@@ -1,4 +1,3 @@
-import { tokens } from "./mask.ts"
 import { renderWorking, type Handoff, type WorkingMemory } from "./working.ts"
 
 export type Row = { readonly id: string; readonly type: string; readonly status?: string; readonly summary?: string; readonly content?: readonly unknown[] }
@@ -6,11 +5,10 @@ export type Episode = {
   readonly id: string
   readonly summary: string
   readonly rowIDs: readonly string[]
-  readonly children?: readonly string[]
   readonly native?: boolean
   readonly gap?: boolean
 }
-export type Checkpoint = { readonly id: string; readonly parent: string | null; readonly episode: Episode; readonly merges?: readonly Episode[]; readonly working?: WorkingMemory; readonly retiredConstraints?: Handoff["retiredConstraints"] }
+export type Checkpoint = { readonly id: string; readonly parent: string | null; readonly episode: Episode; readonly working?: WorkingMemory; readonly retiredConstraints?: Handoff["retiredConstraints"] }
 export type Pending = { readonly id: string; readonly parent: string | null; readonly rowIDs: readonly string[]; readonly archived: boolean }
 
 /** The episode ends at the selected checkpoint (default: running), not at native compaction's retained-tail cut. */
@@ -54,12 +52,6 @@ export function resolveMemory(current: string | null, records: ReadonlyMap<strin
   for (const record of chain.reverse()) {
     add(record.episode)
     episodes.push(record.episode)
-    for (const merged of record.merges ?? []) {
-      const children = merged.children ?? []
-      if (children.length < 2 || children.some((id, i) => episodes[i]?.id !== id)) throw new Error("Merge is not an oldest-episode prefix")
-      add(merged)
-      episodes.splice(0, children.length, merged)
-    }
   }
   const latest = current === null ? undefined : records.get(current)
   return { episodes, catalog, working: latest?.working, through: latest?.episode.id }
@@ -79,45 +71,9 @@ export function renderMemory(episodes: readonly Episode[]): string {
   }).join("\n\n")
 }
 
-/** Reserve half the budget for the merged summary, selecting only the oldest episodes. */
-export function planMerge(episodes: readonly Episode[], budget: number): Episode[] {
-  if (!Number.isFinite(budget) || budget <= 0) throw new RangeError("Memory budget must be positive")
-  if (episodes.length < 2 || tokens(renderMemory(episodes)) <= budget) return []
-  let count = 2
-  while (count < episodes.length && tokens(renderMemory(episodes.slice(count))) > budget / 2) count++
-  return episodes.slice(0, count)
-}
-
-export function mergeEpisode(episodes: readonly Episode[], summary: string): Episode {
-  if (episodes.length < 2) throw new Error("A merge needs at least two episodes")
-  const first = /^E(\d+)(?:[-–—]E\d+)?$/.exec(episodes[0].id)
-  const last = /^E\d+(?:[-–—]E(\d+))?$/.exec(episodes[episodes.length - 1].id)
-  if (!first || !last) throw new Error("Invalid episode id for merge")
-  const end = last[1] ?? /^E(\d+)/.exec(episodes[episodes.length - 1].id)![1]
-  return {
-    id: `E${first[1]}-E${end}`,
-    summary,
-    rowIDs: [],
-    children: episodes.map((episode) => episode.id),
-    ...(episodes.some((episode) => episode.gap) ? { gap: true } : {}),
-  }
-}
-
-/** Descend merged episodes without losing the raw rows or concealing a known archive gap. */
+/** Resolve an episode's raw rows without concealing a known archive gap. */
 export function episodeRows(id: string, catalog: ReadonlyMap<string, Episode>): { rowIDs: string[]; gap: boolean } {
-  const rowIDs: string[] = []
-  const seenRows = new Set<string>(), active = new Set<string>()
-  let gap = false
-  const visit = (episodeID: string) => {
-    if (active.has(episodeID)) throw new Error("Cyclic episode tree")
-    const episode = catalog.get(episodeID)
-    if (!episode) throw new Error("Missing child episode")
-    active.add(episodeID)
-    gap ||= episode.gap === true
-    for (const rowID of episode.rowIDs) if (!seenRows.has(rowID)) { seenRows.add(rowID); rowIDs.push(rowID) }
-    for (const child of episode.children ?? []) visit(child)
-    active.delete(episodeID)
-  }
-  visit(id)
-  return { rowIDs, gap }
+  const episode = catalog.get(id)
+  if (!episode) throw new Error("Missing episode")
+  return { rowIDs: [...episode.rowIDs], gap: episode.gap === true }
 }

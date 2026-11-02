@@ -36,7 +36,7 @@ The existing soft/hard triggers and batched sticky observation masks are unchang
    If this fails, warn and leave native compaction in control. A native fallback
    can exceed this budget and is an explicit exception, not bounded success.
 
-Existing episode/merge archives remain unchanged and recallable. Old checkpoints
+Existing episode archives remain unchanged and recallable. Old checkpoints
 are migrated on their next compaction, not eagerly rewritten. Forks/reverts select
 the corresponding structured state; historical fork reconstruction renders exactly
 that checkpoint, preserving its summary and independent originals/media.

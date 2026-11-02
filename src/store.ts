@@ -326,8 +326,10 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     let highest = 0
     const collect = (episodes: readonly Episode[]) => {
       for (const episode of episodes) {
-        for (const match of episode.id.matchAll(/E(\d+)/g)) highest = Math.max(highest, Number(match[1]))
-        for (const id of episode.rowIDs) rowIDs.add(id)
+        const match = /^E(\d+)$/.exec(episode.id)
+        if (!match) throw new Error("Invalid inherited episode ID")
+        highest = Math.max(highest, Number(match[1]))
+        for (const rowID of episode.rowIDs) rowIDs.add(rowID)
       }
     }
     let active: string | null = [...aliases.keys()][0] ?? null
@@ -339,11 +341,11 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
       const boundary = await source.getPending(active)
       const id = aliases.get(active) ?? active
       if (record) {
-        collect([record.episode, ...(record.merges ?? [])])
+        collect([record.episode])
         if (!await getCheckpoint(id)) await saveCheckpoint({ ...record, id, parent: record.parent === null ? null : aliases.get(record.parent) ?? record.parent })
       }
       if (boundary) {
-        for (const id of boundary.rowIDs) rowIDs.add(id)
+        for (const rowID of boundary.rowIDs) rowIDs.add(rowID)
         if (!await getPending(id)) await put(key("pending", id), { ...boundary, id, parent: boundary.parent === null ? null : aliases.get(boundary.parent) ?? boundary.parent })
       }
       active = record ? record.parent : boundary?.parent ?? null

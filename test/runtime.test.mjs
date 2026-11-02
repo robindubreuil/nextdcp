@@ -364,20 +364,6 @@ test("revert follows only the active working-state chain; old evidence remains r
   assert.match(await h.controller.recall("s", { query: "activebranchneedle" }), /"id":"E3"/)
 })
 
-test("recall accepts all dash forms for a legacy merged episode", async () => {
-  const h = harness()
-  const e1 = { id: "E1", summary: "One", rowIDs: ["u1"] }
-  const e2 = { id: "E2", summary: "Two", rowIDs: ["u2"] }
-  const legacy = { id: "E1–E2", summary: "Merged", rowIDs: [], children: ["E1", "E2"] }
-  await h.store.archiveRows([user("u1", "legacy first"), user("u2", "legacy second")])
-  await h.store.saveCheckpoint({ id: "c1", parent: null, episode: e1 })
-  await h.store.saveCheckpoint({ id: "c2", parent: "c1", episode: e2, merges: [legacy] })
-  h.state.rows = [{ id: "c2", type: "compaction", status: "completed", summary: "Merged", metadata: { nextdcp: { version: 1 } } }]
-  for (const id of ["E1-E2", "E1–E2", "E1—E2"]) {
-    assert.match(await h.controller.recall("s", { id }), /legacy first[\s\S]*legacy second/)
-  }
-})
-
 const cheap = { providerID: "memory-provider", id: "cheap/model", variant: "light" }
 function addCheap(h) {
   h.state.models.push({ ...cheap, name: "Cheap", enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [{ id: "light" }], limit: { context: 200_000, output: 8_192 } })

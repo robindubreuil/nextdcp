@@ -425,20 +425,15 @@ export function createController(ctx: Plugin.Context) {
         throw error
       }
       if (id) {
-        let episodeID = memory.catalog.has(id) ? id : undefined
-        if (!episodeID && /^E\d+[-–—]E\d+$/.test(id)) {
-          const normalized = id.replace(/[–—]/g, "-")
-          episodeID = [...memory.catalog.keys()].find((key) => key.replace(/[–—]/g, "-") === normalized)
-        }
-        if (episodeID) {
-          const full = await transcript(sessionID, store, episodeID, memory.catalog)
+        if (memory.catalog.has(id)) {
+          const full = await transcript(sessionID, store, id, memory.catalog)
           return recallPage(id, full.text, page, full.files)
         }
         return call ? renderCall() : "No matching episode or tool call is available."
       }
       // Visible context needs no search: index archived episodes and the elided originals in the live branch.
       const documents: SearchDocument[] = []
-      for (const episode of memory.catalog.values()) if (!episode.children?.length) {
+      for (const episode of memory.catalog.values()) {
         documents.push({ id: episode.id, text: (await transcript(sessionID, store, episode.id, memory.catalog)).text, summary: episode.summary })
       }
       const live = liveCallIDs(rows)

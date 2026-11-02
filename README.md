@@ -124,7 +124,6 @@ searchable archive note. Only the current objective, standing constraints,
 relevant verified state, unfinished work, and at most three evidence references
 are kept visible. Completed work is archived, not appended to the handoff.
 No topic classifier, observer model, embedding service, or merge request runs.
-Legacy episodes and merged IDs stay recallable without rewriting their archives.
 Recall returns readable transcripts, with complete originals available through
 pages of at most 6,000 characters (formerly 32,000). Images, PDFs, and attachments return as native files on the
 page containing their attachment label, not as JSON or base64 text. Inline text
@@ -137,8 +136,7 @@ with fetchable IDs/pages; a sufficient excerpt needs no follow-up fetch. At most
 40 ranked hits are exposed per query. Archive-note matches are labeled as such,
 not presented as original quotations. Words crossing page boundaries remain
 searchable. Row IDs, provider metadata and
-reasoning are omitted. Merged IDs use ASCII hyphens, and recall also accepts
-en and em dashes. OpenCode still controls the compaction cut and recent tail.
+reasoning are omitted. OpenCode still controls the compaction cut and recent tail.
 
 Ending a successful turn counts the final assistant reply and reasoning too,
 then only records that soft-threshold compaction is due;

@@ -97,21 +97,21 @@ test("200 cumulative compactions write each historical raw row only once", async
   assert.equal(writtenBytes, storedBytes, "no cumulative raw-archive write amplification")
 })
 
-test("fork import copies only its branch, merged children and live masks, reserves IDs, and survives parent deletion", async () => {
+test("fork import copies only its branch and live masks, reserves IDs, and survives parent deletion", async () => {
   const kv = new MemoryStorage(), parent = createStore(kv, "parent"), child = createStore(kv, "child")
   const c1 = { id: "c1", type: "compaction", status: "completed", summary: "first" }
   const c2 = { id: "c2", type: "compaction", status: "completed", summary: "second" }
   const live = { id: "live", type: "assistant", content: [{ type: "tool", id: "live-call", name: "read", state: { status: "completed", input: { path: "original" }, content: [{ type: "text", text: "full output" }] } }] }
   await parent.archiveRows([{ id: "u1", type: "user", text: "first original" }, c1, { id: "u2", type: "user", text: "second original" }, c2, live, { id: "other", type: "user", text: "unrelated branch" }])
   await parent.saveCheckpoint({ id: "c1", parent: null, episode: { id: "E7", summary: "first", rowIDs: ["u1"] } })
-  await parent.saveCheckpoint({ id: "c2", parent: "c1", episode: { id: "E8", summary: "second", rowIDs: ["u2"] }, merges: [{ id: "E7-E8", summary: "merged", rowIDs: [], children: ["E7", "E8"] }] })
+  await parent.saveCheckpoint({ id: "c2", parent: "c1", episode: { id: "E8", summary: "second", rowIDs: ["u2"] } })
   await parent.saveCheckpoint({ id: "other-cp", parent: "c1", episode: { id: "E9", summary: "unrelated", rowIDs: ["other"] } })
   const call = await parent.getCall("live-call")
   const mask = { id: "live-call", name: "read", output: "[elided]" }
   await parent.commitMask({ commit: true, base: [], masks: [mask, { id: "future-call", name: "read", output: "future" }], calls: [call, { ...call, id: "future-call" }], savedTokens: 100 }, "c2")
   await child.inherit("parent", [c2, live])
   const memory = resolveMemory("c2", await child.chain("c2"))
-  assert.deepEqual(memory.episodes.map((episode) => episode.id), ["E7-E8"])
+  assert.deepEqual(memory.episodes.map((episode) => episode.id), ["E7", "E8"])
   assert.ok(memory.catalog.has("E7") && memory.catalog.has("E8"))
   assert.equal(JSON.parse(await child.getRow("u1")).text, "first original")
   assert.equal(await child.getRow("other"), undefined)
