@@ -1,4 +1,4 @@
-# nextdcp — current design (0.3.0)
+# nextdcp — current design (0.4.0)
 
 ## Working set, not a diary
 
@@ -69,7 +69,7 @@ The Complexity Trap (arXiv:2508.21433), and VibeMemBench (arXiv:2609.23570).
 
 The original proposal and experiment history below are retained for context.
 Its episode accumulation/merge policy and 8%-window budget are superseded by the
-0.3.0 contract above and the current README. They are not current behavior.
+0.4.0 contract above and the current README. They are not current behavior.
 
 Goal: let an agent run indefinitely in a single OpenCode session, with full context retrievable on demand.
 Design priorities, in order: robustness across models, simplicity (KISS), prompt-cache friendliness, and low cost.
