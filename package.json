@@ -1,0 +1,32 @@
+{
+  "name": "nextdcp",
+  "version": "0.3.0",
+  "description": "Bounded task-focused working memory and archived recall for OpenCode V2",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./tui": "./dist/tui.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts src/tui.ts --bundle --platform=node --format=esm --target=es2023 --external:@opencode/plugin --external:@opencode/plugin/tui --outdir=dist",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
+    "test": "node --test",
+    "prerelease:local": "npm test",
+    "release:local": "node scripts/release.mjs"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.5 <3"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "esbuild": "0.28.2"
+  },
+  "license": "MIT"
+}
