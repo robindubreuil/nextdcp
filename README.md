@@ -125,7 +125,7 @@ relevant verified state, unfinished work, and at most three evidence references
 are kept visible. Completed work is archived, not appended to the handoff.
 No topic classifier, observer model, embedding service, or merge request runs.
 Recall returns readable transcripts, with complete originals available through
-pages of at most 6,000 characters (formerly 32,000). Images, PDFs, and attachments return as native files on the
+pages of at most 6,000 characters. Images, PDFs, and attachments return as native files on the
 page containing their attachment label, not as JSON or base64 text. Inline text
 attachments are decoded and searchable. The selected model must support the
 attachment's media type; URI-only files must still exist.

@@ -57,7 +57,7 @@ export function resolveMemory(current: string | null, records: ReadonlyMap<strin
   return { episodes, catalog, working: latest?.working, through: latest?.episode.id }
 }
 
-/** Only the latest working state is visible. Legacy/native summaries are migration input. */
+/** Only the latest working state is visible; without one, adopted native summaries render as the episode chain. */
 export function renderHandoff(memory: ReturnType<typeof resolveMemory>): string {
   return memory.working && memory.through ? renderWorking(memory.working, memory.through, [...memory.catalog.values()].some((episode) => episode.gap)) : renderMemory(memory.episodes)
 }
