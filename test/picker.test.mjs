@@ -35,7 +35,7 @@ test("picker is session-only, searchable, preselected and saves without changing
   assert.equal(state.dialogs[0].options.length, 3)
   assert.match(state.dialogs[0].options[2].title, /#light/)
   state.route = { type: "home" }
-  assert.equal(state.commands().commands[0].enabled, false)
+  assert.equal(state.commands().commands[0].enabled(), false)
   await state.commands().commands[0].run()
   assert.equal(state.saved.length, 1)
   cleanup()
@@ -51,10 +51,10 @@ test("picker discovery is global across autocomplete and command-palette input m
     // OpenCode's default base layer is filtered out in autocomplete/dialog mode.
     // The host discovers slash and palette commands only from active layers.
     assert.equal(state.commands().mode, "global")
-    assert.equal(state.commands().commands[0].enabled, false)
+    assert.equal(state.commands().commands[0].enabled(), false)
     state.route = { type: "session", sessionID: "s" }
     const command = state.commands().commands[0]
-    assert.equal(command.enabled, true)
+    assert.equal(command.enabled(), true)
     assert.equal(command.slash.name, "compact-model")
     assert.equal(command.palette, true)
   } finally { cleanup() }

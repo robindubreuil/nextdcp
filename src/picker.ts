@@ -9,7 +9,7 @@ export function installPicker(ctx: Plugin.Context) {
   // Slash autocomplete and the command palette use non-base input modes.
   ctx.keymap.layer(() => ({ mode: "global", commands: [{
     id: "nextdcp.compact-model", title: "Select compaction model", group: "Session", palette: true, slash: { name: "compact-model" },
-    enabled: ctx.ui.router.current().type === "session",
+    enabled: () => ctx.ui.router.current().type === "session",
     run: async () => {
       const route = ctx.ui.router.current()
       if (disposed || open || route.type !== "session") return
