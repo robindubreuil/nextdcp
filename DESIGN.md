@@ -11,7 +11,8 @@ background observer, automatic per-turn retrieval, or merge generation is needed
 
 The normal working-state ceiling is 2,000 estimated tokens for the complete
 rendered handoff, with a prompt target of about 1,000 or less. The estimate is
-chars/4, not a provider-tokenizer guarantee, and does not include native retained
+chars/4 — with Han, kana and hangul characters counting as roughly one token
+each — not a provider-tokenizer guarantee, and does not include native retained
 tail, system instructions, tool definitions, or subsequent conversation.
 The existing soft/hard triggers and batched sticky observation masks are unchanged.
 

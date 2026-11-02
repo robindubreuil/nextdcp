@@ -19,7 +19,16 @@ export type MaskOptions = { readonly minTokens: number; readonly distance: numbe
 export type MaskPlan = { readonly commit: boolean; readonly savedTokens: number; readonly base: readonly Mask[]; readonly masks: readonly Mask[]; readonly calls: readonly ArchivedCall[] }
 
 export const DEFAULT_MASK: MaskOptions = { minTokens: 400, distance: 20_000, batch: 10_000, protected: ["skill", "todowrite", "todoread", "task", "subagent"] }
-export const tokens = (text: string) => Math.max(0, Math.round(text.length / 4))
+// Non-CJK text matches the native chars/4 estimate. Han, kana and hangul are
+// closer to one token per character, so they are counted separately.
+const NON_ASCII = /[\u0080-\uFFFF]/
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu
+export const tokens = (text: string): number => {
+  if (!NON_ASCII.test(text)) return Math.max(0, Math.round(text.length / 4))
+  let wide = 0, units = 0
+  for (const match of text.matchAll(CJK)) { wide++; units += match[0].length }
+  return Math.max(0, Math.round((text.length - units) / 4 + wide))
+}
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const json = (value: unknown) => JSON.stringify(value) ?? ""

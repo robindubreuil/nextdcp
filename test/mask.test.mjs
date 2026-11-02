@@ -227,3 +227,30 @@ test("a deeply nested JSON input does not block unrelated candidates", () => {
   assert.ok(plan.calls.some((item) => item.id === "valid"))
   assert.ok(plan.masks.some((item) => item.id === "valid"))
 })
+
+test("token estimates count CJK scripts per character while keeping chars/4 elsewhere", () => {
+  assert.equal(tokens("plain ascii text"), Math.round("plain ascii text".length / 4))
+  assert.equal(tokens(""), 0)
+  // Accented Latin still costs chars/4; only Han, kana and hangul count as one token each.
+  assert.equal(tokens("café ☕ naïve"), Math.round("café ☕ naïve".length / 4))
+  assert.equal(tokens("日本語"), 3)
+  assert.equal(tokens("ひらがなカタカナ"), 8)
+  assert.equal(tokens("한국어"), 3)
+  assert.equal(tokens("中文english混合"), 2 + Math.round("english".length / 4) + 2)
+  // Astral-plane Han (surrogate pairs) count once per character, not once per UTF-16 unit.
+  assert.equal(tokens("𠀀𠀁"), 2)
+  // Mask thresholds fire on CJK content at the right estimated size.
+  const cjk = msg("tool", result("cjk", "read", "細".repeat(500)))
+  assert.equal(partTokens(cjk.content[0]), 500)
+  assert.ok(partTokens(cjk.content[0]) > DEFAULT_MASK.minTokens)
+})
+
+test("a CJK conversation crosses the mask distance threshold at the correct estimate", () => {
+  const messages = [
+    msg("assistant", call("far", "read", { path: "a" })),
+    msg("tool", result("far", "read", "資料を読み込んだ".repeat(200))),
+    tail(80_004),
+  ]
+  const plan = planMask(messages, [], { ...DEFAULT_MASK, batch: 1 })
+  assert.ok(plan.masks.some((item) => item.id === "far"), "CJK output is masked once past the distance")
+})

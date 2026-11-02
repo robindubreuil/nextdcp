@@ -92,7 +92,9 @@ default. Original archived data remains available through `recall`.
 ## Options
 
 All options are optional and go inside the plugin's `options` object. Token
-counts are estimates, not provider billing counts.
+counts are estimates, not provider billing counts: text is estimated at four
+characters per token, except Han, kana and hangul characters, which count as
+roughly one token each.
 
 | Option | Default | Meaning |
 |---|---:|---|
