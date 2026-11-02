@@ -8,9 +8,12 @@ a source checkout builds them with a development-only esbuild dependency.
 
 ## Install locally
 
-On Windows, run `npm ci` then `npm run release:local` from a source checkout.
-This builds, tests, and copies both bundles to a content-addressed release under
-`%LOCALAPPDATA%/opencode/nextdcp/releases/`. Add the printed absolute file URI
+Run `npm ci` then `npm run release:local` from a source checkout. This builds,
+tests, and copies both bundles to a content-addressed release under the user's
+application-data directory: `%LOCALAPPDATA%/opencode/nextdcp/releases/` on
+Windows, `~/Library/Application Support/opencode/nextdcp/releases/` on macOS,
+and `$XDG_DATA_HOME/opencode/nextdcp/releases/` (or `~/.local/share/…`) on
+Linux. Add the printed absolute file URI
 to the existing OpenCode configuration, preserving its other settings:
 
 ```jsonc

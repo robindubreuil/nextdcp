@@ -1,7 +1,18 @@
 import { createHash, randomBytes } from "node:crypto"
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
+
+/** The per-user application-data root, following each platform's convention. */
+export function releasesDir(platform = process.platform, env = process.env, home = homedir()) {
+  if (platform === "win32") {
+    if (!env.LOCALAPPDATA) throw new Error("LOCALAPPDATA is required for a persistent local release")
+    return join(env.LOCALAPPDATA, "opencode", "nextdcp", "releases")
+  }
+  if (platform === "darwin") return join(home, "Library", "Application Support", "opencode", "nextdcp", "releases")
+  return join(env.XDG_DATA_HOME || join(home, ".local", "share"), "opencode", "nextdcp", "releases")
+}
 
 /** Content-addressed releases are never updated in place. Does not edit OpenCode config. */
 export async function createRelease(source, releases) {
@@ -38,8 +49,7 @@ export async function createRelease(source, releases) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  if (!process.env.LOCALAPPDATA) throw new Error("LOCALAPPDATA is required for a persistent local release")
   const source = fileURLToPath(new URL("../", import.meta.url))
-  const directory = await createRelease(source, join(process.env.LOCALAPPDATA, "opencode", "nextdcp", "releases"))
+  const directory = await createRelease(source, releasesDir())
   console.log(`Release ready: ${directory}\nPlugin URI: ${pathToFileURL(directory).href}\nOpenCode configuration was not changed.`)
 }
