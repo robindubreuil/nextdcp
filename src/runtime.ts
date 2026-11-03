@@ -37,6 +37,22 @@ function growthAfter(messages: readonly ViewMessage[], checkpoint: string | null
   return messageTokens(messages.slice(start).filter((message) => message.role !== "system"))
 }
 
+/** Upper bound on the raw conversation a deferral may hold live, as a share of the model window. */
+const DEFER_WINDOW_SHARE = 0.8
+
+/** Estimated tokens of the raw, unmasked conversation a deferral would hold live. */
+function conversationTokens(rows: readonly Row[]): number {
+  return rows.reduce((sum, row) => {
+    if (row.type === "user") {
+      const text = (row as Row & { text?: unknown }).text
+      return sum + (typeof text === "string" ? tokens(text) : 0)
+    }
+    if (row.type !== "assistant") return sum
+    const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && part.type === "text" ? partTokens(part as Part) : 0), 0)
+    return sum + text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
+  }, 0)
+}
+
 /** Only newly generated assistant rows, not a second projection of the history. */
 function responseTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
@@ -172,11 +188,21 @@ export function createController(ctx: Plugin.Context) {
       return
     }
     const checkpoint = activeCheckpoint(rows)
+    const decision = deferrals.get(event.sessionID)
+    let held = false
+    if (decision?.approved) try {
+      const info = await ctx.session.get({ sessionID: event.sessionID })
+      held = deferrals.get(event.sessionID) === decision && sameRound(decision, info)
+    } catch (error) { log("deferral scope", error) }
+    // A granted deferral stops new shaping, not recovery: committed masks still
+    // render, their originals stay recallable, and views keep tracking growth.
     try {
-      const plan = planMask(event.messages as unknown as Message[], masks, maskOptions)
-      if (plan.commit) {
-        masks = (await store.commitMask(plan, checkpoint)).masks
-        masksBySession.set(event.sessionID, { checkpoint, masks })
+      if (!held) {
+        const plan = planMask(event.messages as unknown as Message[], masks, maskOptions)
+        if (plan.commit) {
+          masks = (await store.commitMask(plan, checkpoint)).masks
+          masksBySession.set(event.sessionID, { checkpoint, masks })
+        }
       }
     } catch (error) { log("mask batch", error) }
     try {
@@ -188,13 +214,7 @@ export function createController(ctx: Plugin.Context) {
       const limit = budgetOption || ((await windowSize(event.model)) ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
       if (budget <= 0 || messageTokens(messages.filter((message) => message.role !== "system")) <= budget) return
-      const decision = deferrals.get(event.sessionID)
-      let deferred = false
-      if (decision?.approved) try {
-        const info = await ctx.session.get({ sessionID: event.sessionID })
-        deferred = deferrals.get(event.sessionID) === decision && sameRound(decision, info)
-      } catch (error) { log("deferral scope", error) }
-      if (!deferred && growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
+      if (!held && growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
   }
 
@@ -331,11 +351,17 @@ export function createController(ctx: Plugin.Context) {
 
   const onRoundEnded = (sessionID: SessionID) => { deferrals.delete(sessionID) }
   const onIdle = async (sessionID: SessionID) => {
-    onRoundEnded(sessionID)
     try {
       const [info, rows] = await Promise.all([
         ctx.session.get({ sessionID }), ctx.session.context({ sessionID }),
       ])
+      const decision = deferrals.get(sessionID)
+      // The round ended, so its grant expires. A grant that carried through this verified
+      // round owes no catch-up marker: the next round re-affirms or the mid-turn trigger
+      // catches up in one bounded compaction. busy alone identifies the round, because
+      // hosts stamp the new idle time when the round ends, before this event fires.
+      const held = decision !== undefined && decision.approved && decision.busy === info.time?.busy
+      deferrals.delete(sessionID)
       if (guarded.has(sessionID) && !running(rows)) clearGuard(sessionID)
       if (info.parentID || idle === Infinity) return
       // Add output produced after the last request, including an updated retry row.
@@ -346,11 +372,14 @@ export function createController(ctx: Plugin.Context) {
       if (start < 0 || rows.slice(view.after === null ? 0 : start + 1).some((row) => row.type === "user")) return
       const growth = view.tokens + Math.max(0, responseTokens(rows.slice(start)) - view.response)
       const after = rows.at(-1)?.id
-      if (growth >= idle && after) {
+      if (!held && growth >= idle && after) {
         // Ending a turn only writes a small, branch-specific marker; no model call.
         await storeFor(sessionID).saveDeferredCompaction({ checkpoint, after, tokens: growth })
       }
-    } catch (error) { log("idle", error) }
+    } catch (error) {
+      deferrals.delete(sessionID)
+      log("idle", error)
+    }
   }
   const onPrompt = async (event: SessionPrompt) => {
     if (idle === Infinity) return
@@ -461,16 +490,30 @@ export function createController(ctx: Plugin.Context) {
       return `Historical evidence, page ${page}${start + SEARCH_PAGE_HITS < hits.length ? `; next page: ${page + 1}` : ""}${hits.length === MAX_SEARCH_HITS ? "; top 40 matches only—narrow the query for other evidence" : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
-  const deferredNotice = "NextDCP's automatic mid-round budget compaction is deferred for this round only. Masking, manual compaction, native overflow handling, and normal compaction before the next round are unchanged. Already-queued compaction is not canceled."
+  const deferredNotice = "NextDCP's automatic mid-round budget compaction and new output masking are deferred for this round only, so the raw conversation stays fully live. Committed elisions still render and stay recallable; manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
   const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
     const reason = input.reason.trim()
-    if (!reason) return "Provide a concrete current need and explain why checkpointing plus recall would materially impair the task."
+    if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
     if (ctx.options.budget === false) return "NextDCP's automatic mid-round budget trigger is already disabled; no deferral is needed. Manual compaction and native overflow handling remain enabled."
     const { sessionID } = context
     const info = await ctx.session.get({ sessionID })
     if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
     const previous = deferrals.get(sessionID)
     if (sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
+
+    // Physics before consent: a grant must fit the window, so no approval is spent on a
+    // conversation that overflows anyway. Nothing is recorded on denial; recomputing is
+    // cheap and never prompts.
+    let rows: readonly Row[], windowTokens: number | undefined
+    try {
+      [rows, windowTokens] = await Promise.all([ctx.session.context({ sessionID }), windowSize(info.model)])
+    } catch (error) {
+      log("deferral physics", error)
+      return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
+    }
+    if (windowTokens === undefined) return "Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed. Recall selectively instead."
+    const estimate = conversationTokens(rows), ceiling = Math.floor(windowTokens * DEFER_WINDOW_SHARE)
+    if (estimate > ceiling) return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
 
     // An unapproved record also prevents concurrent requests and retries after refusal.
     const decision: Deferral = { busy: info.time.busy, idle: info.time.idle, approved: false }
@@ -511,7 +554,7 @@ export async function install(ctx: Plugin.Context) {
     })
     editor.add({
       name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
-      input: { type: "object", properties: { reason: { type: "string", minLength: 1, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
+      input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 500, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
       options: { permission: "defer_compaction", codemode: false },
       execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
     })

@@ -1,7 +1,8 @@
 # nextdcp
 
-Bounded task-focused working memory, deterministic tool-output masking, and on-demand `recall` for
-OpenCode V2 (**v2.2.5+**). The host supplies `@opencode/plugin`; the declared
+Bounded task-focused working memory, deterministic tool-output masking, on-demand `recall`, and
+user-approved round-scoped compaction deferral for OpenCode V2 (**v2.2.5+**). The host supplies
+`@opencode/plugin`; the declared
 peer range is `>=2.2.5 <3`. There are no additional runtime dependencies. The
 published package contains separate, self-contained ESM server and TUI bundles;
 a source checkout builds them with a development-only esbuild dependency.
@@ -20,7 +21,7 @@ to the existing OpenCode configuration, preserving its other settings:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    { "package": "file:///C:/Users/you/AppData/Local/opencode/nextdcp/releases/0.4.0-DIGEST", "options": {} }
+    { "package": "file:///C:/Users/you/AppData/Local/opencode/nextdcp/releases/0.5.0-DIGEST", "options": {} }
   ]
 }
 ```
@@ -101,12 +102,19 @@ retried in that round.
 The reason is visible in the tool call and in the GUI's approval card; the terminal's
 generic approval box shows the tool name, with the reason in the tool call above it.
 
-Approval suppresses only NextDCP's automatic **mid-round budget trigger**. Masking,
-manual compaction, native overflow handling, and normal deferred compaction before
-the next round remain enabled. Already-queued compaction is not canceled. The
-exemption expires on completion, failure, interruption, or plugin reload and is not
-inherited by forks or subagents. Native permission choices retain OpenCode's usual
-scope; the exemption itself is never persisted.
+Physics gates the request before the prompt: the unmasked conversation must fit
+within 80% of the model's context window, and an unknown window is refused, so no
+approval is spent on a conversation that would overflow anyway.
+
+Approval suspends NextDCP's automatic **mid-round budget trigger** and the planning
+of **new** output elisions for that round, keeping the raw conversation fully live.
+Committed elisions still render and stay recallable; manual compaction, native
+overflow handling, and already-queued or in-flight compaction are unaffected. The
+held round writes no deferred idle marker, so the next round starts from the full
+context and either re-affirms or lets the budget trigger catch up in one bounded
+compaction. The exemption expires on completion, failure, interruption, or plugin
+reload and is not inherited by forks or subagents. Native permission choices retain
+OpenCode's usual scope; the exemption itself is never persisted.
 
 ## Options
 

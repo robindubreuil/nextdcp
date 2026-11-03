@@ -1,4 +1,4 @@
-# nextdcp — current design (0.4.0)
+# nextdcp — current design (0.5.0)
 
 ## Working set, not a diary
 
@@ -14,12 +14,22 @@ rendered handoff, with a prompt target of about 1,000 or less. The estimate is
 chars/4 — with Han, kana and hangul characters counting as roughly one token
 each — not a provider-tokenizer guarantee, and does not include native retained
 tail, system instructions, tool definitions, or subsequent conversation.
-The existing soft/hard triggers and batched sticky observation masks are unchanged
-unless the model requests native user approval to defer the mid-round budget
-trigger. A default-ask agent rule preserves configured permissions and native
-Always allow. One in-memory decision expires on completion, failure, interruption,
-or reload and is never inherited. Masking, manual/overflow compaction,
-already-admitted work, and next-prompt compaction remain unchanged.
+The existing soft/hard triggers and batched sticky observation masks are unchanged.
+
+## Round-scoped deferral
+
+Some tasks legitimately need many large results live at once. The `defer_compaction`
+tool lets the model propose skipping the budget trigger and new mask planning for the
+current round only. Three gates apply in order: physics (the unmasked conversation
+must fit 80% of the model's window; an unknown window is refused, so no approval is
+spent on a context that would overflow anyway), user consent (the host permission
+system, action `defer_compaction`, default ask with native Always allow, shown with
+the model's reason), and idempotence within the round. A grant never disables
+recovery: committed masks still render, their originals stay recallable, and a
+compaction already in flight still runs. The grant expires when its round ends —
+success, failure or interruption — and that round writes no deferred idle marker;
+without re-affirmation, the next round's mid-turn budget trigger catches up in one
+bounded compaction. One in-memory decision per session, never inherited or persisted.
 
 ## Commit and failure contract
 
@@ -74,7 +84,7 @@ The Complexity Trap (arXiv:2508.21433), and VibeMemBench (arXiv:2609.23570).
 
 The original proposal and experiment history below are retained for context.
 Its episode accumulation/merge policy and 8%-window budget are superseded by the
-0.4.0 contract above and the current README. They are not current behavior.
+0.5.0 contract above and the current README. They are not current behavior.
 
 Goal: let an agent run indefinitely in a single OpenCode session, with full context retrievable on demand.
 Design priorities, in order: robustness across models, simplicity (KISS), prompt-cache friendliness, and low cost.

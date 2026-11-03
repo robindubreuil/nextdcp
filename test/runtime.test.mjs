@@ -841,28 +841,64 @@ test("deferral defaults to native ask without overriding configured permission r
   } finally { cleanup() }
 })
 
-test("approved deferral preserves masking and normal next-prompt compaction", async () => {
-  const h = harness({ idle: 20, budget: 40, mask: { minTokens: 1, distance: 0, batch: 1 } })
-  const original = "trace evidence ".repeat(100)
-  h.state.rows = [user("u1", "compare traces"), { id: "a1", type: "assistant", content: [
-    { type: "tool", id: "trace", name: "read", state: { status: "completed", input: { path: "trace.log" }, content: [{ type: "text", text: original }] } },
-  ] }, user("u2", "x".repeat(800))]
+test("a granted deferral stops new masks and the budget trigger, then catches up after the round", async () => {
+  const h = harness({ idle: false, budget: 6_000, mask: { minTokens: 1, distance: 0, batch: 1 } })
+  const tool = (id) => ({ id: `row-${id}`, type: "assistant", content: [{
+    type: "tool", id, name: "read", state: { status: "completed", input: { path: id }, content: [{ type: "text", text: `original ${id} `.repeat(1_000) }] },
+  }] })
+  h.state.rows = [tool("cold"), user("tail", "y".repeat(8_000))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal((await h.store.getMasks()).length, 1, "the cold read is elided before the grant")
+  h.state.rows = [tool("cold"), user("tail", "y".repeat(8_000)), tool("hot"), user("tail2", "z".repeat(24_000))]
   assert.match(await defer(h), /deferred for this round only/)
-  const context = { ...event(), messages: projectHistory(h.state.rows).messages }
-  await h.controller.onContext(context)
-  assert.equal(h.state.compact, 0)
-  assert.match(JSON.stringify(context.messages), /Output elided/)
-  assert.equal((await h.store.getCall("trace")).result.value, original)
-  const generate = { ...event(), messages: projectHistory(h.state.rows).messages }
-  await h.controller.onGenerate(generate)
-  assert.deepEqual(generate.messages, context.messages)
-
-  h.state.rows.push({ id: "final", type: "assistant", content: [{ type: "text", text: "comparison complete" }] })
+  assert.equal(h.state.permissions.length, 1)
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.equal(h.state.compact, 0, "the budget trigger is deferred")
+  assert.equal((await h.store.getMasks()).length, 1, "no new elisions while held")
+  assert.equal(await h.store.getCall("hot"), undefined)
+  const cold = request.messages.flatMap((message) => message.content ?? []).find((part) => part.type === "tool-result" && part.id === "cold")
+  assert.match(cold.result.value, /Output elided/, "a committed mask still renders while held")
+  assert.match(await defer(h), /deferred for this round only/, "the held round's approval is idempotent")
+  assert.equal(h.state.permissions.length, 1)
   await h.controller.onIdle("s")
-  assert.ok(await h.store.getDeferredCompaction())
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "the round ended; the next context pays the trigger")
+  assert.equal((await h.store.getMasks()).length, 2, "new elisions resume after the round")
+})
+
+test("deferral is refused when physics cannot guarantee the window, and triggers stay active", async () => {
+  const h = harness({ idle: false, budget: 100 })
+  h.state.rows = [user("u1", "x".repeat(360_000))]
+  assert.match(await defer(h), /about 90000 estimated tokens, above the grant ceiling of 80000 of the 100000-token window/)
+  assert.equal(h.state.permissions.length, 0, "physics refuses before spending the user's attention")
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "a refused grant leaves the budget trigger active")
+  const unknown = harness({ idle: false })
+  unknown.state.models = []
+  unknown.state.rows = [user("u1", "small")]
+  assert.match(await defer(unknown), /window is unknown/)
+  assert.equal(unknown.state.permissions.length, 0)
+})
+
+test("a deferred round writes no catch-up marker; the next round pays the budget trigger instead", async () => {
+  const h = harness({ idle: 100, budget: 1_000 })
+  h.state.rows = [user("u1", "x".repeat(5_000))]
+  assert.match(await defer(h), /deferred for this round only/)
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  await setImmediate()
   assert.equal(h.state.compact, 0)
+  await h.controller.onIdle("s")
+  assert.equal(await h.store.getDeferredCompaction(), undefined, "the held round owes no marker")
   await h.controller.onPrompt(prompt())
-  assert.equal(h.state.compact, 1)
+  assert.equal(h.state.compact, 0, "the next prompt is admitted without a catch-up compaction")
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "without re-affirmation the mid-turn trigger catches up")
 })
 
 test("pending approval does not defer a trigger or cancel already-admitted compaction", async () => {
@@ -967,6 +1003,7 @@ test("steering messages within the same execution keep the current approval", as
 test("empty reasons, disabled budgets, staged reverts, and sessions without a round never request permission", async () => {
   const h = harness()
   assert.match(await h.controller.deferCompaction({ reason: "  " }, toolContext), /concrete current need/)
+  assert.match(await h.controller.deferCompaction({ reason: "y".repeat(501) }, toolContext), /1 to 500 characters/)
   h.state.info.revert = { messageID: "old" }
   assert.match(await defer(h), /staged revert/)
   delete h.state.info.revert
@@ -1193,10 +1230,17 @@ test("setup registers success-only idle events and clears the subscription", asy
   push("session.execution.succeeded")
   await setImmediate()
   await setImmediate()
-  assert.equal(h.state.compact, 0, "success records a marker without calling the model")
+  assert.equal(h.state.compact, 0, "a granted round ends without a marker or a model call")
   const before = h.state.permissions.length
   await deferral.execute(deferralInput, toolContext)
   assert.equal(h.state.permissions.length, before + 1, "success expires the round's exemption")
+  await h.state.hooks.get("prompt")(prompt())
+  assert.equal(h.state.compact, 0, "the next prompt admits without a catch-up compaction")
+  push("session.execution.failed")
+  push("session.execution.succeeded")
+  await setImmediate()
+  await setImmediate()
+  assert.equal(h.state.compact, 0, "an ungranted round records a marker without calling the model")
   await h.state.hooks.get("prompt")(prompt())
   assert.equal(h.state.compact, 1)
   h.state.rows = [native("checkpoint")]
