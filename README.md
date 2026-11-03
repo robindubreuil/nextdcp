@@ -169,7 +169,10 @@ Ending a successful turn counts the final assistant reply and reasoning too,
 then only records that soft-threshold compaction is due;
 it does not generate a summary. If you send another prompt, compaction runs
 before that message is admitted, leaving the new request verbatim after the
-checkpoint. Merely reopening the session does nothing. The marker survives
+checkpoint. The queued message's text is passed to the working-state model as a
+labeled relevance hint — evidence for what stays live, never instructions, and
+it cannot retire constraints (retirement requires an exact quote from a real
+user row). Merely reopening the session does nothing. The marker survives
 reloads and only applies to the same conversation boundary, not a staged revert,
 changed branch or subagent. Manual compaction is unchanged.
 

@@ -83,6 +83,9 @@ export function createController(ctx: Plugin.Context) {
   const masksBySession = new Map<string, { checkpoint: string | null; masks: readonly Mask[] }>()
   const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
   const deferrals = new Map<string, Deferral>()
+  // The queued message that triggered a deferred-marker compaction; evidence for the
+  // working state, read once by whichever generation actually runs.
+  const hints = new Map<string, string>()
   const windows = new Map<string, Promise<number | undefined>>()
   const transcripts = new Map<string, Transcript>()
   let transcriptChars = 0
@@ -294,9 +297,11 @@ export function createController(ctx: Plugin.Context) {
       const users = transcriptRows.flatMap((row) => row.type === "user" && typeof (row as Row & { text?: unknown }).text === "string"
         ? [{ id: row.id, type: "user" as const, text: (row as Row & { text: string }).text }] : [])
       const gap = !boundary.archived || [...existing.catalog.values()].some((episode) => episode.gap)
+      const queued = hints.get(event.sessionID)
+      hints.delete(event.sessionID)
       const context = { through: id, budget: memoryBudget, previous: existing.working ?? renderHandoff(existing),
         archives: [...new Set([id, ...(existing.through ? [existing.through] : []), ...(existing.working?.references.map((ref) => ref.id) ?? [])])],
-        users: users.map((user) => ({ id: user.id, start: user.text.slice(0, 160) })) }
+        users: users.map((user) => ({ id: user.id, start: user.text.slice(0, 160) })), ...(queued ? { queued } : {}) }
       let target: ModelRef | undefined
       try { target = await models.select(event.sessionID) } catch {
         await models.warning(event.sessionID, "Cannot read compaction-model policy; using the main model for this compaction.")
@@ -349,7 +354,7 @@ export function createController(ctx: Plugin.Context) {
     }
   }
 
-  const onRoundEnded = (sessionID: SessionID) => { deferrals.delete(sessionID) }
+  const onRoundEnded = (sessionID: SessionID) => { deferrals.delete(sessionID); hints.delete(sessionID) }
   const onIdle = async (sessionID: SessionID) => {
     try {
       const [info, rows] = await Promise.all([
@@ -392,6 +397,10 @@ export function createController(ctx: Plugin.Context) {
       // Do not reuse another branch/boundary's marker or commit a staged revert.
       if (info.parentID || info.revert || running(rows) ||
           deferred.checkpoint !== activeCheckpoint(rows) || deferred.after !== rows.at(-1)?.id) return
+      // The queued message is the strongest relevance signal for what the working
+      // state must keep live; it stays evidence, never a summarized or obeyed row.
+      const queued = event.prompt.text.trim().slice(0, 2_000)
+      if (queued) hints.set(event.sessionID, queued)
       await requestCompact(event.sessionID, deferred.checkpoint, deferred.tokens)
     } catch (error) { log("deferred compaction; admitting prompt unchanged", error) }
   }
@@ -403,7 +412,7 @@ export function createController(ctx: Plugin.Context) {
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
-    for (const map of [admissions, attempts, cooldown, masksBySession, views, inherited, deferrals]) map.delete(sessionID)
+    for (const map of [admissions, attempts, cooldown, masksBySession, views, inherited, deferrals, hints]) map.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)

@@ -698,6 +698,67 @@ test("soft compaction waits for another prompt and its marker survives a control
   assert.equal(h.state.compact, 1, "resume works without the old in-memory view")
 })
 
+const generationData = (prompt) => JSON.parse(prompt.slice(prompt.indexOf("Compaction context (data):\n") + "Compaction context (data):\n".length))
+
+test("the queued message that resumes a marked session biases the working state", async () => {
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "finished debugging runtime.ts")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: "  Now port the same fix to the TUI bundle.  ", files: [] } })
+  assert.equal(h.state.compact, 1, "the marker is admitted before the queued message")
+  h.state.rows = [user("u1", "finished debugging runtime.ts"), running("c1")]
+  await h.controller.onCompaction(event())
+  assert.equal(h.state.prompts.length, 1)
+  const data = generationData(h.state.prompts[0])
+  assert.equal(data.queued, "Now port the same fix to the TUI bundle.")
+  assert.deepEqual(data.users, [{ id: "u1", start: "finished debugging runtime.ts" }], "constraint retirement only ever quotes real user rows, never the queued text")
+})
+
+test("a hint is omitted without message text and capped when huge", async () => {
+  const empty = harness({ idle: 1 })
+  empty.state.rows = [user("u1", "resumed without words")]
+  await idle(empty)
+  await empty.controller.onPrompt({ ...prompt(), prompt: { text: "   ", files: [] } })
+  empty.state.rows = [user("u1", "resumed without words"), running("c1")]
+  await empty.controller.onCompaction(event())
+  assert.ok(!("queued" in generationData(empty.state.prompts[0])))
+
+  const capped = harness({ idle: 1 })
+  capped.state.rows = [user("u1", "work before a huge queued message")]
+  await idle(capped)
+  await capped.controller.onPrompt({ ...prompt(), prompt: { text: "x".repeat(5_000), files: [] } })
+  capped.state.rows = [user("u1", "work before a huge queued message"), running("c1")]
+  await capped.controller.onCompaction(event())
+  assert.equal(generationData(capped.state.prompts[0]).queued.length, 2_000)
+})
+
+test("the hint is consumed once and never appears on compactions without a queued resume", async () => {
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "work before resuming")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: "keep the trace comparison live", files: [] } })
+  h.state.rows = [user("u1", "work before resuming"), running("c1")]
+  const first = event()
+  await h.controller.onCompaction(first)
+  assert.ok(first.result)
+  assert.equal(generationData(h.state.prompts.at(-1)).queued, "keep the trace comparison live")
+
+  h.state.rows = [completed("c1", first.result), user("u2", "later work without a marker"), running("c2")]
+  await h.controller.onCompaction(event())
+  assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "the hint is read once; later compactions see none")
+})
+
+test("a hint that never reached a generation dies with its round", async () => {
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "work before a lost compaction")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: "keep the state diagram facts", files: [] } })
+  h.controller.onRoundEnded("s")
+  h.state.rows = [user("u1", "work before a lost compaction"), running("c1")]
+  await h.controller.onCompaction(event())
+  assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "an expired hint cannot leak into a later compaction")
+})
+
 test("the final assistant reply and reasoning can cross the soft threshold without being counted twice", async () => {
   const h = harness({ idle: 100, budget: 1_000_000 })
   h.state.rows = [user("u1", "x".repeat(320))]
