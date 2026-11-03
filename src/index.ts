@@ -22,11 +22,12 @@ export async function setup(ctx: Plugin.Context) {
     while (!abort.signal.aborted) {
       try {
         const events = ctx.event.subscribe({
-          types: ["session.execution.succeeded", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"],
+          types: ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"],
           signal: abort.signal,
         })
         for await (const event of events) {
           if (event.type === "session.execution.succeeded") await controller.onIdle(event.data.sessionID)
+          else if (event.type === "session.execution.failed" || event.type === "session.execution.interrupted") controller.onRoundEnded(event.data.sessionID)
           else if (event.type === "session.deleted") await controller.onDeleted(event.data.sessionID)
           else if (event.type === "session.forked") await controller.onFork(event.data.sessionID)
           else controller.onCompactionFinished(event.data.sessionID, event.type === "session.compaction.failed")

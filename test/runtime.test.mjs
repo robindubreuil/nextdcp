@@ -3,7 +3,7 @@ import { registerHooks } from "node:module"
 import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
-import { WORKING_PROMPT, RECALL_DESCRIPTION } from "../src/prompts.ts"
+import { WORKING_PROMPT, RECALL_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION } from "../src/prompts.ts"
 import { createController } from "../src/runtime.ts"
 import { createStore } from "../src/store.ts"
 
@@ -50,17 +50,25 @@ const native = (id, summary = "Native fallback summary") => ({ id, type: "compac
 function harness(options = {}) {
   const storage = new MemoryStorage()
   const state = {
-    rows: [], prompts: [], stateless: [], compact: 0, info: { model }, failAdmission: false,
+    rows: [], prompts: [], stateless: [], compact: 0, info: { model, time: { busy: 1 } }, failAdmission: false,
     failGenerate: false, failStateless: false, hooks: new Map(),
     handoff: { archive: "Work: preserve the exact request.", working: { objective: "Continue current work", constraints: ["Preserve the exact request."],
       state: [], next: ["Continue the task"], references: [] }, retiredConstraints: [] },
     models: [{ ...model, enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [], limit: { context: 100_000, output: 8_192 } }],
-    configured: undefined, warnings: [],
+    configured: undefined, warnings: [], permissions: [], tools: new Map(),
+    agents: [{ id: "build", permissions: [{ action: "*", resource: "*", effect: "allow" }] }],
   }
   const ctx = {
     options, storage,
     model: { list: async () => ({ data: state.models }) },
-    agent: { get: async () => ({ data: { model: state.configured } }) },
+    agent: {
+      get: async () => ({ data: { model: state.configured } }),
+      transform: async (callback) => {
+        callback({ list: () => state.agents, update: (id, update) => update(state.agents.find((agent) => agent.id === id)) })
+        return { dispose: async () => {} }
+      },
+    },
+    permission: { assert: async (input) => { state.permissions.push(input) } },
     rpc: { register: async (definition, handlers) => {
       state.rpc = handlers
       return { dispose: async () => {}, events: { emit: async (name, data) => state.warnings.push({ name, data }) } }
@@ -81,7 +89,10 @@ function harness(options = {}) {
       if (state.failStateless) throw new Error("stateless generation failed")
       return { text: JSON.stringify(state.handoff) }
     } } },
-    tool: { transform: async (callback) => { callback({ add: (definition) => { state.tool = definition } }); return { dispose: async () => {} } } },
+    tool: { transform: async (callback) => {
+      callback({ add: (definition) => { state.tools.set(definition.name, definition); if (definition.name === "recall") state.tool = definition } })
+      return { dispose: async () => {} }
+    } },
     event: { subscribe: () => (async function* () {})() },
   }
   return { ctx, state, storage, store: createStore(storage, "s"), controller: createController(ctx) }
@@ -108,6 +119,10 @@ async function compactRows(h, rows) {
   assert.ok(item.result, "custom compaction must produce a checkpoint")
   return item.result
 }
+
+const deferralInput = { reason: "Compare the active traces simultaneously; checkpointing plus recall would lose the cross-trace alignment." }
+const toolContext = { sessionID: "s", agent: "build", messageID: "assistant", id: "defer-1" }
+const defer = (h) => h.controller.deferCompaction(deferralInput, toolContext)
 
 test("compaction archives every original before generation and recall retrieves episode and call", async () => {
   const h = harness()
@@ -793,6 +808,176 @@ test("a plugin checkpoint without a stored record is adopted as a native episode
   assert.match(result.summary, /Archive through E2/)
 })
 
+test("deferral defaults to native ask without overriding configured permission rules", async () => {
+  const h = harness()
+  const allow = { action: "*", resource: "*", effect: "allow" }
+  const ask = { action: "defer_compaction", resource: "*", effect: "ask" }
+  const deny = { action: "defer_compaction", resource: "*", effect: "deny" }
+  const denyAll = { action: "*", resource: "*", effect: "deny" }
+  h.state.agents.push(
+    { id: "configured", permissions: [allow, deny] },
+    { id: "deny-all", permissions: [denyAll] },
+    { id: "explicit-allow", permissions: [allow, allow] },
+    { id: "empty", permissions: [] },
+  )
+  const cleanup = await setup(h.ctx)
+  try {
+    assert.deepEqual(h.state.agents.map((agent) => agent.permissions), [
+      [allow, ask], [allow, ask, deny], [ask, denyAll], [allow, ask, allow], [ask],
+    ])
+    const tool = h.state.tools.get("defer_compaction")
+    assert.equal(tool.description, DEFER_COMPACTION_DESCRIPTION)
+    assert.deepEqual(tool.options, { permission: "defer_compaction", codemode: false })
+    assert.deepEqual(tool.input.required, ["reason"])
+    assert.equal(tool.input.additionalProperties, false)
+    assert.match((await tool.execute({ reason: `  ${deferralInput.reason}  ` }, toolContext)).content, /deferred for this round only/)
+    assert.deepEqual(h.state.permissions, [{
+      sessionID: "s", agent: "build", action: "defer_compaction", resources: [deferralInput.reason], save: ["*"],
+      source: { type: "tool", messageID: "assistant", id: "defer-1" },
+    }])
+    await tool.execute(deferralInput, toolContext)
+    assert.equal(h.state.permissions.length, 1, "an already-approved round needs no second permission request")
+    assert.equal(h.storage.writes.length, 0, "exemptions are not persisted")
+  } finally { cleanup() }
+})
+
+test("approved deferral preserves masking and normal next-prompt compaction", async () => {
+  const h = harness({ idle: 20, budget: 40, mask: { minTokens: 1, distance: 0, batch: 1 } })
+  const original = "trace evidence ".repeat(100)
+  h.state.rows = [user("u1", "compare traces"), { id: "a1", type: "assistant", content: [
+    { type: "tool", id: "trace", name: "read", state: { status: "completed", input: { path: "trace.log" }, content: [{ type: "text", text: original }] } },
+  ] }, user("u2", "x".repeat(800))]
+  assert.match(await defer(h), /deferred for this round only/)
+  const context = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(context)
+  assert.equal(h.state.compact, 0)
+  assert.match(JSON.stringify(context.messages), /Output elided/)
+  assert.equal((await h.store.getCall("trace")).result.value, original)
+  const generate = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onGenerate(generate)
+  assert.deepEqual(generate.messages, context.messages)
+
+  h.state.rows.push({ id: "final", type: "assistant", content: [{ type: "text", text: "comparison complete" }] })
+  await h.controller.onIdle("s")
+  assert.ok(await h.store.getDeferredCompaction())
+  assert.equal(h.state.compact, 0)
+  await h.controller.onPrompt(prompt())
+  assert.equal(h.state.compact, 1)
+})
+
+test("pending approval does not defer a trigger or cancel already-admitted compaction", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  let approve
+  h.ctx.permission.assert = async (input) => {
+    h.state.permissions.push(input)
+    await new Promise((resolve) => { approve = resolve })
+  }
+  const pending = defer(h)
+  await setImmediate()
+  assert.match(await defer(h), /already been requested/)
+  assert.equal(h.state.permissions.length, 1)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal(h.state.compact, 1, "an unapproved request does not suppress compaction")
+  approve()
+  assert.match(await pending, /Already-queued compaction is not canceled/)
+  h.state.rows.push(running("manual-or-overflow"))
+  const compaction = event()
+  await h.controller.onCompaction(compaction)
+  assert.ok(compaction.result, "approved deferral still allows manual, overflow, or previously admitted compaction")
+})
+
+test("native permission rejection is rethrown and cannot be retried in that round", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  const rejection = new Error("native permission rejection")
+  h.ctx.permission.assert = async (input) => { h.state.permissions.push(input); throw rejection }
+  await assert.rejects(defer(h), (error) => error === rejection)
+  assert.match(await defer(h), /Do not ask again/)
+  assert.equal(h.state.permissions.length, 1)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal(h.state.compact, 1)
+  h.controller.onRoundEnded("s")
+  h.ctx.permission.assert = async (input) => { h.state.permissions.push(input) }
+  assert.match(await defer(h), /deferred for this round only/)
+  assert.equal(h.state.permissions.length, 2)
+})
+
+test("late approval cannot exempt an ended round or overwrite a later round's decision", async () => {
+  for (const end of ["event", "idle", "busy", "delete"]) {
+    const h = harness({ idle: false, budget: 40 })
+    h.state.rows = [user("u", "x".repeat(800))]
+    let approve
+    h.ctx.permission.assert = () => new Promise((resolve) => { approve = resolve })
+    const pending = defer(h)
+    await setImmediate()
+    if (end === "event") h.controller.onRoundEnded("s")
+    if (end === "idle") h.state.info.time.idle = 2
+    if (end === "busy") h.state.info.time.busy = 2
+    if (end === "delete") await h.controller.onDeleted("s")
+    approve()
+    assert.match(await pending, /round ended/, end)
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    assert.equal(h.state.compact, 1, end)
+  }
+
+  const h = harness({ idle: false, budget: 40 })
+  let approve
+  h.ctx.permission.assert = () => new Promise((resolve) => { approve = resolve })
+  const old = defer(h)
+  await setImmediate()
+  h.state.info.time.busy = 2
+  h.ctx.permission.assert = async () => {}
+  await defer(h)
+  approve()
+  assert.match(await old, /round ended/)
+  h.state.rows = [user("u", "x".repeat(800))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal(h.state.compact, 0, "late approval leaves the later round's own approval intact")
+})
+
+test("approved deferrals cannot leak across execution boundaries, sessions, or reloads", async () => {
+  for (const change of ["busy", "idle", "child", "fork", "reload", "unavailable"]) {
+    const h = harness({ idle: false, budget: 40 })
+    h.state.rows = [user("u", "x".repeat(800))]
+    await defer(h)
+    if (change === "busy") h.state.info.time.busy = 2
+    if (change === "idle") h.state.info.time.idle = 2
+    if (change === "reload") h.controller = createController(h.ctx)
+    if (change === "unavailable") {
+      await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+      h.ctx.session.get = async () => { throw new Error("session unavailable") }
+    }
+    const sessionID = change === "child" || change === "fork" ? change : "s"
+    await h.controller.onContext({ ...event(sessionID), messages: projectHistory(h.state.rows).messages })
+    assert.equal(h.state.compact, 1, change)
+  }
+})
+
+test("steering messages within the same execution keep the current approval", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  await defer(h)
+  h.state.rows = [user("u1", "x".repeat(800)), user("u2", "A correction within the active round.")]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal(h.state.compact, 0)
+  assert.match(await defer(h), /deferred for this round only/)
+  assert.equal(h.state.permissions.length, 1)
+})
+
+test("empty reasons, disabled budgets, staged reverts, and sessions without a round never request permission", async () => {
+  const h = harness()
+  assert.match(await h.controller.deferCompaction({ reason: "  " }, toolContext), /concrete current need/)
+  h.state.info.revert = { messageID: "old" }
+  assert.match(await defer(h), /staged revert/)
+  delete h.state.info.revert
+  delete h.state.info.time.busy
+  assert.match(await defer(h), /active round/)
+  assert.equal(h.state.permissions.length, 0)
+  const disabled = harness({ budget: false })
+  assert.match(await defer(disabled), /already disabled/)
+  assert.equal(disabled.state.permissions.length, 0)
+})
+
 test("system and tool definitions above the budget never trigger compaction", async () => {
   const h = harness({ idle: false, budget: 100 })
   h.state.rows = [user("u1", "x".repeat(160))]
@@ -986,13 +1171,20 @@ test("setup registers success-only idle events and clears the subscription", asy
   const cleanup = await setup(h.ctx)
   await setImmediate()
   assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "generate", "compaction"])
-  assert.deepEqual(subscribed, ["session.execution.succeeded", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"])
+  assert.deepEqual(subscribed, ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"])
   assert.equal(h.state.tool.name, "recall")
   assert.equal(h.state.tool.description, RECALL_DESCRIPTION)
   assert.deepEqual(h.state.tool.options, { codemode: false })
+  const deferral = h.state.tools.get("defer_compaction")
+  await deferral.execute(deferralInput, toolContext)
   await h.state.hooks.get("context")({ ...event(), messages: projectHistory(h.state.rows).messages })
-  push("session.execution.failed")
-  push("session.execution.interrupted")
+  for (const type of ["session.execution.failed", "session.execution.interrupted"]) {
+    const before = h.state.permissions.length
+    push(type)
+    await setImmediate()
+    await deferral.execute(deferralInput, toolContext)
+    assert.equal(h.state.permissions.length, before + 1, `${type} expires the round's exemption`)
+  }
   await h.ctx.session.generate({ prompt: WORKING_PROMPT })
   await setImmediate()
   assert.equal(h.state.compact, 0, "Failed, interrupted and transient generation do not trigger idle compaction")
@@ -1002,6 +1194,9 @@ test("setup registers success-only idle events and clears the subscription", asy
   await setImmediate()
   await setImmediate()
   assert.equal(h.state.compact, 0, "success records a marker without calling the model")
+  const before = h.state.permissions.length
+  await deferral.execute(deferralInput, toolContext)
+  assert.equal(h.state.permissions.length, before + 1, "success expires the round's exemption")
   await h.state.hooks.get("prompt")(prompt())
   assert.equal(h.state.compact, 1)
   h.state.rows = [native("checkpoint")]

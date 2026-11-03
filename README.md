@@ -89,6 +89,25 @@ Summaries are still lossy. Neither quality-neutral substitution nor lower total
 cost is guaranteed; compare representative workloads before choosing a cheaper
 default. Original archived data remains available through `recall`.
 
+## Defer compaction for one round
+
+For work that genuinely needs unusually large simultaneous context, the model can
+call `defer_compaction` with a concrete reason why checkpointing plus recall would
+impair the current task. The tool uses OpenCode's native approval prompt (permission
+`defer_compaction`, default `ask`), including **Always allow**. Configured permission
+rules are respected. Each round still needs its own tool call; a refusal cannot be
+retried in that round.
+
+The reason is visible in the tool call and in the GUI's approval card; the terminal's
+generic approval box shows the tool name, with the reason in the tool call above it.
+
+Approval suppresses only NextDCP's automatic **mid-round budget trigger**. Masking,
+manual compaction, native overflow handling, and normal deferred compaction before
+the next round remain enabled. Already-queued compaction is not canceled. The
+exemption expires on completion, failure, interruption, or plugin reload and is not
+inherited by forks or subagents. Native permission choices retain OpenCode's usual
+scope; the exemption itself is never persisted.
+
 ## Options
 
 All options are optional and go inside the plugin's `options` object. Token

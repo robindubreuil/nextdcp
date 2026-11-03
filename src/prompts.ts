@@ -22,6 +22,8 @@ export const RECALL_DESCRIPTION = `Retrieve past conversation evidence ONLY when
 - page: 1-based; results say when more pages exist.
 Provide either id or query.`
 
+export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction for the current round only. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. Approval does not disable masking, manual compaction, native overflow handling, or normal compaction before the next round, and cannot cancel already-queued compaction.`
+
 const tokenLabel = (tokens: number) => tokens >= 1_000 ? `${(tokens / 1_000).toFixed(1)}k` : String(tokens)
 const recallCall = (id: string) => JSON.stringify({ id })
 export const outputStub = (tokens: number, id: string) =>

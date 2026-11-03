@@ -1,8 +1,9 @@
 import type { Plugin } from "@opencode/plugin"
 import type { SessionCompaction, SessionContext, SessionGenerate, SessionPrompt } from "@opencode/plugin/promise/session"
+import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { DEFAULT_MASK, messageTokens, partTokens, planMask, renderMask, tokens, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
 import { adoptNative, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
-import { RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
+import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, HandoffError, parseHandoff, type Handoff } from "./working.ts"
 import { formatCall, formatTranscript, MAX_SEARCH_HITS, recallPage, search, SEARCH_PAGE_HITS, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, exclusive, rowCalls } from "./store.ts"
@@ -14,6 +15,9 @@ type Store = ReturnType<typeof createStore>
 type RecallInput = { readonly id?: string; readonly query?: string; readonly page?: number }
 type ViewMessage = Message & { readonly id?: string; readonly role?: string }
 type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly size: number }
+type Deferral = { busy: number; idle?: number; approved: boolean }
+const sameRound = (decision: Deferral | undefined, info: { time?: { busy?: number; idle?: number } }): decision is Deferral =>
+  decision !== undefined && decision.busy === info.time?.busy && decision.idle === info.time?.idle
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const positive = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
 const nonnegative = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback
@@ -62,6 +66,7 @@ export function createController(ctx: Plugin.Context) {
   const inherited = new Map<string, Promise<void>>()
   const masksBySession = new Map<string, { checkpoint: string | null; masks: readonly Mask[] }>()
   const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
+  const deferrals = new Map<string, Deferral>()
   const windows = new Map<string, Promise<number | undefined>>()
   const transcripts = new Map<string, Transcript>()
   let transcriptChars = 0
@@ -183,7 +188,13 @@ export function createController(ctx: Plugin.Context) {
       const limit = budgetOption || ((await windowSize(event.model)) ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
       if (budget <= 0 || messageTokens(messages.filter((message) => message.role !== "system")) <= budget) return
-      if (growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
+      const decision = deferrals.get(event.sessionID)
+      let deferred = false
+      if (decision?.approved) try {
+        const info = await ctx.session.get({ sessionID: event.sessionID })
+        deferred = deferrals.get(event.sessionID) === decision && sameRound(decision, info)
+      } catch (error) { log("deferral scope", error) }
+      if (!deferred && growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
   }
 
@@ -318,7 +329,9 @@ export function createController(ctx: Plugin.Context) {
     }
   }
 
+  const onRoundEnded = (sessionID: SessionID) => { deferrals.delete(sessionID) }
   const onIdle = async (sessionID: SessionID) => {
+    onRoundEnded(sessionID)
     try {
       const [info, rows] = await Promise.all([
         ctx.session.get({ sessionID }), ctx.session.context({ sessionID }),
@@ -361,7 +374,7 @@ export function createController(ctx: Plugin.Context) {
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
-    for (const map of [admissions, attempts, cooldown, masksBySession, views, inherited]) map.delete(sessionID)
+    for (const map of [admissions, attempts, cooldown, masksBySession, views, inherited, deferrals]) map.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)
@@ -448,20 +461,61 @@ export function createController(ctx: Plugin.Context) {
       return `Historical evidence, page ${page}${start + SEARCH_PAGE_HITS < hits.length ? `; next page: ${page + 1}` : ""}${hits.length === MAX_SEARCH_HITS ? "; top 40 matches only—narrow the query for other evidence" : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
-  return { onPrompt, onContext, onGenerate, onCompaction, onIdle, onCompactionFinished, onDeleted, onFork, recall, registerModels: models.register }
+  const deferredNotice = "NextDCP's automatic mid-round budget compaction is deferred for this round only. Masking, manual compaction, native overflow handling, and normal compaction before the next round are unchanged. Already-queued compaction is not canceled."
+  const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
+    const reason = input.reason.trim()
+    if (!reason) return "Provide a concrete current need and explain why checkpointing plus recall would materially impair the task."
+    if (ctx.options.budget === false) return "NextDCP's automatic mid-round budget trigger is already disabled; no deferral is needed. Manual compaction and native overflow handling remain enabled."
+    const { sessionID } = context
+    const info = await ctx.session.get({ sessionID })
+    if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
+    const previous = deferrals.get(sessionID)
+    if (sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
+
+    // An unapproved record also prevents concurrent requests and retries after refusal.
+    const decision: Deferral = { busy: info.time.busy, idle: info.time.idle, approved: false }
+    deferrals.set(sessionID, decision)
+    // Preserve native rejection/interruption errors; returning them would change host control flow.
+    await ctx.permission.assert({
+      sessionID, agent: context.agent, action: "defer_compaction", resources: [reason], save: ["*"],
+      source: { type: "tool", messageID: context.messageID, id: context.id },
+    })
+    const current = await ctx.session.get({ sessionID })
+    if (deferrals.get(sessionID) !== decision || !sameRound(decision, current)) return "That round ended before deferral could take effect; normal compaction remains enabled."
+    decision.approved = true
+    return deferredNotice
+  }
+  return { onPrompt, onContext, onGenerate, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, registerModels: models.register }
 }
 
-/** Register the documented v2 hooks and recall tool. */
+/** Register the documented v2 hooks and tools. */
 export async function install(ctx: Plugin.Context) {
   const controller = createController(ctx)
   await controller.registerModels()
-  await ctx.tool.transform((editor) => editor.add({
-    name: "recall",
-    description: RECALL_DESCRIPTION,
-    input: { type: "object", properties: { id: { type: "string" }, query: { type: "string" }, page: { type: "integer", minimum: 1 } }, additionalProperties: false },
-    options: { codemode: false },
-    execute: async (input, context) => ({ content: await controller.recall(context.sessionID, input as RecallInput) }),
-  }))
+  await ctx.agent.transform((editor) => {
+    for (const item of editor.list()) editor.update(item.id, (agent) => {
+      // Insert after the host's default allow, before configured rules. Native saved
+      // approvals still win; forcing ask in an evaluate hook would override them.
+      const first = agent.permissions[0]
+      const index = first?.action === "*" && first.resource === "*" && first.effect === "allow" ? 1 : 0
+      agent.permissions.splice(index, 0, { action: "defer_compaction", resource: "*", effect: "ask" })
+    })
+  })
+  await ctx.tool.transform((editor) => {
+    editor.add({
+      name: "recall",
+      description: RECALL_DESCRIPTION,
+      input: { type: "object", properties: { id: { type: "string" }, query: { type: "string" }, page: { type: "integer", minimum: 1 } }, additionalProperties: false },
+      options: { codemode: false },
+      execute: async (input, context) => ({ content: await controller.recall(context.sessionID, input as RecallInput) }),
+    })
+    editor.add({
+      name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
+      input: { type: "object", properties: { reason: { type: "string", minLength: 1, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
+      options: { permission: "defer_compaction", codemode: false },
+      execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
+    })
+  })
   await ctx.session.hook("prompt", controller.onPrompt)
   await ctx.session.hook("context", controller.onContext)
   await ctx.session.hook("generate", controller.onGenerate)

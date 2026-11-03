@@ -14,7 +14,12 @@ rendered handoff, with a prompt target of about 1,000 or less. The estimate is
 chars/4 — with Han, kana and hangul characters counting as roughly one token
 each — not a provider-tokenizer guarantee, and does not include native retained
 tail, system instructions, tool definitions, or subsequent conversation.
-The existing soft/hard triggers and batched sticky observation masks are unchanged.
+The existing soft/hard triggers and batched sticky observation masks are unchanged
+unless the model requests native user approval to defer the mid-round budget
+trigger. A default-ask agent rule preserves configured permissions and native
+Always allow. One in-memory decision expires on completion, failure, interruption,
+or reload and is never inherited. Masking, manual/overflow compaction,
+already-admitted work, and next-prompt compaction remain unchanged.
 
 ## Commit and failure contract
 
