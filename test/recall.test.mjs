@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatCall, formatTranscript, recallPage, paginate, search, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { formatCall, formatTranscript, recallPage, paginate, search, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
 
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
   const documents = [
@@ -53,6 +53,18 @@ test("search is Unicode-normalized and snippets do not split surrogate pairs", (
   assert.ok(hit.snippet.isWellFormed())
 })
 
+test("snippets cut on word boundaries and never open or close on a word fragment", () => {
+  const text = "aaaaaa ".repeat(36) + "needle " + "bbbbbb ".repeat(120)
+  const [hit] = search("needle", [{ id: "E1", text }])
+  assert.ok(hit, "the match is found")
+  const words = hit.snippet.replace(/^…|…$/gu, "").split(" ")
+  assert.ok(words.every((word) => ["aaaaaa", "needle", "bbbbbb"].includes(word)), `no fragment in ${hit.snippet}`)
+  assert.equal(words[0], "aaaaaa", "the snippet opens at a word start")
+  assert.equal(words.at(-1), "bbbbbb", "the snippet closes at a word end")
+  assert.equal(words.filter((word) => word === "needle").length, 1)
+  assert.ok(hit.snippet.startsWith("…") && hit.snippet.endsWith("…"), "both ends show the text is truncated")
+})
+
 test("~1.5k-token pages preserve every character and have explicit continuation", () => {
   const text = "a".repeat(RECALL_PAGE_CHARS - 1) + "😀" + "b".repeat(RECALL_PAGE_CHARS) + "𝄞" + "z"
   const first = paginate(text)
@@ -68,6 +80,26 @@ test("~1.5k-token pages preserve every character and have explicit continuation"
   assert.throws(() => paginate(text, 0), /Invalid/)
   assert.throws(() => paginate(text, 4), /between 1 and 3/)
   assert.throws(() => paginate(text, 1, 1), /Invalid/)
+})
+
+test("id recall without page returns the whole original in one call", () => {
+  const small = "a".repeat(RECALL_PAGE_CHARS * 3)
+  const whole = recallPage("call-1", small)
+  assert.match(whole, /^recall \{"id":"call-1"\} \(whole output\)\n/)
+  assert.ok(whole.endsWith(small))
+  const big = "b".repeat(RECALL_PAGE_CHARS * 7) + "😀 tail"
+  const head = recallPage("call-2", big)
+  const body = head.slice(head.indexOf("\n") + 1)
+  assert.match(head, /^recall \{"id":"call-2","page":6\} \(whole output too large: first 30000 of 42007 characters; continue at page 6\)\n/)
+  assert.equal(body, big.slice(0, RECALL_ALL_CHARS))
+  const rest = Array.from({ length: 3 }, (_, index) => paginate(big, index + 6).content).join("")
+  assert.equal(body + rest, big)
+  assert.equal(recallPage("empty", ""), 'recall {"id":"empty"} (whole output)\n')
+  const files = []
+  const text = formatCall({ id: "call-3", name: "read", input: {}, result: { type: "content", value: [{ type: "text", text: "x ".repeat(3_500) }, { type: "file", uri: "file:///x", mime: "image/png" }] } }, files)
+  const withFile = recallPage("call-3", text, undefined, files)
+  assert.ok(Array.isArray(withFile), "attachment labels come with their native file")
+  assert.deepEqual(withFile.slice(1).map((file) => file.uri), ["file:///x"])
 })
 
 test("recall output contains complete original tool input and text or structured output", () => {

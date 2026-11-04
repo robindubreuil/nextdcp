@@ -4,7 +4,7 @@ import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
 import { WORKING_PROMPT, RECALL_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION } from "../src/prompts.ts"
-import { createController } from "../src/runtime.ts"
+import { createController, install } from "../src/runtime.ts"
 import { createStore } from "../src/store.ts"
 
 // Node's dependency-free tests replace only Plugin.define, whose v2.2.0 implementation
@@ -407,6 +407,26 @@ test("specific model replaces working state in one request without changing the 
   assert.deepEqual((await h.state.rpc.get({ sessionID: "s" })).preference, { mode: "specific", model: cheap })
 })
 
+test("the selected model receives readable text only: no hidden reasoning or row metadata", async () => {
+  const h = harness()
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  const rows = [
+    user("u1", "VISIBLE_USER_TEXT needle"),
+    { id: "a1", type: "assistant", model: { providerID: "provider", id: "model" }, providerMeta: "SECRET_PROVIDER_META", cost: { tokens: 12345 },
+      content: [{ type: "reasoning", text: "SECRET_REASONING_TRACE" }, { type: "text", text: "VISIBLE_ASSISTANT_TEXT" }] },
+    running("c1"),
+  ]
+  const result = await compactRows(h, rows)
+  assert.match(result.summary, /Archive through E1/)
+  const prompt = h.state.stateless[0].prompt
+  assert.match(prompt, /VISIBLE_USER_TEXT/)
+  assert.match(prompt, /VISIBLE_ASSISTANT_TEXT/)
+  assert.doesNotMatch(prompt, /SECRET_REASONING_TRACE/, "hidden reasoning is not sent as conversation content")
+  assert.doesNotMatch(prompt, /SECRET_PROVIDER_META/, "provider metadata is not sent as conversation content")
+  assert.doesNotMatch(prompt, /12345/, "transport fields do not ride along")
+})
+
 test("configured compaction model is honored and explicit main ignores it across reloads", async () => {
   const h = harness()
   addCheap(h)
@@ -485,6 +505,19 @@ test("unavailable, undersized, failed and empty models visibly fall back without
     h.state.rows = [completed("c1", result)]
     assert.match(await h.controller.recall("s", { id: "E1" }), /END_MARKER never truncate/)
   }
+})
+
+test("a missing experimental generate surface degrades to the main model with a clear warning", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  h.ctx.experimental = undefined
+  const result = await compactRows(h, [user("u1", "END_MARKER never truncate"), running("c1")])
+  assert.match(result.summary, /Archive through E1/)
+  assert.equal(h.state.stateless.length, 0, "no stateless call was attempted")
+  assert.equal(h.state.prompts.length, 1, "the main model produced the handoff")
+  assert.match(h.state.warnings[0].data.message, /cannot run stateless generation in this OpenCode build\); using the main model[\s\S]*No transcript was truncated/)
 })
 
 test("attachments use native projection, never a lossy text-only summary", async (t) => {
@@ -759,6 +792,49 @@ test("a hint that never reached a generation dies with its round", async () => {
   assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "an expired hint cannot leak into a later compaction")
 })
 
+test("the queued hint survives the one repair attempt", async () => {
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "work before a queued resume")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: "keep the trace alignment live", files: [] } })
+  h.state.rows = [user("u1", "work before a queued resume"), running("c1")]
+  const original = h.ctx.session.generate
+  h.ctx.session.generate = async (input) => {
+    if (input.prompt.includes("The previous attempt")) return original(input)
+    h.state.prompts.push(input.prompt)
+    return { text: "not JSON" }
+  }
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.ok(item.result)
+  assert.equal(h.state.prompts.length, 2, "exactly one repair attempt")
+  for (const attempt of h.state.prompts) {
+    assert.equal(generationData(attempt).queued, "keep the trace alignment live", "the repair retry keeps the hint")
+  }
+})
+
+test("a failed compaction keeps the hint for its next attempt; committing consumes it", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "work before a queued resume")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: "port the fix to the TUI bundle", files: [] } })
+  h.state.rows = [user("u1", "work before a queued resume"), running("c1")]
+  h.state.failGenerate = true
+  const failed = event()
+  await h.controller.onCompaction(failed)
+  assert.equal(failed.result, undefined, "the failed attempt commits nothing")
+  h.state.failGenerate = false
+  const retry = event()
+  await h.controller.onCompaction(retry)
+  assert.ok(retry.result)
+  assert.equal(generationData(h.state.prompts.at(-1)).queued, "port the fix to the TUI bundle", "a retried compaction keeps the hint")
+
+  h.state.rows = [completed("c1", retry.result), user("u2", "later work without a marker"), running("c2")]
+  await h.controller.onCompaction(event())
+  assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "committing consumed the hint")
+})
+
 test("the final assistant reply and reasoning can cross the soft threshold without being counted twice", async () => {
   const h = harness({ idle: 100, budget: 1_000_000 })
   h.state.rows = [user("u1", "x".repeat(320))]
@@ -930,19 +1006,65 @@ test("a granted deferral stops new masks and the budget trigger, then catches up
   assert.equal((await h.store.getMasks()).length, 2, "new elisions resume after the round")
 })
 
+test("budget: false disables the mid-round trigger, matching idle: false and the deferral notice", async () => {
+  const h = harness({ idle: false, budget: false })
+  h.state.rows = [user("u1", "x".repeat(360_000))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 0, "an explicit false disables the budget trigger entirely")
+})
+
 test("deferral is refused when physics cannot guarantee the window, and triggers stay active", async () => {
   const h = harness({ idle: false, budget: 100 })
   h.state.rows = [user("u1", "x".repeat(360_000))]
-  assert.match(await defer(h), /about 90000 estimated tokens, above the grant ceiling of 80000 of the 100000-token window/)
+  assert.match(await defer(h), /about 90000 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
   assert.equal(h.state.permissions.length, 0, "physics refuses before spending the user's attention")
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 1, "a refused grant leaves the budget trigger active")
+  const attached = harness({ idle: false, budget: 100 })
+  attached.state.rows = [{ ...user("u1", "small"), files: [{ mime: "image/png" }, { mime: "text/plain", data: Buffer.from("x".repeat(300_000)).toString("base64") }] }]
+  assert.match(await defer(attached), /about 76501 estimated tokens/, "attachments count at their media rate or decoded text size")
+  assert.equal(attached.state.permissions.length, 0)
   const unknown = harness({ idle: false })
   unknown.state.models = []
   unknown.state.rows = [user("u1", "small")]
   assert.match(await defer(unknown), /window is unknown/)
   assert.equal(unknown.state.permissions.length, 0)
+})
+
+test("the deferral estimate counts hidden reasoning the same way the response side does", async () => {
+  const h = harness({ idle: false, budget: 100 })
+  h.state.rows = [user("u1", "y".repeat(4_000)), { id: "a1", type: "assistant", content: [
+    { type: "reasoning", text: "r".repeat(280_000) }, { type: "text", text: "t".repeat(12_000) },
+  ] }]
+  // 1_000 user + 70_000 reasoning + 3_000 text = 74_000: hidden reasoning alone pushes it past 73_446.
+  assert.match(await defer(h), /about 74000 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
+  assert.equal(h.state.permissions.length, 0)
+  const visible = harness({ idle: false, budget: 100 })
+  visible.state.rows = [user("u1", "y".repeat(4_000)), { id: "a1", type: "assistant", content: [
+    { type: "text", text: "t".repeat(12_000) },
+  ] }]
+  assert.match(await defer(visible), /deferred for this round only/, "the same conversation without hidden reasoning fits")
+  assert.equal(visible.state.permissions.length, 1)
+})
+
+test("an unknown window announces its disabled budget trigger instead of failing silently", async (t) => {
+  const warnings = []
+  t.mock.method(console, "warn", (text) => warnings.push(text))
+  const h = harness({ idle: false, debug: true })
+  h.state.models = []
+  h.state.rows = [user("u1", "x".repeat(360_000))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 0)
+  assert.ok(warnings.some((text) => text.includes("budget trigger is disabled")), "the disabled trigger is logged when debugging")
+  assert.match(await defer(h), /The automatic mid-round budget trigger is likewise disabled while the window is unknown; set options\.budget to an explicit token count to enable it\./)
+
+  const explicit = harness({ idle: false, budget: 100_000 })
+  explicit.state.models = []
+  assert.match(await defer(explicit), /window is unknown/)
+  assert.doesNotMatch(await defer(explicit), /likewise disabled/, "an explicit budget is a deliberate choice, not a silent default")
 })
 
 test("a deferred round writes no catch-up marker; the next round pays the budget trigger instead", async () => {
@@ -1250,6 +1372,26 @@ test("native precompute and encrypted fallback leave native in control", async (
   assert.match(await h.controller.recall("s", { id: "tool-opaque" }), /original\.ts[\s\S]*archived tool data/)
 })
 
+test("a host without the permission surface keeps recall and core hooks alive", async (t) => {
+  const warnings = []
+  t.mock.method(console, "warn", (text) => warnings.push(text))
+  const h = harness()
+  h.ctx.permission = undefined
+  await install(h.ctx)
+  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "generate", "compaction"], "core hooks register regardless of the experimental surface")
+  assert.ok(h.state.tools.has("recall"))
+  assert.ok(!h.state.tools.has("defer_compaction"), "the deferral gate is omitted instead of half-registered")
+  assert.ok(warnings.some((text) => text.includes("lacks the permission surface")), "the omission is announced")
+
+  const broken = harness()
+  broken.ctx.agent.transform = async () => { throw new Error("experimental surface changed") }
+  await install(broken.ctx)
+  assert.deepEqual([...broken.state.hooks.keys()], ["prompt", "context", "generate", "compaction"])
+  assert.ok(broken.state.tools.has("recall"))
+  assert.ok(!broken.state.tools.has("defer_compaction"))
+  assert.ok(warnings.some((text) => text.includes("defer_compaction registration failed")), "a broken experimental registration cannot take the core down")
+})
+
 test("setup registers success-only idle events and clears the subscription", async () => {
   const h = harness({ idle: 1 })
   h.state.rows = [user("u", "an idle session with work")]
@@ -1331,8 +1473,10 @@ test("event subscription retries after end or error, and stops after cleanup", a
     subscriptions++
     if (subscriptions === 1) return (async function* () {})()
     if (subscriptions === 2) return (async function* () { throw new Error("stream failure") })()
-    return (async function* () {
+    if (subscriptions === 3) return (async function* () {
       yield { type: "session.execution.succeeded", data: { sessionID: "s" } }
+    })()
+    return (async function* () {
       await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))
     })()
   }
@@ -1343,10 +1487,14 @@ test("event subscription retries after end or error, and stops after cleanup", a
   t.mock.timers.tick(250)
   await setImmediate()
   assert.equal(subscriptions, 2)
-  t.mock.timers.tick(250)
+  t.mock.timers.tick(500) // A failed attempt doubles the gap.
   await setImmediate()
   await setImmediate()
   assert.equal(subscriptions, 3)
+  t.mock.timers.tick(250) // A delivered event reset the backoff to a prompt retry.
+  await setImmediate()
+  await setImmediate()
+  assert.equal(subscriptions, 4)
   assert.equal(h.state.compact, 0)
   await h.state.hooks.get("prompt")(prompt())
   assert.equal(h.state.compact, 1)
@@ -1355,5 +1503,5 @@ test("event subscription retries after end or error, and stops after cleanup", a
   t.mock.timers.tick(5_000)
   await setImmediate()
   assert.equal(lastSignal.aborted, true)
-  assert.equal(subscriptions, 3)
+  assert.equal(subscriptions, 4)
 })

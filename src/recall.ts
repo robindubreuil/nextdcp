@@ -4,6 +4,8 @@ import type { Result } from "@opencode/plugin/promise/tool"
 export type SearchDocument = { readonly id: string; readonly text: string; readonly summary?: string }
 export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean }
 export const RECALL_PAGE_CHARS = 6_000
+/** Whole-original recall returns up to five pages in one call; only larger originals page. */
+export const RECALL_ALL_CHARS = 5 * RECALL_PAGE_CHARS
 export const SEARCH_PAGE_HITS = 4
 export const MAX_SEARCH_HITS = 40
 export type RecallFile = { readonly offset: number; readonly file: { readonly type: "file"; readonly uri: string; readonly mime: string; readonly name?: string } }
@@ -24,6 +26,16 @@ function snippet(text: string, index: number): string {
   if (splitsPair(text, start)) start--
   let end = Math.min(text.length, start + 900)
   if (splitsPair(text, end)) end++
+  // Cut on word boundaries: a snippet never opens or closes on a word fragment.
+  // Whitespace is never half a surrogate pair, so these adjustments cannot split one.
+  if (start > 0 && !/\s/u.test(text[start - 1]) && !/\s/u.test(text[start])) {
+    const gap = text.slice(start, end).search(/\s/u)
+    if (gap !== -1 && start + gap + 1 < end) start += gap + 1
+  }
+  if (end < text.length && !/\s/u.test(text[end]) && !/\s/u.test(text[end - 1])) {
+    const gap = text.slice(start, end).search(/\s\S*$/u)
+    if (gap > 0) end = start + gap
+  }
   return `${start ? "…" : ""}${text.slice(start, end).replace(/\s+/gu, " ").trim()}${end < text.length ? "…" : ""}`
 }
 
@@ -215,11 +227,25 @@ export function formatTranscript(id: string, rows: readonly { readonly id: strin
   return render(parts, "\n\n", files)
 }
 
-/** Return attachments only on the page where their label starts, never as base64 text. */
-export function recallPage(id: string, text: string, page = 1, files: readonly RecallFile[] = []): RecallContent {
-  const result = paginate(text, page)
+/** Return attachments only on the page where their label starts, never as base64 text.
+    Without page, return the whole original up to RECALL_ALL_CHARS in one call; an explicit
+    page steps through larger originals in RECALL_PAGE_CHARS pages. */
+export function recallPage(id: string, text: string, page?: number, files: readonly RecallFile[] = []): RecallContent {
   const bounds = pageBounds(text, RECALL_PAGE_CHARS)
-  const attached = files.filter(({ offset }) => offset >= bounds[page - 1] && offset < bounds[page]).map(({ file }) => file)
+  const pages = bounds.length - 1
+  const attach = (from: number, to: number) => files.filter(({ offset }) => offset >= from && offset < to).map(({ file }) => file)
+  if (page === undefined) {
+    const shown = Math.min(pages, RECALL_ALL_CHARS / RECALL_PAGE_CHARS)
+    const end = bounds[shown]
+    const attached = attach(0, end)
+    const label = shown < pages
+      ? `recall ${JSON.stringify({ id, page: shown + 1 })} (whole output too large: first ${end} of ${text.length} characters; continue at page ${shown + 1})`
+      : `recall ${JSON.stringify({ id })} (whole output)`
+    const whole = `${label}\n${text.slice(0, end)}`
+    return attached.length ? [{ type: "text", text: whole }, ...attached] : whole
+  }
+  const result = paginate(text, page)
+  const attached = attach(bounds[page - 1], bounds[page])
   const content = `recall ${JSON.stringify({ id, page })} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
   return attached.length ? [{ type: "text", text: content }, ...attached] : content
 }

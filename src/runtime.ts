@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin"
 import type { SessionCompaction, SessionContext, SessionGenerate, SessionPrompt } from "@opencode/plugin/promise/session"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { DEFAULT_MASK, messageTokens, partTokens, planMask, renderMask, tokens, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
+import { DEFAULT_MASK, mediaTokens, messageTokens, partTokens, planMask, renderMask, tokens, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
 import { adoptNative, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, HandoffError, parseHandoff, type Handoff } from "./working.ts"
@@ -37,18 +37,31 @@ function growthAfter(messages: readonly ViewMessage[], checkpoint: string | null
   return messageTokens(messages.slice(start).filter((message) => message.role !== "system"))
 }
 
-/** Upper bound on the raw conversation a deferral may hold live, as a share of the model window. */
+/** Upper bound on the raw conversation a deferral may hold live, as a share of the window left after the output reserve. */
 const DEFER_WINDOW_SHARE = 0.8
 
-/** Estimated tokens of the raw, unmasked conversation a deferral would hold live. */
+/** Estimated tokens of a user-row attachment: fixed media rates, decoded text size otherwise. */
+function attachmentTokens(file: unknown): number {
+  if (!object(file)) return 0
+  const media = mediaTokens(file.mime)
+  if (media) return media
+  if (typeof file.data !== "string") return 0
+  try { return tokens(new TextDecoder().decode(Uint8Array.from(atob(file.data), (char) => char.charCodeAt(0)))) }
+  catch { return Math.ceil(file.data.length * 3 / 16) }
+}
+
+/** Estimated tokens of the raw, unmasked conversation a deferral would hold live,
+ *  counting the same text and reasoning parts that responseTokens counts. */
 function conversationTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
     if (row.type === "user") {
-      const text = (row as Row & { text?: unknown }).text
-      return sum + (typeof text === "string" ? tokens(text) : 0)
+      const data = row as Row & Record<string, unknown>
+      const text = typeof data.text === "string" ? tokens(data.text) : 0
+      const files = Array.isArray(data.files) ? data.files.reduce<number>((n, file) => n + attachmentTokens(file), 0) : 0
+      return sum + text + files
     }
     if (row.type !== "assistant") return sum
-    const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && part.type === "text" ? partTokens(part as Part) : 0), 0)
+    const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || part.type === "reasoning") ? partTokens(part as Part) : 0), 0)
     return sum + text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
   }, 0)
 }
@@ -73,7 +86,7 @@ export function createController(ctx: Plugin.Context) {
     protected: Array.isArray(rawMask.protected) && rawMask.protected.every((name) => typeof name === "string") ? rawMask.protected : DEFAULT_MASK.protected,
   }
   const idle = ctx.options.idle === false ? Infinity : positive(ctx.options.idle, 25_000)
-  const budgetOption = positive(ctx.options.budget, 0), memoryBudget = positive(rawMemory.budget, DEFAULT_MEMORY_BUDGET)
+  const budgetOption = ctx.options.budget === false ? Infinity : positive(ctx.options.budget, 0), memoryBudget = positive(rawMemory.budget, DEFAULT_MEMORY_BUDGET)
   const debug = ctx.options.debug === true
   const guarded = new Map<string, ReturnType<typeof setTimeout>>()
   const admissions = new Map<string, Promise<void>>()
@@ -84,9 +97,10 @@ export function createController(ctx: Plugin.Context) {
   const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
   const deferrals = new Map<string, Deferral>()
   // The queued message that triggered a deferred-marker compaction; evidence for the
-  // working state, read once by whichever generation actually runs.
+  // working state, consumed only by whichever generation commits its handoff. Failed
+  // generations keep the signal for their retry; the round's end clears what never ran.
   const hints = new Map<string, string>()
-  const windows = new Map<string, Promise<number | undefined>>()
+  const windows = new Map<string, Promise<{ context: number; output: number } | undefined>>()
   const transcripts = new Map<string, Transcript>()
   let transcriptChars = 0
   const keyFor = (sessionID: string, id: string) => `${sessionID}\0${id}`
@@ -125,15 +139,16 @@ export function createController(ctx: Plugin.Context) {
     if (masksBySession.get(sessionID) === cached) masksBySession.set(sessionID, { checkpoint, masks })
     return masks
   }
-  const windowSize = async (ref: unknown): Promise<number | undefined> => {
+  const windowSize = async (ref: unknown): Promise<{ context: number; output: number } | undefined> => {
     const model = modelRef(ref)
     if (!model) return undefined
     const key = JSON.stringify([model.providerID, model.id])
     let lookup = windows.get(key)
     if (!lookup) {
       lookup = ctx.model.list().then((models) => {
-        const size = models.data.find((item) => item.providerID === model.providerID && item.id === model.id)?.limit.context
-        return typeof size === "number" && Number.isFinite(size) && size > 0 ? size : undefined
+        const limit = models.data.find((item) => item.providerID === model.providerID && item.id === model.id)?.limit
+        if (typeof limit?.context !== "number" || !Number.isFinite(limit.context) || limit.context <= 0) return undefined
+        return { context: limit.context, output: typeof limit.output === "number" && Number.isFinite(limit.output) && limit.output > 0 ? limit.output : 0 }
       })
       windows.set(key, lookup)
     }
@@ -214,9 +229,12 @@ export function createController(ctx: Plugin.Context) {
       const growth = growthAfter(messages, checkpoint)
       if (growth === undefined) { views.delete(event.sessionID); return }
       views.set(event.sessionID, { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) })
-      const limit = budgetOption || ((await windowSize(event.model)) ?? 0) * 0.5
+      const limit = budgetOption || ((await windowSize(event.model))?.context ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
-      if (budget <= 0 || messageTokens(messages.filter((message) => message.role !== "system")) <= budget) return
+      // An unknown window disables the auto budget instead of assuming a size; surface
+      // that state rather than silently never firing.
+      if (budget <= 0) return log("budget trigger is disabled; the model window is unknown and options.budget is not set", undefined)
+      if (messageTokens(messages.filter((message) => message.role !== "system")) <= budget) return
       if (!held && growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
   }
@@ -298,7 +316,6 @@ export function createController(ctx: Plugin.Context) {
         ? [{ id: row.id, type: "user" as const, text: (row as Row & { text: string }).text }] : [])
       const gap = !boundary.archived || [...existing.catalog.values()].some((episode) => episode.gap)
       const queued = hints.get(event.sessionID)
-      hints.delete(event.sessionID)
       const context = { through: id, budget: memoryBudget, previous: existing.working ?? renderHandoff(existing),
         archives: [...new Set([id, ...(existing.through ? [existing.through] : []), ...(existing.working?.references.map((ref) => ref.id) ?? [])])],
         users: users.map((user) => ({ id: user.id, start: user.text.slice(0, 160) })), ...(queued ? { queued } : {}) }
@@ -347,6 +364,7 @@ export function createController(ctx: Plugin.Context) {
       const record: Checkpoint = { id: boundary.id, parent: boundary.parent, episode, working: handoff.working,
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
+      hints.delete(event.sessionID) // The committed handoff is the signal's only consumer.
       event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget), metadata: { nextdcp: { version: 2 } } }
     } catch (error) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
@@ -367,6 +385,7 @@ export function createController(ctx: Plugin.Context) {
       // hosts stamp the new idle time when the round ends, before this event fires.
       const held = decision !== undefined && decision.approved && decision.busy === info.time?.busy
       deferrals.delete(sessionID)
+      hints.delete(sessionID) // Round-scoped evidence dies with its round, as onRoundEnded clears it.
       if (guarded.has(sessionID) && !running(rows)) clearGuard(sessionID)
       if (info.parentID || idle === Infinity) return
       // Add output produced after the last request, including an updated retry row.
@@ -453,10 +472,10 @@ export function createController(ctx: Plugin.Context) {
     try {
       const id = typeof input.id === "string" ? input.id.trim() : ""
       const query = typeof input.query === "string" ? input.query.trim() : ""
-      const page = input.page ?? 1
+      const page = input.page
       if ((!id && !query) || (id && query)) return "Provide either id or query."
       if (query.length > 2_000) return "Use a query of at most 2,000 characters; prefer exact identifiers and a few task keywords."
-      if (!Number.isSafeInteger(page) || page < 1) return "Page must be a positive integer."
+      if (page !== undefined && (!Number.isSafeInteger(page) || page < 1)) return "Page must be a positive integer."
       const store = storeFor(sessionID)
       let call = id ? await store.getCall(id) : undefined
       const renderCall = () => {
@@ -493,10 +512,10 @@ export function createController(ctx: Plugin.Context) {
         if (original) documents.push({ id: mask.id, text: formatCall(original) })
       }
       if (!documents.length) return "No matching snippets."
-      const hits = search(query, documents, MAX_SEARCH_HITS), start = (page - 1) * SEARCH_PAGE_HITS
-      if (start >= hits.length) return page === 1 ? "No matching snippets." : "No more search results."
+      const hits = search(query, documents, MAX_SEARCH_HITS), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
+      if (start >= hits.length) return at === 1 ? "No matching snippets." : "No more search results."
       const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => `- recall ${JSON.stringify({ id: hit.id, page: hit.page })}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`)
-      return `Historical evidence, page ${page}${start + SEARCH_PAGE_HITS < hits.length ? `; next page: ${page + 1}` : ""}${hits.length === MAX_SEARCH_HITS ? "; top 40 matches only—narrow the query for other evidence" : ""}\n${lines.join("\n")}`
+      return `Historical evidence, page ${at}${start + SEARCH_PAGE_HITS < hits.length ? `; next page: ${at + 1}` : ""}${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
   const deferredNotice = "NextDCP's automatic mid-round budget compaction and new output masking are deferred for this round only, so the raw conversation stays fully live. Committed elisions still render and stay recallable; manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
@@ -513,15 +532,19 @@ export function createController(ctx: Plugin.Context) {
     // Physics before consent: a grant must fit the window, so no approval is spent on a
     // conversation that overflows anyway. Nothing is recorded on denial; recomputing is
     // cheap and never prompts.
-    let rows: readonly Row[], windowTokens: number | undefined
+    let rows: readonly Row[], window: { context: number; output: number } | undefined
     try {
-      [rows, windowTokens] = await Promise.all([ctx.session.context({ sessionID }), windowSize(info.model)])
+      [rows, window] = await Promise.all([ctx.session.context({ sessionID }), windowSize(info.model)])
     } catch (error) {
       log("deferral physics", error)
       return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
     }
-    if (windowTokens === undefined) return "Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed. Recall selectively instead."
-    const estimate = conversationTokens(rows), ceiling = Math.floor(windowTokens * DEFER_WINDOW_SHARE)
+    if (window === undefined) return `Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed.${budgetOption === 0 ? " The automatic mid-round budget trigger is likewise disabled while the window is unknown; set options.budget to an explicit token count to enable it." : ""} Recall selectively instead.`
+    // The output limit and a 20% share of the rest stay unspent: system instructions,
+    // tool definitions, and the round's own output must still fit nextdcp's estimate.
+    const reserve = window.output > 0 ? window.output : 8_192
+    const windowTokens = window.context
+    const estimate = conversationTokens(rows), ceiling = Math.floor((windowTokens - reserve) * DEFER_WINDOW_SHARE)
     if (estimate > ceiling) return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
 
     // An unapproved record also prevents concurrent requests and retries after refusal.
@@ -544,15 +567,6 @@ export function createController(ctx: Plugin.Context) {
 export async function install(ctx: Plugin.Context) {
   const controller = createController(ctx)
   await controller.registerModels()
-  await ctx.agent.transform((editor) => {
-    for (const item of editor.list()) editor.update(item.id, (agent) => {
-      // Insert after the host's default allow, before configured rules. Native saved
-      // approvals still win; forcing ask in an evaluate hook would override them.
-      const first = agent.permissions[0]
-      const index = first?.action === "*" && first.resource === "*" && first.effect === "allow" ? 1 : 0
-      agent.permissions.splice(index, 0, { action: "defer_compaction", resource: "*", effect: "ask" })
-    })
-  })
   await ctx.tool.transform((editor) => {
     editor.add({
       name: "recall",
@@ -561,13 +575,33 @@ export async function install(ctx: Plugin.Context) {
       options: { codemode: false },
       execute: async (input, context) => ({ content: await controller.recall(context.sessionID, input as RecallInput) }),
     })
-    editor.add({
-      name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
-      input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 500, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
-      options: { permission: "defer_compaction", codemode: false },
-      execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
-    })
   })
+  // The deferral gate is the only consumer of the experimental permission surface.
+  // Feature-detect and register it defensively: a V2.3 shape change warns once and
+  // leaves recall, masking, and archival alive instead of failing plugin setup.
+  if (typeof ctx.agent?.transform === "function" && typeof ctx.permission?.assert === "function") {
+    try {
+      await ctx.agent.transform((editor) => {
+        for (const item of editor.list()) editor.update(item.id, (agent) => {
+          // Insert after the host's default allow, before configured rules. Native saved
+          // approvals still win; forcing ask in an evaluate hook would override them.
+          const first = agent.permissions[0]
+          const index = first?.action === "*" && first.resource === "*" && first.effect === "allow" ? 1 : 0
+          agent.permissions.splice(index, 0, { action: "defer_compaction", resource: "*", effect: "ask" })
+        })
+      })
+      await ctx.tool.transform((editor) => {
+        editor.add({
+          name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
+          input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 500, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
+          options: { permission: "defer_compaction", codemode: false },
+          execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
+        })
+      })
+    } catch (error) {
+      console.warn(`[nextdcp] defer_compaction registration failed; deferral is unavailable${error instanceof Error ? `: ${error.message}` : ""}`)
+    }
+  } else console.warn("[nextdcp] this OpenCode build lacks the permission surface; defer_compaction is unavailable")
   await ctx.session.hook("prompt", controller.onPrompt)
   await ctx.session.hook("context", controller.onContext)
   await ctx.session.hook("generate", controller.onGenerate)

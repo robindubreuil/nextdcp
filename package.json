@@ -17,16 +17,22 @@
     "build": "esbuild src/index.ts src/tui.ts --bundle --platform=node --format=esm --target=es2023 --external:@opencode/plugin --external:@opencode/plugin/tui --outdir=dist",
     "prepack": "npm run build",
     "pretest": "npm run build",
+    "typecheck": "tsc --noEmit",
     "test": "node --test",
-    "prerelease:local": "npm test",
+    "prerelease:local": "npm run typecheck && npm test",
     "release:local": "node scripts/release.mjs"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.2.5 <3"
   },
   "devDependencies": {
     "@opencode/plugin": "2.2.5",
-    "esbuild": "0.28.2"
+    "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
   },
   "license": "MIT"
 }

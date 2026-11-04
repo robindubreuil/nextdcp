@@ -92,8 +92,12 @@ export function createModels(ctx: Plugin.Context) {
       const model = matching(await choices(), selected)
       if (!model) throw new Error(`${modelLabel(selected)} is unavailable`)
       assertFits(model, prompt)
+      // Feature-detect the single experimental surface this plugin consumes; a V2.3
+      // shape change must degrade to the main-model fallback, not a deep TypeError.
+      const generate = ctx.experimental?.generate
+      if (typeof generate?.text !== "function") throw new Error(`${modelLabel(selected)} cannot run stateless generation in this OpenCode build`)
       let result: Awaited<ReturnType<typeof ctx.experimental.generate.text>>
-      try { result = await ctx.experimental.generate.text({ model: selected as HostRef, prompt }) } catch {
+      try { result = await generate.text({ model: selected as HostRef, prompt }) } catch {
         // Provider errors can contain prompts or credentials. Do not send them to clients.
         throw new Error(`${modelLabel(selected)} request failed`)
       }

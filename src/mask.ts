@@ -18,7 +18,7 @@ export type ArchivedCall = { readonly id: string; readonly name: string; readonl
 export type MaskOptions = { readonly minTokens: number; readonly distance: number; readonly batch: number; readonly protected: readonly string[] }
 export type MaskPlan = { readonly commit: boolean; readonly savedTokens: number; readonly base: readonly Mask[]; readonly masks: readonly Mask[]; readonly calls: readonly ArchivedCall[] }
 
-export const DEFAULT_MASK: MaskOptions = { minTokens: 400, distance: 20_000, batch: 10_000, protected: ["skill", "todowrite", "todoread", "task", "subagent"] }
+export const DEFAULT_MASK: MaskOptions = { minTokens: 400, distance: 20_000, batch: 10_000, protected: ["skill", "todowrite", "todoread", "task", "subagent", "recall"] }
 // Non-CJK text matches the native chars/4 estimate. Han, kana and hangul are
 // closer to one token per character, so they are counted separately.
 const NON_ASCII = /[\u0080-\uFFFF]/
@@ -32,7 +32,7 @@ export const tokens = (text: string): number => {
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const json = (value: unknown) => JSON.stringify(value) ?? ""
-const mediaTokens = (mime: unknown) => {
+export const mediaTokens = (mime: unknown) => {
   if (typeof mime !== "string") return 0
   const type = mime.toLowerCase()
   return type.startsWith("image/") ? 1_500 : type === "application/pdf" ? 2_000 : 0
@@ -218,7 +218,7 @@ export function planMask(messages: readonly Message[], previous: readonly Mask[]
       if (output === undefined && (distances.get(`${current.result.message}/${current.result.partIndex}`) ?? 0) > options.distance) {
         const size = partTokens(current.result.part)
         if (size > options.minTokens) {
-          const stub = outputStub(size, id)
+          const stub = outputStub(size, id, pair.call.part.name)
           const after = partTokens({ ...current.result.part, result: { type: "text", value: stub } } as Result)
           if (after < size) { output = stub; saved += size - after }
         }

@@ -386,14 +386,22 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   const getCalls = async (): Promise<ArchivedCall[]> => (await all("calls")).map(({ id, value }) => {
     return archivedCall(decode<unknown>(value, key("calls", id)), id)
   })
-  /** Remove every record of a deleted session. */
+  /** Remove every record of a deleted session, including keys written outside this store. */
   const clear = async () => {
-    for (const kind of ["rows", "calls", "masks", "pending", "checkpoints"]) {
-      for (const { id } of await all(kind)) await storage.remove(key(kind, id))
-    }
-    await storage.remove(counterKey)
-    await storage.remove(`${root}fork`)
-    await storage.remove(deferredKey)
+    // A prefix scan of the session root replaces any per-kind list: preferences and
+    // warnings live under the same root but are not written through this store.
+    const keys: string[] = []
+    let after: string | undefined
+    do {
+      const page = await storage.scan({ prefix: root, after, limit: 500 })
+      for (const entry of page.entries) {
+        if (!entry.key.startsWith(root)) throw new Error("Invalid storage scan entry")
+        keys.push(entry.key)
+      }
+      if (page.next !== undefined && page.next === after) throw new Error("Storage scan did not advance")
+      after = page.next
+    } while (after !== undefined)
+    for (const key of keys) await storage.remove(key)
   }
   return { getRow, getRows, getCall, getCalls, saveCall, getMasks, commitMask, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, clear }
 }

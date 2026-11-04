@@ -27,7 +27,7 @@ test("the captured message fixture is masked without changing anything else", as
   assert.equal(before[firstResult].id, undefined)
   const rendered = renderMask(before, plan.masks)
   assert.equal(plan.savedTokens, messageTokens(before) - messageTokens(rendered))
-  assert.match(rendered[firstResult].content[0].result.value, /^\[Output elided to save context: ~[\d.]+k? tokens\. Retrieve with recall/)
+  assert.match(rendered[firstResult].content[0].result.value, /^\[Output elided to save context: \w+, ~[\d.]+k? tokens\. (Retrieve with recall|Re-run it)/)
   assert.deepEqual(rendered[secondResult], before[secondResult])
   golden[firstResult].content[0].result = rendered[firstResult].content[0].result
   assert.deepEqual(rendered, golden)
@@ -135,8 +135,8 @@ test("large nested input fields and output can become eligible in separate batch
   const second = planMask(extended, first.masks, options({ distance: 2_500 }))
   assert.equal(second.masks.length, 1)
   assert.deepEqual(second.masks[0].input, first.masks[0].input)
-  assert.match(second.masks[0].output, /^\[Output elided to save context: ~/)
-  assert.doesNotMatch(second.masks[0].output, /"content"|write/)
+  assert.match(second.masks[0].output, /^\[Output elided to save context: /)
+  assert.doesNotMatch(second.masks[0].output, /"content"|"text"|"nested"/, "the output stub names the tool but must not echo the input")
   assert.equal(second.savedTokens, messageTokens(renderMask(extended, first.masks)) - messageTokens(renderMask(extended, second.masks)))
 })
 
@@ -146,6 +146,7 @@ test("protected, provider-executed, incomplete, failed, and ambiguous pairs are 
     [call("a", "skill", { text: huge }), result("a", "skill", huge)],
     [call("b", "task", { text: huge }), result("b", "task", huge)],
     [call("sub", "subagent", { text: huge }), result("sub", "subagent", huge)],
+    [call("r", "recall", { text: huge }), result("r", "recall", huge)],
     [call("c", "read", { text: huge }, { providerExecuted: true }), result("c", "read", huge)],
     [call("d", "read", { text: huge }), result("d", "read", huge, { providerExecuted: true })],
     [call("e", "read", { text: huge }), { type: "tool-result", id: "e", name: "read", result: { type: "error", value: huge } }],
@@ -160,7 +161,7 @@ test("protected, provider-executed, incomplete, failed, and ambiguous pairs are 
     assert.equal(planMask(messages, [], options()).commit, false, JSON.stringify(parts.map((p) => p.id)))
     // Protection is checked at planning time; the remaining cases must also be
     // rejected when rendering an invalid or incomplete persisted pair.
-    if (index >= 3) assert.deepEqual(renderMask(messages, [{ id: parts[0].id, name: parts[0].name, output: "unsafe", input: [{ path: ["text"], stub: "unsafe" }] }]), messages)
+    if (index >= 4) assert.deepEqual(renderMask(messages, [{ id: parts[0].id, name: parts[0].name, output: "unsafe", input: [{ path: ["text"], stub: "unsafe" }] }]), messages)
   }
 })
 
@@ -186,7 +187,8 @@ test("request estimates include system, tool definitions, content and native med
 
 test("stub templates escape identifiers without repeating the tool input", () => {
   const id = 'a"b'
-  assert.equal(outputStub(3_100, id), '[Output elided to save context: ~3.1k tokens. Retrieve with recall {"id":"a\\"b"}]')
+  assert.equal(outputStub(3_100, id, "write"), '[Output elided to save context: write, ~3.1k tokens. Retrieve with recall {"id":"a\\"b"}]')
+  assert.equal(outputStub(3_100, id, "read"), '[Output elided to save context: read, ~3.1k tokens. Re-run it for current content, or recall {"id":"a\\"b"} for the original]')
   assert.equal(inputStub("write", 901, id), '[Input elided to save context: write, ~901 tokens. Retrieve with recall {"id":"a\\"b"}]')
   const messages = [msg("assistant", call("id", "write", { text: "x".repeat(5_000) })), msg("tool", result("id", "write", "o".repeat(1_000))), tail()]
   assert.ok(planMask(messages, [], options()).masks[0].output, "short notice allows useful output masking even for a large input")

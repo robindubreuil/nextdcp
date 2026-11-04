@@ -62,8 +62,10 @@ BM25 ranks bounded transcript passages and short archive notes, not whole long
 documents. Excerpts choose the densest relevant window, retain their source ID
 and raw-text page, and deduplicate identical evidence. Notes are explicitly labeled
 as summaries. Search returns four excerpts per page, at most 40 ranked results;
-opening an original returns at most 6,000 characters, with native files only on
-the page containing their label. Pagination preserves Unicode surrogate pairs.
+opening an original returns the whole original in one call up to 30,000 characters,
+or 6,000-character pages for larger ones, with native files only on the part
+containing their label. Retrieved originals stay live once recalled; pagination
+preserves Unicode surrogate pairs.
 Only archived/hidden data is indexed; visible history is not redundantly retrieved.
 
 Local production installs use content-addressed, never-overwritten release copies.

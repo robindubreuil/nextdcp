@@ -15,3 +15,8 @@ test("the shipped entry is a single ESM bundle with only the host SDK external",
   const tui = await readFile(new URL("../dist/tui.js", import.meta.url), "utf8")
   assert.deepEqual([...tui.matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((match) => match[1]), ["@opencode/plugin/tui"])
 })
+
+test("the manifest supports hosts on Node 20 and later", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  assert.equal(manifest.engines.node, ">=20")
+})

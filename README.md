@@ -102,9 +102,10 @@ retried in that round.
 The reason is visible in the tool call and in the GUI's approval card; the terminal's
 generic approval box shows the tool name, with the reason in the tool call above it.
 
-Physics gates the request before the prompt: the unmasked conversation must fit
-within 80% of the model's context window, and an unknown window is refused, so no
-approval is spent on a conversation that would overflow anyway.
+Physics gates the request before the prompt: the unmasked conversation, including
+attachments, must fit within 80% of the model's context window after reserving its
+output limit; an unknown window is refused, so no approval is spent on a
+conversation that would overflow anyway.
 
 Approval suspends NextDCP's automatic **mid-round budget trigger** and the planning
 of **new** output elisions for that round, keeping the raw conversation fully live.
@@ -126,11 +127,11 @@ roughly one token each.
 | Option | Default | Meaning |
 |---|---:|---|
 | `idle` | `25000` | After a successful turn with this much new conversation, compact on the **next prompt**, not while idle. Set `false` to disable. Subagent sessions are ignored. |
-| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this after masking and new growth reaches `min(idle, budget / 4)`. System instructions and tool definitions are excluded. |
+| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this after masking and new growth reaches `min(idle, budget / 4)`. System instructions and tool definitions are excluded. Set `false` to disable. |
 | `mask.minTokens` | `400` | Minimum size, exclusive, of a tool result or input string to consider. |
 | `mask.distance` | `20000` | Minimum distance, exclusive, from the end of the request. |
 | `mask.batch` | `10000` | Minimum estimated tokens saved before committing new masks. |
-| `mask.protected` | `skill`, `todowrite`, `todoread`, `task`, `subagent` | Tool names never newly masked. Supplying this list replaces the default. |
+| `mask.protected` | `skill`, `todowrite`, `todoread`, `task`, `subagent`, `recall` | Tool names never newly masked. Supplying this list replaces the default. Retrieved evidence stays live once recalled. |
 | `memory.budget` | `2000` | Maximum estimated tokens for the complete rendered working state, including headings and references. Target is normally about 1000 or less. Independent of conversation age and model window. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |
 
@@ -151,8 +152,10 @@ searchable archive note. Only the current objective, standing constraints,
 relevant verified state, unfinished work, and at most three evidence references
 are kept visible. Completed work is archived, not appended to the handoff.
 No topic classifier, observer model, embedding service, or merge request runs.
-Recall returns readable transcripts, with complete originals available through
-pages of at most 6,000 characters. Images, PDFs, and attachments return as native files on the
+Recall returns readable transcripts, with complete originals returned in one call
+up to 30,000 characters and larger originals available through
+pages of at most 6,000 characters. Everything recall returns stays live for the
+rest of the episode. Images, PDFs, and attachments return as native files on the
 page containing their attachment label, not as JSON or base64 text. Inline text
 attachments are decoded and searchable. The selected model must support the
 attachment's media type; URI-only files must still exist.
@@ -242,4 +245,5 @@ and backups accordingly.
   cost or better task accuracy.
 
 From a source checkout, run `npm test` with Node.js 22.18+ (tested with Node 26).
-It builds the shipped entry before running the native TypeScript tests.
+It builds the shipped entry before running the native TypeScript tests; `npm run
+typecheck` checks `src/` under `strict` mode.

@@ -1,6 +1,16 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import { modelLabel, modelRpc, type ModelPreference, type ModelState } from "./model-rpc.ts"
 
+// RPC rejections arrive as plain { type, message } objects carrying host-authored text
+// (models.ts explains every refused selection itself). Transport failures are Errors and
+// keep the generic fallback, which hides uncontrolled internals.
+const rpcRejection = (error: unknown): string | undefined => {
+  if (typeof error !== "object" || error === null || error instanceof Error) return undefined
+  const failure = error as { type?: unknown; message?: unknown }
+  return typeof failure.type === "string" && typeof failure.message === "string" && failure.message.trim()
+    ? failure.message.trim() : undefined
+}
+
 export function installPicker(ctx: Plugin.Context) {
   const rpc = ctx.client.rpc(modelRpc)
   let open = false
@@ -37,9 +47,9 @@ export function installPicker(ctx: Plugin.Context) {
         await rpc.set({ sessionID, preference: selected }, { signal: abort.signal })
         if (disposed) return
         ctx.ui.toast.show({ title: "Compaction model saved", message: `${key(selected)} · next compaction · main model unchanged`, variant: "success" })
-      } catch {
+      } catch (error) {
         if (disposed) return
-        ctx.ui.toast.show({ title: "Compaction model", message: "Could not load or save the selection. Check that nextdcp is active and try again.", variant: "error" })
+        ctx.ui.toast.show({ title: "Compaction model", message: rpcRejection(error) ?? "Could not load or save the selection. Check that nextdcp is active and try again.", variant: "error" })
       } finally { open = false }
     },
   }] }))

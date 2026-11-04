@@ -360,3 +360,14 @@ test("deferred compaction is durable, session-scoped, validated and removed with
     await assert.rejects(store.getDeferredCompaction(), /Invalid deferred compaction/)
   }
 })
+
+test("clear removes the whole session root, including keys written outside the store", async () => {
+  const kv = new MemoryStorage(), store = createStore(kv, "s")
+  await store.saveDeferredCompaction({ checkpoint: null, after: "m1", tokens: 25_001 })
+  kv.values.set("sessions/s/model", JSON.stringify({ mode: "specific" }))
+  kv.values.set("sessions/s/model/warning", "stale warning")
+  kv.values.set("sessions/s/unknown-future-key", "x")
+  kv.values.set("sessions/other/rows/r9", "{}")
+  await store.clear()
+  assert.deepEqual([...kv.values.keys()], ["sessions/other/rows/r9"], "the session root is gone; other sessions survive")
+})

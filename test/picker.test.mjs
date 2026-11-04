@@ -140,3 +140,25 @@ test("fallback events toast only for the current session", async () => {
     cleanup()
   }
 })
+
+test("picker surfaces host-authored RPC rejections and keeps transport errors generic", async () => {
+  const fallback = "Could not load or save the selection. Check that nextdcp is active and try again."
+  const attempts = [
+    [{ type: "invalid_selection", message: "That text model or variant is unavailable; selection was not changed" },
+      "That text model or variant is unavailable; selection was not changed"],
+    [new Error("socket hang up"), fallback],
+    [{ type: "invalid_selection", message: "   " }, fallback],
+  ]
+  for (const [failure, message] of attempts) {
+    const { ctx, state } = harness()
+    const rpc = ctx.client.rpc()
+    ctx.client.rpc = () => ({ ...rpc, set: async () => { throw failure } })
+    const cleanup = installPicker(ctx)
+    try {
+      await state.commands().commands[0].run()
+      assert.equal(state.saved.length, 0, "nothing was saved")
+      assert.equal(state.toasts.at(-1).variant, "error")
+      assert.equal(state.toasts.at(-1).message, message)
+    } finally { cleanup() }
+  }
+})
