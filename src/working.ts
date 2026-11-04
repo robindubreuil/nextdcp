@@ -23,13 +23,19 @@ export function validWorking(value: unknown): value is WorkingMemory {
     value.references.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why))
 }
 
+/** Only the compactor's explicit Title line names an episode; the note body stays archived. */
+export function episodeNote(summary: string): { readonly title?: string; readonly body: string } {
+  const match = /^Title:[\t ]*([^\r\n]+?)[\t ]*(?:\r?\n|$)/.exec(summary)
+  return match ? { title: match[1], body: summary.slice(match[0].length).replace(/^\r?\n/, "") } : { body: summary }
+}
+
 /** Old archives are evidence, not an instruction stream or a permanent episode directory. */
-export function renderWorking(working: WorkingMemory, through: string, gap = false): string {
+export function renderWorking(working: WorkingMemory, through: string, gap = false, title?: string): string {
   const section = (name: string, items: readonly string[]) => items.length ? `\n\n${name}:\n${items.map((item) => `- ${item}`).join("\n")}` : ""
   return `## Current working state\nObjective: ${working.objective}` +
     section("Applicable user constraints", working.constraints) + section("Relevant state and decisions", working.state) +
     section("Unfinished work and next action", working.next) + section("Evidence references", working.references.map((ref) => `${ref.id}: ${ref.why}`)) +
-    `\n\nArchive through ${through}: older tasks and exact evidence are available with recall(query); they are not listed here.` +
+    `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are available with recall(query); they are not listed here.` +
     (gap ? " Some original history was not archived; recall reports these gaps." : "")
 }
 
@@ -55,8 +61,8 @@ export function parseHandoff(raw: string, previous: WorkingMemory | undefined, u
   return { archive: value.archive.trim(), working: { ...value.working, constraints }, retiredConstraints: value.retiredConstraints as Retirement[] }
 }
 
-export function assertMemoryBudget(working: WorkingMemory, through: string, gap: boolean, budget: number): string {
-  const rendered = renderWorking(working, through, gap)
+export function assertMemoryBudget(working: WorkingMemory, through: string, gap: boolean, budget: number, title?: string): string {
+  const rendered = renderWorking(working, through, gap, title)
   const size = tokens(rendered)
   if (size > budget) throw new HandoffError(`Working state exceeds its budget (${size} > ${budget} estimated tokens); active constraints were not truncated`)
   return rendered

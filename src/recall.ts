@@ -1,8 +1,9 @@
 import type { ArchivedCall } from "./mask.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
 
-export type SearchDocument = { readonly id: string; readonly text: string; readonly summary?: string }
-export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean }
+export type SearchDocument = { readonly id: string; readonly text: string; readonly summary?: string; readonly echoes?: readonly (readonly [number, number])[] }
+type Location = { readonly id: string; readonly page: number }
+export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly also?: readonly Location[] }
 export const RECALL_PAGE_CHARS = 6_000
 /** Whole-original recall returns up to five pages in one call; only larger originals page. */
 export const RECALL_ALL_CHARS = 5 * RECALL_PAGE_CHARS
@@ -10,7 +11,7 @@ export const SEARCH_PAGE_HITS = 4
 export const MAX_SEARCH_HITS = 40
 export type RecallFile = { readonly offset: number; readonly file: { readonly type: "file"; readonly uri: string; readonly mime: string; readonly name?: string } }
 export type RecallContent = NonNullable<Result["content"]>
-type Fragment = { readonly text: string; readonly files?: readonly RecallFile[] }
+type Fragment = { readonly text: string; readonly files?: readonly RecallFile[]; readonly echoes?: readonly (readonly [number, number])[] }
 type Word = { readonly text: string; readonly index: number }
 
 const words = (text: string): Word[] => Array.from(text.matchAll(/[\p{L}\p{M}\p{N}_]+/gu), (match) => ({
@@ -50,8 +51,14 @@ export function search(query: string, documents: readonly SearchDocument[], limi
     const pages = bounds.slice(1).map((_, index) => ({ id: document.id, page: index + 1, text: document.text,
       parsed: [] as Word[], counts: new Map<string, number>(), note: false }))
     let page = 0
+    const echoes = document.echoes ?? []
+    let echo = 0
     for (const word of words(document.text)) {
       while (page + 1 < pages.length && word.index >= bounds[page + 1]) page++
+      while (echo < echoes.length && echoes[echo][1] <= word.index) echo++
+      // Echoes of recall output are excluded from scoring only: pages and snippets stay
+      // byte-aligned with the fetchable text, so hit pages always fetch what they name.
+      if (echo < echoes.length && word.index >= echoes[echo][0]) continue
       pages[page].parsed.push(word)
     }
     if (document.summary) pages.push({ id: document.id, page: 1, text: document.summary, parsed: words(document.summary), counts: new Map(), note: true })
@@ -64,7 +71,8 @@ export function search(query: string, documents: readonly SearchDocument[], limi
     return [term, Math.log(1 + (corpus.length - count + 0.5) / (count + 0.5))]
   }))
   const k = 1.2, b = 0.75
-  const hits = corpus.flatMap(({ id, page, text, parsed, counts, note }): SearchHit[] => {
+  type Draft = { readonly hit: SearchHit; readonly core: string; readonly size: number }
+  const drafts = corpus.flatMap(({ id, page, text, parsed, counts, note }): Draft[] => {
     let score = 0
     for (const term of terms) {
       const count = counts.get(term) ?? 0
@@ -75,7 +83,7 @@ export function search(query: string, documents: readonly SearchDocument[], limi
     if (score === 0) return []
     const matches = parsed.filter((word) => termSet.has(word.text))
     const window = new Map<string, number>()
-    let left = 0, coverage = 0, best = -1, index = matches[0].index, span = Infinity
+    let left = 0, coverage = 0, best = -1, index = matches[0].index, end = index, span = Infinity
     for (let right = 0; right < matches.length; right++) {
       const word = matches[right]
       const count = window.get(word.text) ?? 0
@@ -86,19 +94,33 @@ export function search(query: string, documents: readonly SearchDocument[], limi
         window.set(old, remaining)
         if (!remaining) coverage -= weights.get(old)!
       }
+      // Shrink to the tightest window for this coverage: the core must be canonical, so
+      // copies of one region match even when their surroundings carry stray term echoes.
+      while (left < right && window.get(matches[left].text)! > 1) {
+        const old = matches[left++].text
+        window.set(old, window.get(old)! - 1)
+      }
       const width = word.index - matches[left].index
       if (coverage > best + 1e-10 || (Math.abs(coverage - best) < 1e-10 && width < span)) {
-        best = coverage; index = matches[left].index; span = width
+        best = coverage; index = matches[left].index; end = word.index + word.text.length; span = width
       }
     }
-    return [{ id, page, score, snippet: snippet(text, index), ...(note ? { note: true } : {}) }]
+    // The matched core is what identifies the evidence; its surroundings differ per transcript.
+    const core = words(text.slice(index, end)).map((word) => word.text)
+    return [{ hit: { id, page, score, snippet: snippet(text, index), ...(note ? { note: true } : {}) }, core: core.join(" "), size: core.length }]
   })
-  const seen = new Set<string>()
-  return hits.sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : a.page - b.page)).filter((hit) => {
-    if (seen.has(hit.snippet)) return false
-    seen.add(hit.snippet)
-    return true
-  }).slice(0, limit)
+  drafts.sort((a, b) => b.hit.score - a.hit.score || (a.hit.id < b.hit.id ? -1 : a.hit.id > b.hit.id ? 1 : a.hit.page - b.hit.page))
+  // Repeated reads of one region come back as near-identical excerpts across episodes. Collapse
+  // them into one hit and list the duplicates as fetchable locations, so the hit budget buys
+  // distinct evidence. A short core is not distinctive enough to merge distinct snippets.
+  const kept: (Draft & { also: Location[] })[] = []
+  for (const draft of drafts) {
+    const twin = kept.find((other) => draft.hit.note === other.hit.note &&
+      (draft.hit.snippet === other.hit.snippet || (draft.size >= 8 && draft.core === other.core)))
+    if (twin) twin.also.push({ id: draft.hit.id, page: draft.hit.page })
+    else kept.push({ ...draft, also: [] })
+  }
+  return kept.map(({ hit, also }) => (also.length ? { ...hit, also } : hit)).slice(0, limit)
 }
 
 function pageBounds(text: string, pageChars: number): number[] {
@@ -125,14 +147,15 @@ const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? "null"
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const text = (value: unknown) => typeof value === "string" ? value : ""
 
-/** Carry exact attachment offsets through nested formatting; labels may also occur in ordinary text. */
-function render(parts: readonly Fragment[], separator: string, files: RecallFile[]): string {
+/** Carry exact attachment and echo offsets through nested formatting; labels may also occur in ordinary text. */
+function render(parts: readonly Fragment[], separator: string, files: RecallFile[], echoes: [number, number][] = []): string {
   let offset = 0
   const chunks: string[] = []
   for (const part of parts) {
     if (!part.text) continue
     if (chunks.length) offset += separator.length
     for (const file of part.files ?? []) files.push({ ...file, offset: offset + file.offset })
+    for (const range of part.echoes ?? []) echoes.push([offset + range[0], offset + range[1]])
     chunks.push(part.text)
     offset += part.text.length
   }
@@ -176,7 +199,7 @@ function toolContent(value: unknown, files: RecallFile[]): string {
 }
 
 /** Render the useful contents of a stored row, without transport or provider metadata. */
-function transcriptRow(row: unknown, files: RecallFile[]): string {
+function transcriptRow(row: unknown, files: RecallFile[], echoes: [number, number][] = []): string {
   if (!object(row) || typeof row.type !== "string") throw new Error("Invalid archived row")
   if (row.type === "user") {
     const skills = Array.isArray(row.skills) ? row.skills.flatMap((skill) => object(skill) && text(skill.text)
@@ -199,8 +222,11 @@ function transcriptRow(row: unknown, files: RecallFile[]): string {
       const local: RecallFile[] = [], outputFiles: RecallFile[] = []
       const error = state.status === "error" ? object(state.error) ? text(state.error.message) : text(state.error) : ""
       const output = ["completed", "error"].includes(text(state.status)) ? toolContent(state.content, outputFiles) : ""
-      return [{ text: render([{ text: label }, { text: error }, { text: output, files: outputFiles }], "\n", local), files: local }]
-    }), "\n", files)
+      const tool = render([{ text: label }, { text: error }, { text: output, files: outputFiles }], "\n", local)
+      // A recall rendering is a re-presentation of evidence archived elsewhere: marked as echo
+      // so search never ranks it against the original it quotes.
+      return [{ text: tool, files: local, ...(text(part.name) === "recall" ? { echoes: [[0, tool.length]] } : {}) }]
+    }), "\n", files, echoes)
   }
   if (row.type === "shell") {
     const output = object(row.output) ? text(row.output.output) : ""
@@ -214,17 +240,17 @@ function transcriptRow(row: unknown, files: RecallFile[]): string {
   return ""
 }
 
-export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], gap = false, files: RecallFile[] = []): string {
+export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], gap = false, files: RecallFile[] = [], echoes: [number, number][] = []): string {
   const parts: Fragment[] = [{ text: `Episode ${id}: raw transcript` }]
   if (gap) parts.push({ text: "Recall gap: some raw history was not archived." })
   for (const row of rows) {
     if (row.text === undefined) { parts.push({ text: "[Unavailable archived row; recall gap]" }); continue }
     try {
-      const local: RecallFile[] = []
-      parts.push({ text: transcriptRow(JSON.parse(row.text), local), files: local })
+      const local: RecallFile[] = [], rowEchoes: [number, number][] = []
+      parts.push({ text: transcriptRow(JSON.parse(row.text), local, rowEchoes), files: local, echoes: rowEchoes })
     } catch { parts.push({ text: "[Invalid archived row; recall gap]" }) }
   }
-  return render(parts, "\n\n", files)
+  return render(parts, "\n\n", files, echoes)
 }
 
 /** Return attachments only on the page where their label starts, never as base64 text.
@@ -238,8 +264,10 @@ export function recallPage(id: string, text: string, page?: number, files: reado
     const shown = Math.min(pages, RECALL_ALL_CHARS / RECALL_PAGE_CHARS)
     const end = bounds[shown]
     const attached = attach(0, end)
+    // The label reports the call that was made; paging advice stays in the parenthetical,
+    // and originals beyond the cap point at query-first retrieval before raw paging.
     const label = shown < pages
-      ? `recall ${JSON.stringify({ id, page: shown + 1 })} (whole output too large: first ${end} of ${text.length} characters; continue at page ${shown + 1})`
+      ? `recall ${JSON.stringify({ id })} (whole output too large: first ${end} of ${text.length} characters; use a query to locate the relevant page first, or continue at page ${shown + 1})`
       : `recall ${JSON.stringify({ id })} (whole output)`
     const whole = `${label}\n${text.slice(0, end)}`
     return attached.length ? [{ type: "text", text: whole }, ...attached] : whole

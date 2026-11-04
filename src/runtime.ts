@@ -4,7 +4,7 @@ import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { DEFAULT_MASK, mediaTokens, messageTokens, partTokens, planMask, renderMask, tokens, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
 import { adoptNative, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
-import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, HandoffError, parseHandoff, type Handoff } from "./working.ts"
+import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
 import { formatCall, formatTranscript, MAX_SEARCH_HITS, recallPage, search, SEARCH_PAGE_HITS, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, exclusive, rowCalls } from "./store.ts"
 import { createModels } from "./models.ts"
@@ -14,7 +14,7 @@ type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type Store = ReturnType<typeof createStore>
 type RecallInput = { readonly id?: string; readonly query?: string; readonly page?: number }
 type ViewMessage = Message & { readonly id?: string; readonly role?: string }
-type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly size: number }
+type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly echoes: readonly (readonly [number, number])[]; readonly size: number }
 type Deferral = { busy: number; idle?: number; approved: boolean }
 const sameRound = (decision: Deferral | undefined, info: { time?: { busy?: number; idle?: number } }): decision is Deferral =>
   decision !== undefined && decision.busy === info.time?.busy && decision.idle === info.time?.idle
@@ -25,8 +25,6 @@ const modelRef = (value: unknown) => object(value) && typeof value.providerID ==
   ? { providerID: value.providerID, id: value.id } : undefined
 const activeCheckpoint = (rows: readonly Row[]) => rows.findLast((row) => row.type === "compaction" && row.status === "completed")?.id ?? null
 const running = (rows: readonly Row[]) => rows.some((row) => row.type === "compaction" && row.status === "running")
-const liveCallIDs = (rows: readonly Row[]) => new Set(rows.flatMap((row) => row.type !== "assistant" ? [] : (row.content ?? [])
-  .flatMap((part) => object(part) && part.type === "tool" && typeof part.id === "string" ? [part.id] : [])))
 const GUARD_TIMEOUT = 3 * 60_000
 const TRANSCRIPT_CACHE_CHARS = 8_000_000
 
@@ -329,7 +327,7 @@ export function createController(ctx: Plugin.Context) {
       }
       const validate = (raw: string) => {
         const result = parseHandoff(raw, existing.working, users, ids)
-        assertMemoryBudget(result.working, id, gap, memoryBudget)
+        assertMemoryBudget(result.working, id, gap, memoryBudget, episodeNote(result.archive).title)
         return result
       }
       let handoff: Handoff | undefined
@@ -365,7 +363,7 @@ export function createController(ctx: Plugin.Context) {
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
       hints.delete(event.sessionID) // The committed handoff is the signal's only consumer.
-      event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget), metadata: { nextdcp: { version: 2 } } }
+      event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget, episodeNote(handoff.archive).title), metadata: { nextdcp: { version: 2 } } }
     } catch (error) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
       await models.warning(event.sessionID, `Working-state compaction failed (${detail}); using native OpenCode compaction and its configured model. This safety fallback is not size-bounded; no active constraints were silently truncated.`)
@@ -454,9 +452,9 @@ export function createController(ctx: Plugin.Context) {
     }
     const episode = episodeRows(id, catalog)
     const rows = await Promise.all(episode.rowIDs.map(async (rowID) => ({ id: rowID, text: await store.getRow(rowID) })))
-    const files: RecallFile[] = []
-    const text = formatTranscript(id, rows, episode.gap, files)
-    const result = { text, files, size: text.length + files.reduce((sum, item) => sum + item.file.uri.length, 0) }
+    const files: RecallFile[] = [], echoes: [number, number][] = []
+    const text = formatTranscript(id, rows, episode.gap, files, echoes)
+    const result = { text, files, echoes, size: text.length + files.reduce((sum, item) => sum + item.file.uri.length, 0) }
     if (result.size > TRANSCRIPT_CACHE_CHARS) return result
     transcripts.set(key, result)
     transcriptChars += result.size
@@ -499,23 +497,27 @@ export function createController(ctx: Plugin.Context) {
           const full = await transcript(sessionID, store, id, memory.catalog)
           return recallPage(id, full.text, page, full.files)
         }
-        return call ? renderCall() : "No matching episode or tool call is available."
+        return call ? renderCall() : "No matching episode or tool call is available. Try a query search by content instead."
       }
-      // Visible context needs no search: index archived episodes and the elided originals in the live branch.
+      // Visible context needs no search: index archived episodes and every elided original.
       const documents: SearchDocument[] = []
       for (const episode of memory.catalog.values()) {
-        documents.push({ id: episode.id, text: (await transcript(sessionID, store, episode.id, memory.catalog)).text, summary: episode.summary })
+        const full = await transcript(sessionID, store, episode.id, memory.catalog)
+        documents.push({ id: episode.id, text: full.text, echoes: full.echoes, summary: episode.summary })
       }
-      const live = liveCallIDs(rows)
-      for (const mask of await masksFor(sessionID, rows)) if (live.has(mask.id)) {
+      for (const mask of await masksFor(sessionID, rows)) {
         const original = await store.getCall(mask.id)
         if (original) documents.push({ id: mask.id, text: formatCall(original) })
       }
-      if (!documents.length) return "No matching snippets."
+      if (!documents.length) return "Nothing is archived to search yet."
       const hits = search(query, documents, MAX_SEARCH_HITS), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
-      if (start >= hits.length) return at === 1 ? "No matching snippets." : "No more search results."
-      const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => `- recall ${JSON.stringify({ id: hit.id, page: hit.page })}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`)
-      return `Historical evidence, page ${at}${start + SEARCH_PAGE_HITS < hits.length ? `; next page: ${at + 1}` : ""}${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
+      if (start >= hits.length) return at === 1 ? "No matching snippets. Try broader keywords or exact identifiers." : "No more search results."
+      const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => {
+        const target = hit.note ? hit.id : `recall ${JSON.stringify({ id: hit.id, page: hit.page })}`
+        const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? location.id : `${location.id} p${location.page}`)).join(", ")})` : ""
+        return `- ${target}${also}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`
+      })
+      return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
   const deferredNotice = "NextDCP's automatic mid-round budget compaction and new output masking are deferred for this round only, so the raw conversation stays fully live. Committed elisions still render and stay recallable; manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."

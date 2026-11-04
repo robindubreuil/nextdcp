@@ -1,4 +1,4 @@
-import { renderWorking, type Handoff, type WorkingMemory } from "./working.ts"
+import { episodeNote, renderWorking, type Handoff, type WorkingMemory } from "./working.ts"
 
 export type Row = { readonly id: string; readonly type: string; readonly status?: string; readonly summary?: string; readonly content?: readonly unknown[] }
 export type Episode = {
@@ -59,14 +59,15 @@ export function resolveMemory(current: string | null, records: ReadonlyMap<strin
 
 /** Only the latest working state is visible; without one, adopted native summaries render as the episode chain. */
 export function renderHandoff(memory: ReturnType<typeof resolveMemory>): string {
-  return memory.working && memory.through ? renderWorking(memory.working, memory.through, [...memory.catalog.values()].some((episode) => episode.gap)) : renderMemory(memory.episodes)
+  const gap = [...memory.catalog.values()].some((episode) => episode.gap)
+  const title = memory.through ? episodeNote(memory.catalog.get(memory.through)?.summary ?? "").title : undefined
+  return memory.working && memory.through ? renderWorking(memory.working, memory.through, gap, title) : renderMemory(memory.episodes)
 }
 
 export function renderMemory(episodes: readonly Episode[]): string {
   return episodes.map((episode) => {
-    const title = /^Title:[\t ]*([^\r\n]+?)[\t ]*(?:\r?\n|$)/.exec(episode.summary)
-    const heading = `## Episode ${episode.id}${title ? ` — ${title[1]}` : ""}${episode.native ? " (native)" : ""}${episode.gap ? " (recall gap: some raw history was not archived)" : ""}`
-    const body = title ? episode.summary.slice(title[0].length).replace(/^\r?\n/, "") : episode.summary
+    const { title, body } = episodeNote(episode.summary)
+    const heading = `## Episode ${episode.id}${title ? ` — ${title}` : ""}${episode.native ? " (native)" : ""}${episode.gap ? " (recall gap: some raw history was not archived)" : ""}`
     return body ? `${heading}\n${body}` : heading
   }).join("\n\n")
 }

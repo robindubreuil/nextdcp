@@ -33,10 +33,77 @@ test("focused recall ranks small passages, not an entire long document or its fi
 test("identical evidence is deduplicated and archive-only search notes are explicitly labeled", () => {
   const hits = search("needle", [{ id: "E2", text: "same needle evidence" }, { id: "E1", text: "same needle evidence" }])
   assert.deepEqual(hits.map((hit) => hit.id), ["E1"])
+  assert.deepEqual(hits[0].also, [{ id: "E2", page: 1 }])
   const [note] = search("selector", [{ id: "E3", text: "The raw transcript uses other words.", summary: "Compaction model selector; src/picker.ts." }])
   assert.equal(note.note, true)
   assert.equal(note.page, 1)
   assert.match(note.snippet, /selector/)
+})
+
+test("repeated copies of one evidence region collapse into one hit with fetchable locations", () => {
+  const core = "physics before consent: a grant must fit the window, so no approval is spent on a conversation that overflows anyway"
+  const hits = search("physics consent grant window approval", [
+    { id: "E5", text: `read output 525: 526: // ${core} 527: // tail with window budget notes` },
+    { id: "E4", text: `edit input: ${core} plus a different tail about window sizes` },
+    { id: "E1", text: "separate topic: window and grant sizing in recall budgets" },
+  ])
+  assert.equal(hits.length, 2)
+  const group = hits.find((hit) => hit.also?.length)
+  assert.ok(group, "the near-identical excerpts form one hit")
+  assert.deepEqual([group.id, ...group.also.map((location) => location.id)].sort(), ["E4", "E5"])
+  assert.deepEqual(group.also.map((location) => location.page), [1])
+  assert.ok(hits.some((hit) => hit.id === "E1" && !hit.also), "distinct evidence survives untouched")
+})
+
+test("short identical match cores with distinct snippets stay separate hits", () => {
+  const hits = search("needle", [{ id: "E1", text: "needle here in alpha context" }, { id: "E2", text: "needle there in beta context" }])
+  assert.deepEqual(hits.map((hit) => hit.id), ["E1", "E2"])
+  assert.ok(hits.every((hit) => !hit.also))
+})
+
+test("a stray term echo near one copy does not split the group", () => {
+  const core = "physics before consent: a grant must fit the window, so no approval is spent on a conversation that overflows anyway"
+  const filler = "neutral words repeat ".repeat(20)
+  const hits = search("physics consent grant window approval", [
+    { id: "E1", text: `${core} and a plain tail` },
+    { id: "E2", text: `grant ${filler.slice(0, 400)} ${core} ${filler.slice(0, 250)} window` },
+  ])
+  assert.equal(hits.length, 1)
+  assert.deepEqual([hits[0].id, ...hits[0].also.map((location) => location.id)].sort(), ["E1", "E2"])
+})
+
+test("recall echoes are excluded from scoring while the original evidence still ranks", () => {
+  const quoted = "needle quoted verbatim inside a recall result "
+  const echo = quoted.repeat(20)
+  const text = `${echo}${"plain context ".repeat(15)}genuine needle evidence lives here`
+  const [hit] = search("needle", [{ id: "E1", text, echoes: [[0, echo.length]] }])
+  assert.match(hit.snippet, /genuine needle evidence/)
+  assert.doesNotMatch(hit.snippet, /quoted verbatim/, "the window centers on genuine content")
+  assert.deepEqual(search("needle", [{ id: "E2", text: echo, echoes: [[0, echo.length]] }]), [], "an echo-only page never competes")
+})
+
+test("echo exclusion is score-deep only: hit pages stay aligned with fetchable text", () => {
+  const echo = "noise ".repeat(1_200) // spans past the first 6k-char page
+  const text = `${echo}genuine needle after the echo`
+  const [hit] = search("needle", [{ id: "E1", text, echoes: [[0, echo.length]] }])
+  assert.equal(hit.page, 2, "the match sits on page 2 of the unchanged text")
+  assert.match(paginate(text, hit.page).content, /genuine needle/)
+})
+
+test("formatTranscript marks recall renderings as echoes, and only those", () => {
+  const row = { id: "m1", type: "assistant", content: [
+    { type: "text", text: "checking" },
+    { type: "tool", name: "recall", state: { input: { query: "x" }, status: "completed", content: [{ type: "text", text: "Historical evidence, page 1\n- recall {\"id\":\"E1\",\"page\":1}: quoted core" }] } },
+    { type: "tool", name: "read", state: { input: { path: "a.ts" }, status: "completed", content: [{ type: "text", text: "genuine file content" }] } },
+  ] }
+  const echoes = []
+  const text = formatTranscript("E1", [{ id: "m1", text: JSON.stringify(row) }], false, [], echoes)
+  assert.equal(echoes.length, 1)
+  const [start, end] = echoes[0]
+  assert.match(text.slice(start, end), /^\[Tool recall /)
+  assert.match(text.slice(start, end), /quoted core/)
+  assert.doesNotMatch(text.slice(start, end), /genuine file content/)
+  assert.match(text, /genuine file content/, "the rendering itself keeps every byte")
 })
 
 test("search is Unicode-normalized and snippets do not split surrogate pairs", () => {
@@ -90,7 +157,7 @@ test("id recall without page returns the whole original in one call", () => {
   const big = "b".repeat(RECALL_PAGE_CHARS * 7) + "😀 tail"
   const head = recallPage("call-2", big)
   const body = head.slice(head.indexOf("\n") + 1)
-  assert.match(head, /^recall \{"id":"call-2","page":6\} \(whole output too large: first 30000 of 42007 characters; continue at page 6\)\n/)
+  assert.match(head, /^recall \{"id":"call-2"\} \(whole output too large: first 30000 of 42007 characters; use a query to locate the relevant page first, or continue at page 6\)\n/)
   assert.equal(body, big.slice(0, RECALL_ALL_CHARS))
   const rest = Array.from({ length: 3 }, (_, index) => paginate(big, index + 6).content).join("")
   assert.equal(body + rest, big)

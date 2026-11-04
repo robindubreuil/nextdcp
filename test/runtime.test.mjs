@@ -155,6 +155,51 @@ test("compaction archives every original before generation and recall retrieves 
   assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive integer/)
 })
 
+test("the checkpoint summary titles the new episode from its Title line", async () => {
+  const h = harness()
+  h.state.handoff.archive = "Title: Recall fixes\nWork: preserve the exact request."
+  const result = await compactRows(h, [user("u1", "original words"), running("c1")])
+  assert.match(result.summary, /Archive through E1 \(Recall fixes\): older tasks/)
+  assert.doesNotMatch(result.summary, /Work: preserve/)
+})
+
+test("repeated evidence across episodes collapses in search with fetchable locations", async () => {
+  const h = harness()
+  const shared = "consent then several filler words pass before the window closes"
+  const first = await compactRows(h, [user("u1", `first three words ${shared} one tail here`), running("c1")])
+  const second = await compactRows(h, [completed("c1", first), user("u2", `other three words ${shared} two tails there`), running("c2")])
+  h.state.rows = [completed("c2", second), user("live", "x")]
+  const found = await h.controller.recall("s", { query: "consent window" })
+  assert.match(found, /\(also (E1|E2) p1\)/)
+  assert.equal(found.split("\n").filter((line) => line.startsWith("- recall ")).length, 1)
+})
+
+test("archived recall output never outranks the evidence it quotes", async () => {
+  const h = harness()
+  const echoed = "freshechoedneedle appears inside an archived recall result"
+  const first = await compactRows(h, [user("u1", "session context"), { id: "a1", type: "assistant", content: [
+    { type: "tool", id: "call-echo", name: "recall", state: { status: "completed", input: { query: "x" },
+      content: [{ type: "text", text: `Historical evidence, page 1\n- recall {"id":"E1","page":1}: ${echoed}` }] } },
+  ] }, running("c1")])
+  h.state.rows = [completed("c1", first), user("live", "x")]
+  assert.match(await h.controller.recall("s", { query: "freshechoedneedle" }), /No matching snippets\. Try broader keywords/)
+  assert.match(await h.controller.recall("s", { id: "E1" }), /freshechoedneedle/, "the echo stays fetchable in the transcript")
+  assert.match(await h.controller.recall("s", { id: "nope" }), /Try a query search by content instead/)
+  const found = await h.controller.recall("s", { query: "session context" })
+  assert.match(found, /page 1 of 1 \(1 hit\)/)
+})
+
+test("archive-note hits show the note itself, not a fetch call that cannot reproduce it", async () => {
+  const h = harness()
+  h.state.handoff.archive = "Completed work; notekeyword recorded in the cold archive note."
+  const first = await compactRows(h, [user("u1", "some context"), running("c1")])
+  h.state.rows = [completed("c1", first), user("live", "x")]
+  const found = await h.controller.recall("s", { query: "notekeyword" })
+  assert.match(found, /- E1 \(archive note, not original evidence\):/)
+  assert.doesNotMatch(found, /- recall \{/, "no call that would fetch different content")
+  assert.match(found, /page 1 of 1 \(1 hit\)/)
+})
+
 test("forks retain episode IDs and originals, branch independently, and survive parent deletion/reload", async () => {
   const h = harness()
   const first = await compactRows(h, [user("u1", "parent original uniqueparent"), running("c1")])
@@ -1453,7 +1498,7 @@ test("setup registers success-only idle events and clears the subscription", asy
   await setImmediate()
   assert.equal(h.state.compact, 1, "A compaction-only execution does not loop")
   h.state.rows = [user("u", "an idle session with work")]
-  assert.match((await h.state.tool.execute({ query: "idle" }, { sessionID: "s" })).content, /No matching/)
+  assert.match((await h.state.tool.execute({ query: "idle" }, { sessionID: "s" })).content, /Nothing is archived to search yet/)
   push("session.deleted")
   await setImmediate()
   await setImmediate()

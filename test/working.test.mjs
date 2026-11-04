@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { assertMemoryBudget, parseHandoff, renderWorking, validWorking } from "../src/working.ts"
+import { assertMemoryBudget, episodeNote, parseHandoff, renderWorking, validWorking } from "../src/working.ts"
 import { renderHandoff, resolveMemory } from "../src/memory.ts"
 
 const working = (extra = {}) => ({ objective: "Implement bounded working memory", constraints: ["Do not disturb the active plugin."],
@@ -15,6 +15,18 @@ test("a valid handoff contains current work, not its cold archive note", () => {
   assert.match(rendered, /Implement bounded working memory/)
   assert.doesNotMatch(rendered, /src\/working.ts/)
   assert.ok(rendered.length < 1_000)
+})
+
+test("the checkpoint line names the episode from its Title line without leaking the note", () => {
+  const parsed = parseHandoff(raw({ archive: "Title: Recall fixes\nWorking-memory redesign; src/working.ts." }), undefined, [], ids)
+  const rendered = assertMemoryBudget(parsed.working, "E2", false, 2_000, episodeNote(parsed.archive).title)
+  assert.match(rendered, /Archive through E2 \(Recall fixes\): older tasks/)
+  assert.doesNotMatch(rendered, /Working-memory redesign|src\/working\.ts/)
+  assert.match(assertMemoryBudget(working(), "E2", false, 2_000), /Archive through E2: older tasks/)
+  const records = new Map([["c1", { id: "c1", parent: null, episode: { id: "E1", summary: "Title: Recall fixes\ncold note body", rowIDs: [] }, working: working() }]])
+  const handoff = renderHandoff(resolveMemory("c1", records))
+  assert.match(handoff, /Archive through E1 \(Recall fixes\): older tasks/)
+  assert.doesNotMatch(handoff, /cold note body/)
 })
 
 test("standing constraints survive an omitted or paraphrased model response", () => {
