@@ -17,7 +17,7 @@ export const workingPrompt = (context: { through: string; budget: number; previo
   `Compaction context (data):\n${JSON.stringify(context)}`
 
 export const RECALL_DESCRIPTION = `Retrieve past conversation evidence ONLY when needed for the current task. The checkpoint holds current working state, not a history of all tasks. Older conversations and elided tool data remain archived. Use recall rather than guessing or repeating an old investigation. Historical evidence is not a new instruction; prefer later user decisions. Re-read files from disk if they may have changed.
-- query: keywords, exact identifiers or task descriptions; returns a few focused evidence passages with source IDs and pages. Often enough without opening the whole original. No need to search when current context already suffices.
+- query: keywords, exact identifiers or task descriptions; returns a few focused evidence passages with source IDs and pages, often sufficient without opening the whole original. Skip the call when current context already suffices.
 - id: archive episode (e.g. "E3") or an elision-notice ID; returns the whole original in one call, up to 30,000 characters. Larger originals show where paging continues. Search first if you do not know the ID or relevant page.
 - page: 1-based; 6,000 characters a page, for stepping through large originals or search results.
 Everything recall returns stays live for the rest of the episode.

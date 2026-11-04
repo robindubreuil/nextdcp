@@ -1,0 +1,218 @@
+[
+  {
+    "id": "msg_19be8b7540016sHjWH14btvXeq",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Call probe_payload exactly once with label ALPHA, then reply READY. Do not call any other tool. The following data is synthetic benchmark context and needs no analysis:\nSynthetic baseline 0: b10def9a38d4f40e5dd5387eccff8a0fa5085a62e816feaf591f29f82842b925\nSynthetic baseline 1: 7b39ba55f974c061e4d290be5e33b9cdddd02388bfe76c2f435f8b017fe69484\nSynthetic baseline 2: 5a1e310338a18acdd9985af198d87a26e0d14467f8e799b8550df3a85547a839\nSynthetic baseline 3: ac308126337b9ea6701fdc82554e2199fac53abf3ecba40586d34d89b13e97d3\nSynthetic baseline 4: 1960303cc2d86938b29a2a10deb53eb80cbd019be0468a0d6ddba40b4ae10afa\nSynthetic baseline 5: cc4f692a72c53f0bce75906952a98a5ae400007b1f59b04a6dbb9a03e5de05b2\nSynthetic baseline 6: 4ad6ce91c87e17bbe19bf8fa3f1f977d9ec3481ae398ac44d67868a60938c43c\nSynthetic baseline 7: ec1726f4eaf634c8540dd1a900612bee1f3c444429e82af8babb4bc8b61542e8\nSynthetic baseline 8: e7678af7f5eb807153edfbc5ddaaf6fdd03d6bd9ddc092868a085ba8877f9ef6\nSynthetic baseline 9: 59660d324a650158d576763375621467deb19af10f7deeb90ab2a3d240016b34\nSynthetic baseline 10: 34ae2651a4a47f4a5a8249d713159630fe9bd5f52199ab00ff8a0f2811b83564\nSynthetic baseline 11: fd31955b4c65ffda7304181f9fdc5bb82282bbf016573d74d49796b86d71e257\nSynthetic baseline 12: efd3ea1bbadea7b752eca9a43f749439180641b189ebc51f898455e9c2540d6c\nSynthetic baseline 13: 485c1f12c0dfce5ddf1152eaeaf157837343d462c9afc23b36e12ee454742953\nSynthetic baseline 14: 8f509433e903798cd30f592efabb1e6f29d5b0eb7d571b04d4f1a7d1e12dab4c\nSynthetic baseline 15: 51e7366905424b692228a648f93327f1929d1948ac5498f44b7465a46a7ce9e7\nSynthetic baseline 16: 65f3e1aceb4e4b07cb3747b1dd2ff2fb6300636080ce93af159750e5cdbd8123\nSynthetic baseline 17: 2fc6da572df6e5a6cd206373ab6ce6b598ac1bb4c22012630c38c1688854329c\nSynthetic baseline 18: b77cff8e42e44e239a17950db1665d843d74c7ee69cf26dc89e2e3927c2380dd\nSynthetic baseline 19: b7bd60835c124715865b69b0e9d5420009394a89deda5f4fd6b404467dd8af12\nSynthetic baseline 20: 1b2048c113694d69adec503ee6aab2fdbe4f3824fc2e09adf436ca947d8c1e69\nSynthetic baseline 21: 482fc49bed910264adbed44bfa86f85b46555b47127f72c81514b29ca9983100\nSynthetic baseline 22: a1582eb622703ade823171da3c7fa18e991a95a372a17b19475c51f2315f3654\nSynthetic baseline 23: a23e5662c5f47d24875a9ca881bc3a089ceceb7caef5ca2b81540eafe8378761\nSynthetic baseline 24: a19c0bd167a7f3dd4da0928a31f9ac6ab830263939470f4ecdefaf5112bd4e76\nSynthetic baseline 25: 94c2892291ad22e972becbf87778d4e3fa8a30bdfd44c251d032a2e9c595e786\nSynthetic baseline 26: 067aff6dd4008bbf9323718f35e9ddadabc79b39eddeef78e116ec7060c0783a\nSynthetic baseline 27: 4da2bcea230d8e5e63f8dfe6dbeeccd0afd9019540283e82d160eff51dd49689\nSynthetic baseline 28: de1d1f855e68ccc6b6d91f09421c6c40b6314b9426bed48f6602549ed716573e\nSynthetic baseline 29: 2b5210b8f2e27fa156bdc46d3de0fada916616ea5c2b7fe0b2b50466d5e043b6\nSynthetic baseline 30: 44aaea39235c42c891127d8cd32b0df1ff320ae33e97a7a2fbe20121bdb0fe37\nSynthetic baseline 31: 2037b5716e57126bb20768e33f1e0b0491a89bc5ba8e95225a1e245e03108c78\nSynthetic baseline 32: 716745e2accfe02f1fd2e609807a7bbd0579998a75781cd015dce6b2facf7bc1\nSynthetic baseline 33: 96f1c9a72805268fd885cecfcf46d4f9b92376fcf5a615a640cad5a97daca4be\nSynthetic baseline 34: e436a2ccd33c1fa2109291b558bfb73596b42e809cbf5a3c182ef1bfa86ab8d0\nSynthetic baseline 35: f4623b6cd1cf9a64d64ad15054a6d8eb1cd6ea610f9c295bd6ca4dc1350eb37a\nSynthetic baseline 36: c1e4c9f5ee8c2da05b4702c6cdd7f6eac74dd917f4e4c92e97cbe079adc36228\nSynthetic baseline 37: 8605702ae0a785fdb2049f11c52185669e93a4f799276a927d59566421d940aa\nSynthetic baseline 38: c2cc9a52a2f05c232c9a079d22db0339ac51a9444d6686f86742fd8152d4ca6a\nSynthetic baseline 39: 12d69231ece63435cd1cf0ddba8d142704386ca066bb40fc8fc1023865da2e96\nSynthetic baseline 40: a0895f2e83bbb0af088c65aba771e89db51b66385c961a76534bb21801ed7061\nSynthetic baseline 41: 54174bb556dace3600d345cce134294f0e91337eddf827fa1648d773e5ecdc35\nSynthetic baseline 42: 2ac6ce6dbf54c36ed9225b97f9500257c3a98772c9b7e100e27bfb8a5607120c\nSynthetic baseline 43: 76a710195864c583a3c421d4afa238a6bfa75b14b7667ccd7104aeba0b5278e6\nSynthetic baseline 44: a48e8a949b106abb0fed151cc44690b075e9bcae84d3d6e0de6eb0a8e34c252a\nSynthetic baseline 45: 281c669e32bc8e5dae75fa5065ec8d4392cfe03e5803db5008a32697ed5ecf9a\nSynthetic baseline 46: 60c8ce178e2f5d9c8c040eab95f35df731b70d4c22f8bd2a7a25efd0011cda1c\nSynthetic baseline 47: 51618755a97c72b74e4197be6e4df55787d7db256bc3557a8300de544497a862\nSynthetic baseline 48: 552e36d4a4df51153754cb301a5d45dfdadaffe5fdae40cd250c45b1f2349b96\nSynthetic baseline 49: 38fe400ef75004ca649dc201644fb2c399e955cf42385be841b01c7ad4df76f1\nSynthetic baseline 50: ebfba7e58a5460ce7f0362cd459503fa9c472eeed13da50b10a9f5550973cd37\nSynthetic baseline 51: 2f587336c8f05249b7265f9ce5fa96851049e4e6d43089c9538780a83f30245f\nSynthetic baseline 52: 321d43d9d8421734c0a09c125404e8575f1a1cd11524c23abb5391fb327553ae\nSynthetic baseline 53: 6c7be966a2aad5bec16605006a7636737f92c2536d01beb0c3544baf110dc59d\nSynthetic baseline 54: 50e13a242e4f27721bfee296447e0a917881d5e53d33fb3b2e4a68e5ad4f5af9\nSynthetic baseline 55: 6998858cff47442ed864be5b702ec2f179ddf92851e1e52899f7eb29dd3f20ae\nSynthetic baseline 56: a27c9d141352fd0fc43c819c69639645c965418f0159d70f5ae8d7545203778c\nSynthetic baseline 57: 86c8d3b167643e54b810a468729f86abf2ad349a426738386738a4495ce64e87\nSynthetic baseline 58: 06f398f194188726d49d340e574fb364037e3e3ba6dff5750adb5cfc02f09dc4\nSynthetic baseline 59: 23dc1d1d9e85e2b550848692b2382b7b94dcc76f90ac9d94d47d2adca1c6b4bb\nSynthetic baseline 60: 7c06f79846cfb4b7d56835caf75d928e286f7e95b2121730f3a2bce1f0273e47\nSynthetic baseline 61: 06ff7a47251ba5841875501cc8a32dde3e8ebece23356c8700b5f9b4163c1869\nSynthetic baseline 62: 2627b7bd9d7d0b23a0d5d4c932561073e041c4317a47e08d836de2f5a046469e\nSynthetic baseline 63: 2469a0e705fae08f2e35443393da6f9e900fc14d1bd72599162e714e5a5de2f7\nSynthetic baseline 64: a5f20c6780d9bc6593d243395c9afef92c49e067fa71654ae0b2d8bb6a5f82d0\nSynthetic baseline 65: 956a473e023a02738ca0cd36e7dc22655946a76ea1a1b91431b90b5eaf3077a8\nSynthetic baseline 66: 3c6df02e8eadc1aa06781dc2bce8467826044b3d8c31a0c2c7c3b0b26f836999\nSynthetic baseline 67: ee8cb68d1733005007d7ff56d68ec606f69ecfee9c223b370c7e09761076c244\nSynthetic baseline 68: ebc7f0dbd20c98099d59bd8f020b18d7448a152eb23e43adf0c75dc3dd8aff86\nSynthetic baseline 69: 58abf063859b08e1dc35d5f6f8fd89fe2fd83e7a6277c22f2f0b6956010b8e90\nSynthetic baseline 70: 893c80931c2e464a544ee80df06d60a7a4ee52b287e80dfd708cb6f0f3741547\nSynthetic baseline 71: 9d990f9fdf5c7771957f932a7835cb23b2ced33af4d0a1f157450e44367c3742\nSynthetic baseline 72: 1ce654afce676ea94c766ea9fde8b499070df6e1c494133c88df8bdec3dbc3e0\nSynthetic baseline 73: 0c14c8a015307aa97f69354a20a4b715442a11726d247f9dff8f281bde54d338\nSynthetic baseline 74: aa9fe7d4eef551fc7c912c070b6c3b3c392df77b465625e0b783fcdf7b188922\nSynthetic baseline 75: ebffa4ce345e2c8f8101092cc4baa3fd163a8a4856573cbf9e913ae296b547c4\nSynthetic baseline 76: 67febb2ea8b626739db529844117368ff6a78a2c1cdb3814e1cc002374a99c0d\nSynthetic baseline 77: a551640824878b14e4a2543ce8ac5e79c3e875e4e475d5a77512ead2ca39d4a7\nSynthetic baseline 78: faea864151a64a490af8851fb18fc0c9f6fe2e6cfa205721f470575d1898ad0a\nSynthetic baseline 79: 45b196ef5b58316c7ac680c661e1d9c9c8dc863aa7f0a7d2d8814a4a00539388\nSynthetic baseline 80: 77863cfb05cb099476844dfd58ee8af382cf7a7a7f193a32f245517e927fbbbf\nSynthetic baseline 81: 58337ded412ee80a64432f56e5142f7913e1afcb43d5c5b0cbf5a9ab5549681f\nSynthetic baseline 82: c4933c0fc002bb6c309bf306284c6a4634a32861d6ef2c9c7030949a565cac38\nSynthetic baseline 83: d3a3801f356ae004d280ad75e3bd36ad2c156a8e0a705c2a92fa2d5d0af8e562\nSynthetic baseline 84: a61ef28eda673de19cc273c1fa727b055bdbc78c3c0d5dafd68421bfbf7606b8\nSynthetic baseline 85: b7e476d9d5cdac6b431953f085d740e109a6fb14fbe1e091a71b64c4f5c38447\nSynthetic baseline 86: feaaa354c630905852cbf6b51b05b8ab5d72bf266e3ac7773d03a6029fa2f13b\nSynthetic baseline 87: f62523bd8089bbbf6b7176b99c68dd0012dfe2a52564bc8eb16bf292a9661e49\nSynthetic baseline 88: 9ffbfcc852a8be730bb63df7ca87ec6a618b952e852d4e38c47e9d530c082611\nSynthetic baseline 89: 3e3cd0180e942ea3aac436ca7871af5b24615af730efd064d4e4faf62d0e9e8f\nSynthetic baseline 90: ca0f52a5068b79a5e601adcd186fab855e83cc49a63a213be51b986b4d105899\nSynthetic baseline 91: c7ba9785f4b1167a47b440bc939ffa70f1cd89a570dac0481b67bbd6a3a47c12\nSynthetic baseline 92: fe8e5f7d5c375162b4ab2e622a1a4c4c08bcae6175255da3e6caa80066a5630c\nSynthetic baseline 93: 3bef9b56bf8a80c4b637f0310d47f379c17bed840fc809af7e15de515b98273a\nSynthetic baseline 94: 1a2078f28fdaaa1fdeabcbc3b4edaee84fda976f4b591fe6b36b752758ec30a4\nSynthetic baseline 95: bab849266ae474aadcfb91b0909eb30131a9d6fa620e045bd1fb852abd093b38\nSynthetic baseline 96: 7457539b37a65643836e8596eb2397c01a75db11395fff31e88292c87e817c0a\nSynthetic baseline 97: f4ae1b1eb08004965149c9c217cd66ab494ad832084ff5ee571e8a7df34ed621\nSynthetic baseline 98: ead4f475d0788f8b25ddf5e3c79a86899c521c650a1ee29654088d9f4ad134ca\nSynthetic baseline 99: ba20cb241abfa2d5b08c29020ccdc7b6b88478f34fba287b2d59cf666c5de61a\nSynthetic baseline 100: d03874f72c169969cd56ee4a6b3830a2f761420f5286b935cf1e69256ab946da\nSynthetic baseline 101: a55f475ee324ead7cff00e8a75e6de297022edc9ebbb134312481a256892cf3e\nSynthetic baseline 102: 2c654a098660d45edf747af9ff66a4f408d2afaab606b4005da3a338a0799335\nSynthetic baseline 103: 21c84cd16a0609c54a4806e385fd6d8f77407b29ed68a6f4fa2ae4e3e598d147\nSynthetic baseline 104: e367f784dfaf0ba702b41f4f191d108889df3e516b5f39fdca79aceb12df6ab4\nSynthetic baseline 105: 606ffaf62ff725a3053a09fc25d3e522344c6128b7e013257dde687a8c84c899\nSynthetic baseline 106: 2c8c8dd6723f450e6b6be9daff175ddec7310dc48c8ae695611aee9ea4db629e\nSynthetic baseline 107: a900815030060fed77d1c816d27b1d61d1b34667889d715491190ec41f49f7ac\nSynthetic baseline 108: a773498dd4b79b61cfecb88e7a27afcf14b1127440d1b6dbcfbe6ed044fc8e98\nSynthetic baseline 109: c16c5a2916d46c68994e7f9bafafc5a50e586d4ed1b6101854c669951db44c10\nSynthetic baseline 110: ad09b4a21046f2ef97055eab664b2b18f29e7ea955c5c668d4a1a05532546364\nSynthetic baseline 111: 411e7a4e32141097b3d79e46c94938a43ecff8aa879adac7eb1878de9f972669\nSynthetic baseline 112: bfdb7b1457f5d4cc5ed531a41d43a5d253d238feb68f15e4b96d0408a8d61b18\nSynthetic baseline 113: e7e7de415324eb5a7c2c5cc0a9c8da9c7b4a9c93833d7a74183ae8f0bfdf5783\nSynthetic baseline 114: a4ba966bfb2dda87bba47f7835ec90ac293a9ed72260d1583cfaf1a7f39d6d84\nSynthetic baseline 115: 7996902c893947bcce7473d5f73af8e07c32bf760d00951bf09a142066fb766e\nSynthetic baseline 116: c9376df333213bf3312dc9322e7246e4a7397c63745b0090981c7cf1d2ff5710\nSynthetic baseline 117: fe9cfec720dac697617065c8d379b335ac957f066b636da360c9027a3f286666\nSynthetic baseline 118: 1b91362d33f8bdb0429f33c4055f32010a817cd6c9a6475c01b42780eaa814f2\nSynthetic baseline 119: 36c55492468ac36c6be6004c7d65b2f1d43597a9e58df08c60ffdc4e02d8ee66\nSynthetic baseline 120: 13297d3a7e49eb64dd55f1608d3f7570f944caccb4ae254da5f76c24607fa57d\nSynthetic baseline 121: 46c6eaaabfdafcfc8ec728c12e0490e38e4249709a64e738014e984c5731d155\nSynthetic baseline 122: 6bf7eef8e6d7b75995a4279dc6e7cfe005878bef8db907154f08e58fa5406f44\nSynthetic baseline 123: a48f61f87b32b1e1606c2ccb1bb61bcf53833196df03896020f78909ef231764\nSynthetic baseline 124: 927d9b7fba59f1abd133494483d602598cd2e552ee5c82e5bf0d540df29bee2c\nSynthetic baseline 125: 285b83724d2845a1119c6f8dc55e61df413cccc2e8c91e20ab6ef1eba10a003f\nSynthetic baseline 126: d8d649ed36073c796e10c78652aacd79038466b54d8e818fe4f998e086b94fd7\nSynthetic baseline 127: fa4290b6f643028d02fb4037d3b0aacee780e93539dec508c0e505462b864927\nSynthetic baseline 128: 95e69a12c3bfa2b9cf66a4922a551a6f1e2346aadf308bcd8876abf11e1d6e95\nSynthetic baseline 129: 0d8eb14a2db4d30675b068aff63e6a0b6c8c098430904e53c42c218b4fef942c\nSynthetic baseline 130: 74ccd1d67c18f7fcfc1ac32006f64d7d099520a36ab4e7dfb6f6d1e1b94b4199\nSynthetic baseline 131: b2a423b7621845fe63a47b5a8f2bacf3eb597a107fb1e70c54ed0b741aedbcbd\nSynthetic baseline 132: e61c5cdfbecb83e3d142f0e7f9cf79b0ff0f2e29634b31b4f37e295ab2ad334c\nSynthetic baseline 133: 495ad2e429ec1630b4d2332435fd691645d2b05cca5c0049898be4f5164e699d\nSynthetic baseline 134: 6cd3e7539440a33d77d919e9244015b58ee051b73a06bdab32151eecc1f6999c\nSynthetic baseline 135: 8b5c3bac4f949f7ca5f2a7ffa462cb49379994c43329575eeffb6bc5508bb164\nSynthetic baseline 136: 0dfd681869d27617f651ffe12e8ab0512a2daf73e9f727c65f6432e793cd5492\nSynthetic baseline 137: 8d0cf838029d4fafeeee50b4ef9728821d578b75cfbd726724b171da07b8b437\nSynthetic baseline 138: b458c89e633cd23508b21e7d4f253a08183b852950d9c587b24dd5bc23ce8779\nSynthetic baseline 139: 01c55eb5445d817dd5e8fb36fcebcf5621740c165764092dc7ee715b83559457\nSynthetic baseline 140: 9af02b6307f877c629d231e88d885faa082e9a68fcbd7217a1eb599550357e51\nSynthetic baseline 141: 84ef56df7e1d601e9fac440fb7df61f18d4daf1de59028b827ec82d188cab34a\nSynthetic baseline 142: 5338129ab94d63e57b3cf70f1a2661eba17431c0c90206e9444ffae79cd6b090\nSynthetic baseline 143: eab11ba0aedab07bb720ae13c061b62ccf523723373d17f59d3ca7595f9a025c\nSynthetic baseline 144: 3d9b3e39f35cb63af1150d54a1d31a117be7b8df567368bcb402c4d75db28f4d\nSynthetic baseline 145: 152ee96a56b6036a6d4127418f62895b6186ed049387f66aa744c480ef7c735d\nSynthetic baseline 146: 3777a88303e93294cbd63593e83cbf6bc19dfe10eb053d2161eda9f7eba88054\nSynthetic baseline 147: 2d68b17fba1e6425e004c469b78c7a1526d370fe540d1d7792a9c0911d8e3ce4\nSynthetic baseline 148: 25d10f5926951df90bb173bfbe404ee94da75328f6818565c925131606b43c93\nSynthetic baseline 149: 90c37f04d94d91ef77db4188c8199a61a7fdd04983fe693e07667a119ce76587\nSynthetic baseline 150: 55aa4ee2c1737e3c8b8a4ce8d07702f00b5ab5357e6e44d4e31158f9e506d575\nSynthetic baseline 151: 930484d0896ccf55172f042c498e49fa3bfb2e5f3f4a3037574fe2093ec4fab6\nSynthetic baseline 152: c40a8e7c7b54d8c80be5e0b7fbe36a11478202fd1d149c0765db9d938bf610ad\nSynthetic baseline 153: eafa9938ea77e8ab43e623ae005c7f9948fa645675262abdcbcbd4cd0084959a\nSynthetic baseline 154: 973a16d2e667c3c810331fec9b382aaa9519dead290d8154ba366e2e77848e09\nSynthetic baseline 155: fea3da0d5eeb36162881e39706e30ca32738ddffa17ad2d1e8441699c62ceafc\nSynthetic baseline 156: 95d266c63702c08e20bf7425da60e9df91c20533013bcdcc65056173a98ab1cc\nSynthetic baseline 157: c3acfc8d0941377ab9fa45df7954487283bd35b620a0807427fb3f6ab3afb3cc\nSynthetic baseline 158: 5126f0a9b39d2cb1bc94e5e81202917610540b1d9e12c073e65657189a25fc6e\nSynthetic baseline 159: 0063514fab0e2a070a72c272287bfcba92bcbddee6f891dbe6e7ce53e1b53121"
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8bd11001kebsqh3GRwCxPB",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool-call",
+        "id": "toolu_vrtx_01DN77hzoCxHBtnqU5Tkgwxn",
+        "name": "probe_payload",
+        "input": {
+          "label": "ALPHA"
+        },
+        "providerExecuted": false
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": [
+      {
+        "type": "tool-result",
+        "id": "toolu_vrtx_01DN77hzoCxHBtnqU5Tkgwxn",
+        "name": "probe_payload",
+        "result": {
+          "type": "text",
+          "value": "[Output elided to save context: probe payload. recall(\"toolu_vrtx_01DN77hzoCxHBtnqU5Tkgwxn\") retrieves it.]"
+        },
+        "providerExecuted": false
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8c1f00015D7wJ68QVThFMB",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "READY"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8e3c9001NGdwMg6AnnSu8d",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Call probe_payload exactly once with label BETA, then reply READY. Do not call other tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8e3de001UkCd7gJlj659kA",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "tool-call",
+        "id": "toolu_vrtx_018DKUT2PR5AYi2Z29kVCSxK",
+        "name": "probe_payload",
+        "input": {
+          "label": "BETA"
+        },
+        "providerExecuted": false
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": [
+      {
+        "type": "tool-result",
+        "id": "toolu_vrtx_018DKUT2PR5AYi2Z29kVCSxK",
+        "name": "probe_payload",
+        "result": {
+          "type": "text",
+          "value": "[Output elided to save context: probe payload. recall(\"toolu_vrtx_018DKUT2PR5AYi2Z29kVCSxK\") retrieves it.]"
+        },
+        "providerExecuted": false
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8e8390012fCRuCkTYhP4pP",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "READY"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8eafa001ozFIdDpFL0QJXd",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word BASELINE. Do not call tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8eb07001DlSR6JavXJUSjB",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "BASELINE"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8eeda001xN1VI0fW2HNS8v",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word MASK1. Do not call tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8eeee001WNzIeHRFC2m9Ag",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "MASK1"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8f214001MRPiz6qRom88CX",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word MASK1REPEAT. Do not call tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8f2230017Mr3g5KkkhRmpz",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "MASK1REPEAT"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8f550001caTUKN5mNX8hj7",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word MASK2. Do not call tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8f563001eDS3FYN9lvjSXk",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "MASK2"
+      }
+    ]
+  },
+  {
+    "id": "msg_19be8f83e00133bF7S7Is2CnMg",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word MASK2REPEAT. Do not call tools."
+      }
+    ],
+    "metadata": {}
+  },
+  {
+    "id": "msg_19be8f84e0010dF4bkeg0eZqgM",
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "MASK2REPEAT"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Summarize this synthetic test conversation in one short sentence. Do not call tools."
+      }
+    ]
+  }
+]

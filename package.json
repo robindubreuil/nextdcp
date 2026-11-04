@@ -25,6 +25,14 @@
   "engines": {
     "node": ">=20"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robindubreuil/nextdcp.git"
+  },
+  "homepage": "https://github.com/robindubreuil/nextdcp#readme",
+  "bugs": {
+    "url": "https://github.com/robindubreuil/nextdcp/issues"
+  },
   "peerDependencies": {
     "@opencode/plugin": ">=2.2.5 <3"
   },

@@ -21,14 +21,15 @@ to the existing OpenCode configuration, preserving its other settings:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    { "package": "file:///C:/Users/you/AppData/Local/opencode/nextdcp/releases/0.5.0-DIGEST", "options": {} }
+    { "package": "file:///path/to/opencode/nextdcp/releases/0.5.0-DIGEST", "options": {} }
   ]
 }
 ```
 
-Use the actual URI printed by the release script, not the example digest. Remove or disable the old
-`opencode-dcp` plugin before enabling nextdcp; do not run both on
-the same session. The package can also be packed with `npm pack`; no registry
+Use the actual URI printed by the release script, not the example digest. Do not
+run nextdcp alongside another context-management plugin (such as
+`opencode-dcp`) in the same session. The package can also be packed with
+`npm pack`; no registry
 release is assumed. `npm pack` builds automatically; installed packages use the
 same bundle through their package entrypoint. **Do not point a live installation
 at the development `dist` directory.** Editing or rebuilding source cannot change
@@ -244,6 +245,7 @@ and backups accordingly.
   omitted details. Lower token usage does not by itself guarantee lower total
   cost or better task accuracy.
 
-From a source checkout, run `npm test` with Node.js 22.18+ (tested with Node 26).
-It builds the shipped entry before running the native TypeScript tests; `npm run
-typecheck` checks `src/` under `strict` mode.
+From a source checkout, run `npm test` with Node.js 22.18+ (native TypeScript
+type stripping). It builds the shipped entry before running the TypeScript
+tests; `npm run typecheck` checks `src/` under `strict` mode. Golden message
+fixtures used by the tests live in `test/fixtures/`.
