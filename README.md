@@ -21,7 +21,7 @@ to the existing OpenCode configuration, preserving its other settings:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    { "package": "file:///path/to/opencode/nextdcp/releases/0.5.0-DIGEST", "options": {} }
+    { "package": "file:///path/to/opencode/nextdcp/releases/<version>-<digest>", "options": {} }
   ]
 }
 ```
