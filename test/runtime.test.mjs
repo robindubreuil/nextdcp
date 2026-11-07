@@ -4,6 +4,7 @@ import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
 import { WORKING_PROMPT, RECALL_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION } from "../src/prompts.ts"
+import { tokens } from "../src/tokens.ts"
 import { createController, install } from "../src/runtime.ts"
 import { createStore } from "../src/store.ts"
 
@@ -52,7 +53,7 @@ function harness(options = {}) {
   const state = {
     rows: [], prompts: [], stateless: [], compact: 0, info: { model, time: { busy: 1 } }, failAdmission: false,
     failGenerate: false, failStateless: false, hooks: new Map(),
-    handoff: { archive: "Work: preserve the exact request.", working: { objective: "Continue current work", constraints: ["Preserve the exact request."],
+    handoff: { archive: "Title: Continue work\nWork: preserve the exact request.", working: { objective: "Continue current work", constraints: ["Preserve the exact request."],
       state: [], next: ["Continue the task"], references: [] }, retiredConstraints: [] },
     models: [{ ...model, enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [], limit: { context: 100_000, output: 8_192 } }],
     configured: undefined, warnings: [], permissions: [], tools: new Map(),
@@ -80,14 +81,14 @@ function harness(options = {}) {
       generate: async ({ prompt }) => {
         state.prompts.push(prompt)
         if (state.failGenerate) throw new Error("model failed")
-        return { text: JSON.stringify(state.handoff) }
+        return { text: JSON.stringify(state.queue?.length ? state.queue.shift() : state.handoff) }
       },
       hook: async (name, callback) => { state.hooks.set(name, callback); return { dispose: async () => {} } },
     },
     experimental: { generate: { text: async (input) => {
       state.stateless.push(input)
       if (state.failStateless) throw new Error("stateless generation failed")
-      return { text: JSON.stringify(state.handoff) }
+      return { text: JSON.stringify(state.queue?.length ? state.queue.shift() : state.handoff) }
     } } },
     tool: { transform: async (callback) => {
       callback({ add: (definition) => { state.tools.set(definition.name, definition); if (definition.name === "recall") state.tool = definition } })
@@ -132,6 +133,7 @@ const armGate = async (h, run = (request) => h.controller.onContext(request)) =>
   await setImmediate()
   assert.equal(h.state.compact, before, "the crossing arms the gate instead of compacting")
   assert.match(request.system.at(-1)?.text ?? "", /NextDCP budget gate/)
+  assert.match(request.system.at(-1)?.text ?? "", /next reply is the compactor's primary input/, "the gate tells the model its reply steers the checkpoint")
 }
 
 test("compaction archives every original before generation and recall retrieves episode and call", async () => {
@@ -232,7 +234,7 @@ test("archived recall output never outranks the evidence it quotes", async () =>
 
 test("archive-note hits show the note itself, not a fetch call that cannot reproduce it", async () => {
   const h = harness()
-  h.state.handoff.archive = "Completed work; notekeyword recorded in the cold archive note."
+  h.state.handoff.archive = "Title: Completed work\nnotekeyword recorded in the cold archive note."
   const first = await compactRows(h, [user("u1", "some context"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   const found = await h.controller.recall("s", { query: "notekeyword", layer: "full" })
@@ -522,6 +524,75 @@ async function saveModel(h, preference, sessionID = "s") {
   return h.state.rpc.set({ sessionID, preference }, errorContext)
 }
 
+test("an invalid handoff is repaired once by the main model, carrying the exact failure", async () => {
+  const h = harness()
+  const valid = h.state.handoff
+  h.state.queue = [{ ...valid, archive: "no title line" }, { ...valid, archive: "Title: Repaired\nfixed note" }]
+  const result = await compactRows(h, [user("u1", "some words"), running("c1")])
+  assert.match(result.summary, /Archive through E1 \(Repaired\): older tasks/)
+  assert.equal(h.state.prompts.length, 2)
+  assert.doesNotMatch(h.state.prompts[0], /previous attempt failed/)
+  assert.match(h.state.prompts.at(-1), /previous attempt failed: Archive note must begin with a 'Title: <episode name>' line/)
+})
+
+test("a separate compaction model's drifted handoff falls back to the main model with the exact failure", async () => {
+  const h = harness()
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  h.state.queue = [{ ...h.state.handoff, archive: "Title: 修复标签\n中文笔记。" }]
+  const result = await compactRows(h, [user("u1", "english words"), running("c1")])
+  assert.match(result.summary, /Archive through E1 \(Continue work\): older tasks/)
+  assert.equal(h.state.stateless.length, 1)
+  assert.equal(h.state.prompts.length, 1)
+  assert.match(h.state.prompts[0], /previous attempt failed: Archive note must stay in the language/)
+  assert.ok(h.state.warnings.some((item) => String(item.data?.message ?? "").includes("Cannot produce a bounded handoff")))
+})
+
+test("an over-budget handoff commits the shortest valid artifact with a warning instead of native fallback", async () => {
+  const probe = harness()
+  const measured = tokens((await compactRows(probe, [user("u1", "words"), running("c1")])).summary)
+  const h = harness({ memory: { budget: measured - 2 } })
+  await h.controller.registerModels()
+  h.state.queue = [
+    h.state.handoff,
+    { ...h.state.handoff, working: { ...h.state.handoff.working, state: [...h.state.handoff.working.state, "x".repeat(400)] } },
+  ]
+  const result = await compactRows(h, [user("u1", "words"), running("c1")])
+  assert.match(result.summary, /Continue current work/)
+  assert.doesNotMatch(result.summary, /x{20}/, "the shorter first attempt beats the padded repair")
+  assert.equal(h.state.prompts.length, 2, "attempt 0 is strict; the repair carries the exact overage")
+  assert.match(h.state.prompts[1], /previous attempt failed: Working state exceeds its budget/)
+  assert.ok(h.state.warnings.some((item) => String(item.data?.message ?? "").includes("accepted the shortest valid handoff")))
+})
+
+test("a shorter over-budget repair wins the same contest", async () => {
+  const probe = harness()
+  const measured = tokens((await compactRows(probe, [user("u1", "words"), running("c1")])).summary)
+  const h = harness({ memory: { budget: measured - 2 } })
+  await h.controller.registerModels()
+  h.state.queue = [
+    { ...h.state.handoff, working: { ...h.state.handoff.working, state: [...h.state.handoff.working.state, "y".repeat(400)] } },
+    { ...h.state.handoff, working: { ...h.state.handoff.working, state: [...h.state.handoff.working.state, "SHORTER-REPAIR-MARK"] } },
+  ]
+  const result = await compactRows(h, [user("u1", "words"), running("c1")])
+  assert.match(result.summary, /SHORTER-REPAIR-MARK/, "the shorter repair beats the padded first attempt")
+  assert.doesNotMatch(result.summary, /y{20}/)
+  assert.ok(h.state.warnings.some((item) => String(item.data?.message ?? "").includes("accepted the shortest valid handoff")))
+})
+
+test("a handoff that never validates falls back to native compaction", async () => {
+  const h = harness()
+  await h.controller.registerModels()
+  h.state.queue = [{ ...h.state.handoff, archive: "no title line" }, { ...h.state.handoff, archive: "still no title" }]
+  h.state.rows = [user("u1", "words"), running("c1")]
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.equal(item.result, undefined, "no valid handoff exists; native compaction stays in control")
+  assert.equal(h.state.prompts.length, 2, "the repair also ran and failed validation")
+  assert.match(h.state.prompts[1], /previous attempt failed: Archive note must begin/)
+  assert.ok(h.state.warnings.some((entry) => String(entry.data?.message ?? "").includes("Working-state compaction failed")))
+})
+
 test("specific model replaces working state in one request without changing the main model", async () => {
   const h = harness()
   addCheap(h)
@@ -713,18 +784,19 @@ test("100 checkpoints replace working state without a growing diary, directory, 
   const h = harness({ memory: { budget: 512 } })
   let previous, firstSize
   for (let i = 1; i <= 100; i++) {
-    h.state.handoff.archive = `Completed topic ${i}; archivekeyword${i}.`
+    h.state.handoff.archive = `Title: Completed topic ${i}\narchivekeyword${i}.`
     h.state.handoff.working.state = [`currentfact${i}`]
     if (i > 1) h.state.handoff.working.constraints = [] // A careless omission must not erase the old constraint.
     const result = await compactRows(h, [...(previous ? [previous] : []), user(`u${i}`, `originaltopic${i}`), running(`c${i}`)])
     assert.match(result.summary, /Preserve the exact request/)
     assert.match(result.summary, new RegExp(`currentfact${i}\\b`))
-    assert.doesNotMatch(result.summary, /Completed topic|archivekeyword|originaltopic/)
+    assert.doesNotMatch(result.summary, /archivekeyword|originaltopic/, "note bodies and originals stay out of the working state")
     if (i > 1) assert.doesNotMatch(result.summary, new RegExp(`currentfact${i - 1}\\b`))
     assert.ok(Math.ceil(result.summary.length / 4) <= 512)
-    firstSize ??= result.summary.length
+    // Baseline from the second episode on, once the archive anchor has appeared.
+    if (i > 1) firstSize ??= result.summary.length
     // The archive anchor's episode count and endpoint ids grow by digits only — never per episode.
-    assert.ok(result.summary.length <= firstSize + 24)
+    if (firstSize !== undefined) assert.ok(result.summary.length <= firstSize + 24)
     previous = completed(`c${i}`, result)
     if (i % 10 === 0) h.controller = createController(h.ctx)
   }
@@ -752,22 +824,22 @@ test("an over-budget or malformed handoff gets one repair, not another growing e
   }
 })
 
-test("unrepairable state or constraint overflow fails visibly to native without committing or truncating", async (t) => {
+test("unrepairable state or constraint overflow commits the shortest valid artifact visibly, never truncating", async (t) => {
   t.mock.method(console, "warn", () => {})
   for (const field of ["state", "constraints"]) {
     const h = harness({ memory: { budget: 256 } })
     await h.controller.registerModels()
     const first = await compactRows(h, [user("u1", "first"), running("c1")])
-    h.state.handoff.working[field] = ["essential long material ".repeat(1_000)]
+    const material = "essential long material ".repeat(1_000)
+    h.state.handoff.working[field] = [material]
     h.state.rows = [completed("c1", first), user("u2", "original never discarded"), running("c2")]
     const second = event()
     await h.controller.onCompaction(second)
-    assert.equal(second.result, undefined)
-    assert.equal(await h.store.getCheckpoint("c2"), undefined)
-    assert.equal((await h.store.getPending("c2")).archived, true)
+    assert.ok(second.result?.summary.includes(material), "the whole state/constraint commits, never sliced to fit")
+    assert.ok((await h.store.getCheckpoint("c2")).working[field].includes(material), "the durable record keeps it whole")
     assert.match(await h.store.getRow("u2"), /original never discarded/)
     assert.equal(h.state.prompts.length, 3)
-    assert.match(h.state.warnings.at(-1).data.message, /safety fallback is not size-bounded/)
+    assert.match(h.state.warnings.at(-1).data.message, /accepted the shortest valid handoff/)
     assert.equal((await h.store.getCheckpoint("c1")).working.constraints[0], "Preserve the exact request.")
   }
 })

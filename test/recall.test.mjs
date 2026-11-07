@@ -436,8 +436,8 @@ test("formatCatalog is a compact index by default, whole notes on the all view, 
   ]
   const header = "Archive catalog (newest first) — one entry's note: recall id=catalog E<n>; every note: recall id=catalog all"
   const labeled = `E10 — Recall fixes (${formatSpan(1_000, 2_000)})`
-  assert.equal(formatCatalog(entries), [header, labeled, "E2", "E1"].join("\n"), "compact: one line per entry, newest first, no note bodies")
-  assert.equal(formatCatalog(entries, "all"), [header, `${labeled}\nnewest body`, "E2\nolder body", "E1\noldest body"].join("\n\n"), "all: every whole note")
+  assert.equal(formatCatalog(entries), [header, labeled, "E2 — (native summary)", "E1 — (native summary)"].join("\n"), "compact: one line per entry, newest first, no note bodies")
+  assert.equal(formatCatalog(entries, "all"), [header, `${labeled}\nnewest body`, "E2 — (native summary)\nolder body", "E1 — (native summary)\noldest body"].join("\n\n"), "all: every whole note")
   assert.equal(formatCatalogEntry(entries[1]), `${labeled}\nnewest body`, "an entry fetch is its label and whole note")
 
   const many = Array.from({ length: 40 }, (_, index) => ({ id: `E${index + 1}`, note: "n".repeat(2_000) }))

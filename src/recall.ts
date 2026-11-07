@@ -360,8 +360,10 @@ export function formatRow(raw: string, resolve?: Resolve): string {
 
 export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }
 
+/** A handoff's Title line names an episode; a title-less entry is an adopted native
+ *  (or pre-plugin) summary and says so, never a silent blank. */
 const catalogLine = (entry: CatalogEntry): string =>
-  `${entry.id}${entry.title ? ` — ${entry.title}` : ""}${entry.start !== undefined && entry.end !== undefined ? ` (${formatSpan(entry.start, entry.end)})` : ""}`
+  `${entry.id} — ${entry.title ?? "(native summary)"}${entry.start !== undefined && entry.end !== undefined ? ` (${formatSpan(entry.start, entry.end)})` : ""}`
 
 /** One entry's label and whole note: the fetchable original behind a catalog line. */
 export function formatCatalogEntry(entry: CatalogEntry): string {

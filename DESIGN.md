@@ -80,12 +80,20 @@ inherited or persisted.
    Keep task-local requirements in state/next, not the permanent constraint list.
    Persist retirement evidence with the checkpoint for audit.
 5. Validate references against the reachable archive and count the entire rendered
-   state. An invalid/oversized handoff gets at most one repair attempt. Network or
-   essential-storage failures do not trigger speculative repair requests.
+   state. The archive note must begin with a `Title:` line and stay in the language
+   of the user's messages — a compactor may not introduce a writing system the user
+   never used. An invalid/oversized/off-language handoff gets at most one repair
+   attempt, and every retry carries the exact validation failure so the stronger
+   model repairs the defect instead of repeating it. Network or essential-storage
+   failures do not trigger speculative repair requests.
 6. Save the structured state and cold archive note before returning version-2
-   metadata. Never truncate active constraints or save an over-budget custom result.
-   If this fails, warn and leave native compaction in control. A native fallback
-   can exceed this budget and is an explicit exception, not bounded success.
+   metadata. Never truncate active constraints. A custom result must fit its
+   budget; when the final repair is still over, commit the shortest valid
+   handoff, disclosed by a warning — a structured, constraint-preserving
+   artifact beats native's unbounded summary plus raw tail at any size. Native
+   compaction stays in control only when no valid handoff was produced, or when
+   saving fails. A native fallback can exceed this budget and is an explicit
+   exception, not bounded success.
 
 Existing episode archives remain unchanged and recallable. Old checkpoints
 are migrated on their next compaction, not eagerly rewritten. Forks/reverts select
@@ -149,7 +157,7 @@ rows' `time.created` — one pair per episode, never per turn — used only to r
 time in the catalog and the anchor line. **Native checkpoint without `nextdcp`
 metadata**
 (after a fallback, a fork, or lost storage): adopt its native summary text as one
-episode (`Ek (native)`) and continue the chain from it.
+episode (`Ek — (native summary)` in the catalog) and continue the chain from it.
 
 `/compact-model` is a TUI-only picker backed by a portable, schema-validated
 `nextdcp.model` RPC. Its keymap layer is global so slash autocomplete and the

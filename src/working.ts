@@ -53,12 +53,20 @@ export function renderWorking(working: WorkingMemory, through: string, gap = fal
     (gap ? " Some original history was not archived; recall reports these gaps." : "")
 }
 
+/** A compactor may drift into another language on a valid schema, which silently locks
+ *  the user out of their own archive. The note must not use a script the user never did. */
+const CJK = /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/
+
 /** Validate before committing. Never repair malformed JSON by silently discarding fields. */
 export function parseHandoff(raw: string, previous: WorkingMemory | undefined, users: readonly UserRow[], ids: ReadonlySet<string>): Handoff {
   let value: unknown
   try { value = JSON.parse(raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")) } catch { throw new HandoffError("Compactor did not return valid JSON") }
   if (!object(value) || !keys(value, ["archive", "working", "retiredConstraints"]) || !text(value.archive) || value.archive.length > 4_000 ||
       !validWorking(value.working) || !Array.isArray(value.retiredConstraints)) throw new HandoffError("Compactor returned an invalid handoff schema")
+  const archive = value.archive.trim()
+  if (!/^Title:[\t ]*\S/.test(archive)) throw new HandoffError("Archive note must begin with a 'Title: <episode name>' line")
+  if (CJK.test(archive) && !users.some((row) => row.type === "user" && typeof row.text === "string" && CJK.test(row.text)))
+    throw new HandoffError("Archive note must stay in the language of the user's messages")
   const retired = new Set<string>()
   for (const item of value.retiredConstraints) {
     if (!object(item) || !keys(item, ["constraint", "messageID", "quote"]) || !text(item.constraint) || !text(item.messageID) || !text(item.quote) ||
@@ -72,12 +80,16 @@ export function parseHandoff(raw: string, previous: WorkingMemory | undefined, u
   // Retirement must be explicit, auditable, and grounded in a new user message.
   const constraints = [...new Set([...(previous?.constraints ?? []).filter((item) => !retired.has(item)), ...value.working.constraints])]
   if (constraints.some((item) => retired.has(item))) throw new HandoffError("A retired constraint is still present in the handoff")
-  return { archive: value.archive.trim(), working: { ...value.working, constraints }, retiredConstraints: value.retiredConstraints as Retirement[] }
+  return { archive, working: { ...value.working, constraints }, retiredConstraints: value.retiredConstraints as Retirement[] }
 }
 
-export function assertMemoryBudget(working: WorkingMemory, through: string, gap: boolean, budget: number, title?: string, anchor?: Anchor): string {
+/** Count the entire rendered working state — headings, preserved constraints,
+ *  references and gap notices included — in budget units. */
+export function measureWorking(working: WorkingMemory, through: string, gap = false, title?: string, anchor?: Anchor): { readonly rendered: string; readonly size: number } {
   const rendered = renderWorking(working, through, gap, title, anchor)
-  const size = tokens(rendered)
-  if (size > budget) throw new HandoffError(`Working state exceeds its budget (${size} > ${budget} estimated tokens); active constraints were not truncated`)
-  return rendered
+  return { rendered, size: tokens(rendered) }
 }
+
+/** The canonical over-budget failure, carried verbatim into the repair prompt. */
+export const budgetFailure = (size: number, budget: number): string =>
+  `Working state exceeds its budget (${size} > ${budget} estimated tokens); active constraints were not truncated`

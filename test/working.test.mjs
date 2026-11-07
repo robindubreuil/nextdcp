@@ -1,17 +1,17 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { assertMemoryBudget, episodeNote, parseHandoff, renderWorking, validWorking } from "../src/working.ts"
+import { budgetFailure, episodeNote, measureWorking, parseHandoff, renderWorking, validWorking } from "../src/working.ts"
 import { renderHandoff, resolveMemory } from "../src/memory.ts"
 
 const working = (extra = {}) => ({ objective: "Implement bounded working memory", constraints: ["Do not disturb the active plugin."],
   state: ["Development is isolated."], next: ["Run isolated tests."], references: [], ...extra })
-const raw = (extra = {}) => JSON.stringify({ archive: "Working-memory redesign; src/working.ts.", working: working(), retiredConstraints: [], ...extra })
+const raw = (extra = {}) => JSON.stringify({ archive: "Title: Working-memory redesign\nsrc/working.ts details.", working: working(), retiredConstraints: [], ...extra })
 const ids = new Set(["E1", "E2"])
 
 test("a valid handoff contains current work, not its cold archive note", () => {
   const parsed = parseHandoff(raw(), undefined, [], ids)
   assert.deepEqual(parsed.working, working())
-  const rendered = assertMemoryBudget(parsed.working, "E2", false, 2_000)
+  const rendered = measureWorking(parsed.working, "E2").rendered
   assert.match(rendered, /Implement bounded working memory/)
   assert.doesNotMatch(rendered, /src\/working.ts/)
   assert.ok(rendered.length < 1_000)
@@ -19,10 +19,10 @@ test("a valid handoff contains current work, not its cold archive note", () => {
 
 test("the checkpoint line names the episode from its Title line without leaking the note", () => {
   const parsed = parseHandoff(raw({ archive: "Title: Recall fixes\nWorking-memory redesign; src/working.ts." }), undefined, [], ids)
-  const rendered = assertMemoryBudget(parsed.working, "E2", false, 2_000, episodeNote(parsed.archive).title)
+  const rendered = measureWorking(parsed.working, "E2", false, episodeNote(parsed.archive).title).rendered
   assert.match(rendered, /Archive through E2 \(Recall fixes\): older tasks/)
   assert.doesNotMatch(rendered, /Working-memory redesign|src\/working\.ts/)
-  assert.match(assertMemoryBudget(working(), "E2", false, 2_000), /Archive through E2: older tasks/)
+  assert.match(measureWorking(working(), "E2").rendered, /Archive through E2: older tasks/)
   const records = new Map([["c1", { id: "c1", parent: null, episode: { id: "E1", summary: "Title: Recall fixes\ncold note body", rowIDs: [] }, working: working() }]])
   const handoff = renderHandoff(resolveMemory("c1", records))
   assert.match(handoff, /Archive through E1 \(Recall fixes\): older tasks/)
@@ -50,12 +50,20 @@ test("only an exact quote from a new user row can explicitly retire a constraint
   assert.throws(() => parseHandoff(raw({ retiredConstraints: [retirement, retirement] }), working(), users, ids), /Invalid constraint/)
 })
 
-test("budget includes headings, preserved constraints, references and gap notices; never slices text", () => {
+test("an episode note must begin with Title: and stay in the user's language", () => {
+  assert.throws(() => parseHandoff(raw({ archive: "Working-memory redesign; src/working.ts." }), undefined, [], ids), /Title/)
+  assert.throws(() => parseHandoff(raw({ archive: "标题：修复会话标签\n正文内容。" }), undefined, [], ids), /Title/)
+  assert.throws(() => parseHandoff(raw({ archive: "Title: 修复会话标签\n调查并修复了对话层污染问题。" }), undefined, [], ids), /language/)
+  const chineseUsers = [{ id: "u1", type: "user", text: "请调查并修复对话层污染问题。" }]
+  assert.equal(parseHandoff(raw({ archive: "Title: 修复会话标签\n调查并修复了对话层污染问题。" }), undefined, chineseUsers, ids).archive, "Title: 修复会话标签\n调查并修复了对话层污染问题。")
+})
+
+test("budget counts the entire rendered state; the overage report is exact and canonical", () => {
   const value = working({ references: [{ id: "E1", why: "Earlier design decision" }] })
-  const rendered = renderWorking(value, "E2", true), budget = Math.ceil(rendered.length / 4)
-  assert.equal(assertMemoryBudget(value, "E2", true, budget), rendered)
-  assert.throws(() => assertMemoryBudget(value, "E2", true, budget - 1), /budget/)
-  assert.throws(() => assertMemoryBudget(working({ constraints: ["required ".repeat(4_000)] }), "E2", false, 2_000), /not truncated/)
+  const rendered = renderWorking(value, "E2", true)
+  const { size } = measureWorking(value, "E2", true)
+  assert.equal(size, Math.round(rendered.length / 4), "headings, constraints, references and gap notices all count")
+  assert.equal(budgetFailure(size, size - 1), `Working state exceeds its budget (${size} > ${size - 1} estimated tokens); active constraints were not truncated`)
 })
 
 test("malformed or incomplete responses and invented references fail closed without leaking output", () => {
