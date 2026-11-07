@@ -3,7 +3,7 @@ import type { SessionCompaction, SessionContext, SessionPrompt } from "@opencode
 import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { mediaTokens, messageTokens, partTokens, tokens, type ArchivedCall, type Message, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
-import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
+import { budgetGateNotice, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
 import { address, formatCall, formatCatalog, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, exclusive, rowCalls } from "./store.ts"
@@ -11,13 +11,16 @@ import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
+type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
 type Store = ReturnType<typeof createStore>
 type RecallInput = { readonly id?: string; readonly query?: string; readonly layer?: Layer; readonly page?: number }
 type ViewMessage = Message & { readonly id?: string; readonly role?: string }
 type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly echoes: readonly (readonly [number, number])[]; readonly size: number }
-type Deferral = { busy: number; idle?: number; approved: boolean }
-const sameRound = (decision: Deferral | undefined, info: { time?: { busy?: number; idle?: number } }): decision is Deferral =>
-  decision !== undefined && decision.busy === info.time?.busy && decision.idle === info.time?.idle
+type Round = { busy: number; idle?: number }
+type Deferral = Round & { approved: boolean }
+type Gate = Round & { checkpoint: string | null; growth: number }
+const sameRound = (round: Round | undefined, info: { time?: { busy?: number; idle?: number } }): boolean =>
+  round !== undefined && round.busy === info.time?.busy && round.idle === info.time?.idle
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const positive = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
 const modelRef = (value: unknown) => object(value) && typeof value.providerID === "string" && typeof value.id === "string"
@@ -129,6 +132,9 @@ export function createController(ctx: Plugin.Context) {
   const inherited = new Map<string, Promise<void>>()
   const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
   const deferrals = new Map<string, Deferral>()
+  // The open budget gate: one evaluation window per budget crossing, keyed on the
+  // session and stamped with the round and checkpoint it belongs to.
+  const gates = new Map<string, Gate>()
   // The queued message that triggered a deferred-marker compaction; evidence for the
   // working state, consumed only by whichever generation commits its handoff. Failed
   // generations keep the signal for their retry; the round's end clears what never ran.
@@ -243,10 +249,31 @@ export function createController(ctx: Plugin.Context) {
       // that state rather than silently never firing. Estimates meeting real window
       // sizes are calibrated against provider-reported usage when the host supplies it.
       if (budget <= 0) return log("budget trigger is disabled; the model window is unknown and options.budget is not set", undefined)
-      if (messageTokens(messages.filter((message) => message.role !== "system")) * usageScale(rows) <= budget) return
+      const estimate = messageTokens(messages.filter((message) => message.role !== "system")) * usageScale(rows)
+      if (estimate <= budget) return
       // growth and idle are raw estimate units (the deferred-marker channel's units);
       // the budget quarter is real tokens, so convert it through the same calibration.
-      if (!held && growth >= Math.min(idle, budget / 4 / usageScale(rows))) void requestCompact(event.sessionID, checkpoint, growth)
+      if (held || growth < Math.min(idle, budget / 4 / usageScale(rows))) return
+      // Crossing: the budget gate grants one evaluation step before compaction proceeds.
+      // A failed round-stamp read degrades to the plain trigger, never to a skipped cut.
+      let info: SessionInfo | undefined
+      try { info = await ctx.session.get({ sessionID: event.sessionID }) } catch (error) { log("budget gate", error) }
+      const gate = gates.get(event.sessionID)
+      if (gate) {
+        gates.delete(event.sessionID)
+        // Build N+1 closes the gate it opened; a gate from another round or boundary is
+        // stale and falls through to a fresh crossing. A held gate stays open so the
+        // grant's idempotent re-affirmation keeps its round.
+        if (info && sameRound(gate, info) && gate.checkpoint === checkpoint) return void requestCompact(event.sessionID, checkpoint, growth)
+      }
+      // Arm the gate together with its notice; without a showable notice the crossing
+      // stays silent and compacts as before.
+      if (info?.time?.busy !== undefined && !guarded.has(event.sessionID) && (cooldown.get(event.sessionID) ?? 0) <= Date.now() && !sameRound(deferrals.get(event.sessionID), info)) {
+        gates.set(event.sessionID, { busy: info.time.busy, idle: info.time.idle, checkpoint, growth })
+        event.system.push({ type: "text", text: budgetGateNotice(estimate, budget) })
+        return
+      }
+      void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
   }
 
@@ -381,7 +408,15 @@ export function createController(ctx: Plugin.Context) {
     }
   }
 
-  const onRoundEnded = (sessionID: SessionID) => { deferrals.delete(sessionID); hints.delete(sessionID) }
+  const onRoundEnded = (sessionID: SessionID) => {
+    // A failed or interrupted round has no later build to close its gate; the crossing it
+    // consumed is repaid here unless a grant held the round.
+    const gate = gates.get(sessionID), decision = deferrals.get(sessionID)
+    gates.delete(sessionID)
+    deferrals.delete(sessionID)
+    hints.delete(sessionID)
+    if (gate && !decision?.approved) void requestCompact(sessionID, gate.checkpoint, gate.growth)
+  }
   const onIdle = async (sessionID: SessionID) => {
     try {
       const [info, rows] = await Promise.all([
@@ -396,6 +431,13 @@ export function createController(ctx: Plugin.Context) {
       deferrals.delete(sessionID)
       hints.delete(sessionID) // Round-scoped evidence dies with its round, as onRoundEnded clears it.
       if (guarded.has(sessionID) && !running(rows)) clearGuard(sessionID)
+      // The round ended with an open gate: its evaluation window is over, so the crossing
+      // it consumed is repaid unless a grant held the round or the boundary already moved.
+      const gate = gates.get(sessionID)
+      if (gate) {
+        gates.delete(sessionID)
+        if (!held && gate.checkpoint === activeCheckpoint(rows)) void requestCompact(sessionID, gate.checkpoint, gate.growth)
+      }
       if (info.parentID || idle === Infinity) return
       // Add output produced after the last request, including an updated retry row.
       // Never reuse a view whose raw boundary disappeared or admitted another prompt.
@@ -436,11 +478,15 @@ export function createController(ctx: Plugin.Context) {
     clearGuard(sessionID)
     // A failing compaction must not be retried on every following step.
     if (failed) cooldown.set(sessionID, Date.now() + GUARD_TIMEOUT)
-    else cooldown.delete(sessionID)
+    else {
+      cooldown.delete(sessionID)
+      // A completed cut moved the boundary; its open gate is stale now.
+      gates.delete(sessionID)
+    }
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
-    for (const map of [admissions, attempts, cooldown, views, inherited, deferrals, hints]) map.delete(sessionID)
+    for (const map of [admissions, attempts, cooldown, views, inherited, deferrals, hints, gates]) map.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)
@@ -573,21 +619,31 @@ export function createController(ctx: Plugin.Context) {
   }
   const deferredNotice = "NextDCP's automatic mid-round budget compaction is deferred for this round only. Manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
   const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
+    const { sessionID } = context
+    // Gate first: outside the open budget gate's evaluation window there is nothing to
+    // defer, and no permission is ever spent on a call the notice did not invite.
+    let info: SessionInfo, rows: readonly Row[]
+    try {
+      [info, rows] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.context({ sessionID })])
+    } catch (error) {
+      log("deferral gate", error)
+      return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
+    }
+    const gate = gates.get(sessionID)
+    if (!gate || !sameRound(gate, info) || gate.checkpoint !== activeCheckpoint(rows))
+      return "Compaction deferral is only available at an open NextDCP budget gate; this request is outside one. Normal compaction and recall remain enabled."
     const reason = input.reason.trim()
     if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
-    if (ctx.options.budget === false) return "NextDCP's automatic mid-round budget trigger is already disabled; no deferral is needed. Manual compaction and native overflow handling remain enabled."
-    const { sessionID } = context
-    const info = await ctx.session.get({ sessionID })
     if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
     const previous = deferrals.get(sessionID)
-    if (sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
+    if (previous && sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
 
     // Physics before consent: a grant must fit the window, so no approval is spent on a
     // conversation that overflows anyway. Nothing is recorded on denial; recomputing is
     // cheap and never prompts.
-    let rows: readonly Row[], window: { context: number; output: number } | undefined
+    let window: { context: number; output: number } | undefined
     try {
-      [rows, window] = await Promise.all([ctx.session.context({ sessionID }), windowSize(info.model)])
+      window = await windowSize(info.model)
     } catch (error) {
       log("deferral physics", error)
       return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."

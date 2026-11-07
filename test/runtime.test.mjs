@@ -123,6 +123,16 @@ async function compactRows(h, rows) {
 const deferralInput = { reason: "Compare the active traces simultaneously; checkpointing plus recall would lose the cross-trace alignment." }
 const toolContext = { sessionID: "s", agent: "build", messageID: "assistant", id: "defer-1" }
 const defer = (h) => h.controller.deferCompaction(deferralInput, toolContext)
+// Build N of the budget gate: a fresh crossing arms instead of compacting, with its notice.
+// Tests that run through setup() pass the registered hook as run to reach its own controller.
+const armGate = async (h, run = (request) => h.controller.onContext(request)) => {
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  const before = h.state.compact
+  await run(request)
+  await setImmediate()
+  assert.equal(h.state.compact, before, "the crossing arms the gate instead of compacting")
+  assert.match(request.system.at(-1)?.text ?? "", /NextDCP budget gate/)
+}
 
 test("compaction archives every original before generation and recall retrieves episode and call", async () => {
   const h = harness()
@@ -993,7 +1003,7 @@ test("a plugin checkpoint without a stored record is adopted as a native episode
 })
 
 test("deferral defaults to native ask without overriding configured permission rules", async () => {
-  const h = harness()
+  const h = harness({ idle: false, budget: 40 })
   const allow = { action: "*", resource: "*", effect: "allow" }
   const ask = { action: "defer_compaction", resource: "*", effect: "ask" }
   const deny = { action: "defer_compaction", resource: "*", effect: "deny" }
@@ -1014,6 +1024,8 @@ test("deferral defaults to native ask without overriding configured permission r
     assert.deepEqual(tool.options, { permission: "defer_compaction", codemode: false })
     assert.deepEqual(tool.input.required, ["reason"])
     assert.equal(tool.input.additionalProperties, false)
+    h.state.rows = [user("u", "x".repeat(800))]
+    await armGate(h, (request) => h.state.hooks.get("context")(request))
     assert.match((await tool.execute({ reason: `  ${deferralInput.reason}  ` }, toolContext)).content, /deferred for this round only/)
     assert.deepEqual(h.state.permissions, [{
       sessionID: "s", agent: "build", action: "defer_compaction", resources: [deferralInput.reason], save: ["*"],
@@ -1035,6 +1047,7 @@ test("a granted deferral stops the budget trigger, then catches up after the rou
   await setImmediate()
   assert.equal(h.state.compact, 0, "the first request is still under the budget")
   h.state.rows = [tool("cold"), user("tail", "y".repeat(8_000)), tool("hot"), user("tail2", "z".repeat(24_000))]
+  await armGate(h)
   assert.match(await defer(h), /deferred for this round only/)
   assert.equal(h.state.permissions.length, 1)
   const request = { ...event(), messages: projectHistory(h.state.rows).messages }
@@ -1044,9 +1057,64 @@ test("a granted deferral stops the budget trigger, then catches up after the rou
   assert.match(await defer(h), /deferred for this round only/, "the held round's approval is idempotent")
   assert.equal(h.state.permissions.length, 1)
   await h.controller.onIdle("s")
+  await armGate(h)
   await h.controller.onContext(request)
   await setImmediate()
   assert.equal(h.state.compact, 1, "the round ended; the next context pays the trigger")
+})
+
+test("the budget gate arms at the crossing and pays it at the next build", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  await armGate(h)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "the next build closes the gate and compacts")
+})
+
+test("deferral outside an open gate never prompts, even when the budget trigger is off", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  assert.match(await defer(h), /outside one/)
+  assert.equal(h.state.permissions.length, 0)
+  const disabled = harness({ budget: false })
+  assert.match(await defer(disabled), /outside one/, "without a crossing there is no gate to defer behind")
+  assert.equal(disabled.state.permissions.length, 0)
+})
+
+test("an approved deferral holds its gate while a rejected request leaves the crossing to pay", async () => {
+  const held = harness({ idle: false, budget: 40 })
+  held.state.rows = [user("u", "x".repeat(800))]
+  await armGate(held)
+  assert.match(await defer(held), /deferred for this round only/)
+  await held.controller.onContext({ ...event(), messages: projectHistory(held.state.rows).messages })
+  await setImmediate()
+  assert.equal(held.state.compact, 0, "the grant holds the gate open for its round")
+  const refused = harness({ idle: false, budget: 40 })
+  refused.state.rows = [user("u", "x".repeat(800))]
+  await armGate(refused)
+  refused.ctx.permission.assert = async () => { throw new Error("denied") }
+  await assert.rejects(defer(refused))
+  await refused.controller.onContext({ ...event(), messages: projectHistory(refused.state.rows).messages })
+  await setImmediate()
+  assert.equal(refused.state.compact, 1, "a rejected request leaves the next build to compact")
+})
+
+test("a consumed crossing never re-arms while guarded or cooling down", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  await armGate(h)
+  const build = async (note) => {
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+    await h.controller.onContext(request)
+    await setImmediate()
+    assert.equal(h.state.compact, 1, note)
+    assert.ok(!request.system.some((part) => /NextDCP budget gate/.test(part.text ?? "")), note)
+  }
+  await build("the next build pays the consumed crossing")
+  await build("the admission guard blocks a re-arm")
+  h.controller.onCompactionFinished("s", true)
+  await build("a failing compaction cools the trigger down")
 })
 
 test("budget: false disables the mid-round trigger, matching idle: false and the deferral notice", async () => {
@@ -1055,11 +1123,13 @@ test("budget: false disables the mid-round trigger, matching idle: false and the
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 0, "an explicit false disables the budget trigger entirely")
+  assert.match(await defer(h), /outside one/, "without a crossing there is no gate to defer behind")
 })
 
 test("deferral is refused when physics cannot guarantee the window, and triggers stay active", async () => {
   const h = harness({ idle: false, budget: 100 })
   h.state.rows = [user("u1", "x".repeat(360_000))]
+  await armGate(h)
   assert.match(await defer(h), /about 90000 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
   assert.equal(h.state.permissions.length, 0, "physics refuses before spending the user's attention")
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
@@ -1067,11 +1137,13 @@ test("deferral is refused when physics cannot guarantee the window, and triggers
   assert.equal(h.state.compact, 1, "a refused grant leaves the budget trigger active")
   const attached = harness({ idle: false, budget: 100 })
   attached.state.rows = [{ ...user("u1", "small"), files: [{ mime: "image/png" }, { mime: "text/plain", data: Buffer.from("x".repeat(300_000)).toString("base64") }] }]
+  await armGate(attached)
   assert.match(await defer(attached), /about 76501 estimated tokens/, "attachments count at their media rate or decoded text size")
   assert.equal(attached.state.permissions.length, 0)
-  const unknown = harness({ idle: false })
+  const unknown = harness({ idle: false, budget: 100 })
   unknown.state.models = []
-  unknown.state.rows = [user("u1", "small")]
+  unknown.state.rows = [user("u1", "x".repeat(360_000))]
+  await armGate(unknown)
   assert.match(await defer(unknown), /window is unknown/)
   assert.equal(unknown.state.permissions.length, 0)
 })
@@ -1082,12 +1154,14 @@ test("the deferral estimate counts hidden reasoning the same way the response si
     { type: "reasoning", text: "r".repeat(280_000) }, { type: "text", text: "t".repeat(12_000) },
   ] }]
   // 1_000 user + 70_000 reasoning + 3_000 text = 74_000: hidden reasoning alone pushes it past 73_446.
+  await armGate(h)
   assert.match(await defer(h), /about 74000 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
   assert.equal(h.state.permissions.length, 0)
   const visible = harness({ idle: false, budget: 100 })
   visible.state.rows = [user("u1", "y".repeat(4_000)), { id: "a1", type: "assistant", content: [
     { type: "text", text: "t".repeat(12_000) },
   ] }]
+  await armGate(visible)
   assert.match(await defer(visible), /deferred for this round only/, "the same conversation without hidden reasoning fits")
   assert.equal(visible.state.permissions.length, 1)
 })
@@ -1101,17 +1175,22 @@ test("provider-reported usage calibrates estimates that face model window limits
   h.state.rows = [...pair(), user("u1", "z".repeat(928))]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
   assert.equal(h.state.compact, 1, "532 estimated tokens bill like 638 and pass the 600-token budget")
   const denied = harness({ idle: false, budget: 100 })
   denied.state.rows = [...pair(), user("u1", "x".repeat(360_000))]
+  await armGate(denied)
   assert.match(await defer(denied), /about 108360 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
   assert.equal(denied.state.permissions.length, 0)
   const flat = harness({ idle: false, budget: 100 })
   flat.state.rows = [...pair({ read: 260 }), user("u1", "x".repeat(360_000))]
+  await armGate(flat)
   assert.match(await defer(flat), /about 108360 estimated tokens/, "cache fields count toward billed growth whether nested or flat")
   const median = harness({ idle: false, budget: 100 })
   median.state.rows = [billed("a1", 640), billed("a2", 1_000),
     { ...billed("a3", 1_420), content: [{ type: "text", text: "" }] }, user("u1", "x".repeat(360_000))]
+  await armGate(median)
   assert.match(await defer(median), /about 126840 estimated tokens/, "two pairs of 1.2 and 1.4 calibrate to the upper median of 1.4")
 })
 
@@ -1122,6 +1201,8 @@ test("the growth gate converts the budget quarter into the estimator's own units
   const calibration = [billed("a1", 640), { ...billed("a2", 4_640), content: [{ type: "text", text: "" }] }]
   const fire = harness({ idle: false, budget: 4_000 })
   fire.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(2_408))]
+  await fire.controller.onContext({ ...event(), messages: projectHistory(fire.state.rows).messages })
+  await setImmediate()
   await fire.controller.onContext({ ...event(), messages: projectHistory(fire.state.rows).messages })
   await setImmediate()
   assert.equal(fire.state.compact, 1, "602 estimated tokens bill like 1,204 and reach the gate at 1,000 real tokens of growth")
@@ -1145,6 +1226,7 @@ test("unusable usage data falls back to native chars/4 estimate units", async ()
   for (const [name, rows] of variants) {
     const h = harness({ idle: false, budget: 100 })
     h.state.rows = [...rows, user("u1", "x".repeat(360_000))]
+    await armGate(h)
     assert.match(await defer(h), /about 90300 estimated tokens, above the grant ceiling of 73446/, name)
     assert.equal(h.state.permissions.length, 0, name)
     const trigger = harness({ idle: false, budget: 600 })
@@ -1159,9 +1241,12 @@ test("an unknown window announces its disabled budget trigger instead of failing
   const warnings = []
   t.mock.method(console, "warn", (text) => warnings.push(text))
   const h = harness({ idle: false, debug: true })
-  h.state.models = []
   h.state.rows = [user("u1", "x".repeat(360_000))]
-  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await armGate(h)
+  // The window can vanish mid-round; only the ref's own lookup decides what is known.
+  h.state.models = []
+  h.state.info.model = { providerID: "provider", id: "switched" }
+  await h.controller.onContext({ ...event(), model: { providerID: "provider", id: "switched" }, messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 0)
   assert.ok(warnings.some((text) => text.includes("budget trigger is disabled")), "the disabled trigger is logged when debugging")
@@ -1169,6 +1254,8 @@ test("an unknown window announces its disabled budget trigger instead of failing
 
   const explicit = harness({ idle: false, budget: 100_000 })
   explicit.state.models = []
+  explicit.state.rows = [user("u1", "x".repeat(600_000))]
+  await armGate(explicit)
   assert.match(await defer(explicit), /window is unknown/)
   assert.doesNotMatch(await defer(explicit), /likewise disabled/, "an explicit budget is a deliberate choice, not a silent default")
 })
@@ -1176,6 +1263,7 @@ test("an unknown window announces its disabled budget trigger instead of failing
 test("a deferred round writes no catch-up marker; the next round pays the budget trigger instead", async () => {
   const h = harness({ idle: 100, budget: 1_000 })
   h.state.rows = [user("u1", "x".repeat(5_000))]
+  await armGate(h)
   assert.match(await defer(h), /deferred for this round only/)
   const request = { ...event(), messages: projectHistory(h.state.rows).messages }
   await h.controller.onContext(request)
@@ -1185,6 +1273,7 @@ test("a deferred round writes no catch-up marker; the next round pays the budget
   assert.equal(await h.store.getDeferredCompaction(), undefined, "the held round owes no marker")
   await h.controller.onPrompt(prompt())
   assert.equal(h.state.compact, 0, "the next prompt is admitted without a catch-up compaction")
+  await armGate(h)
   await h.controller.onContext(request)
   await setImmediate()
   assert.equal(h.state.compact, 1, "without re-affirmation the mid-turn trigger catches up")
@@ -1198,6 +1287,7 @@ test("pending approval does not defer a trigger or cancel already-admitted compa
     h.state.permissions.push(input)
     await new Promise((resolve) => { approve = resolve })
   }
+  await armGate(h)
   const pending = defer(h)
   await setImmediate()
   assert.match(await defer(h), /already been requested/)
@@ -1217,13 +1307,16 @@ test("native permission rejection is rethrown and cannot be retried in that roun
   h.state.rows = [user("u", "x".repeat(800))]
   const rejection = new Error("native permission rejection")
   h.ctx.permission.assert = async (input) => { h.state.permissions.push(input); throw rejection }
+  await armGate(h)
   await assert.rejects(defer(h), (error) => error === rejection)
   assert.match(await defer(h), /Do not ask again/)
   assert.equal(h.state.permissions.length, 1)
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   assert.equal(h.state.compact, 1)
   h.controller.onRoundEnded("s")
+  h.controller.onCompactionFinished("s")
   h.ctx.permission.assert = async (input) => { h.state.permissions.push(input) }
+  await armGate(h)
   assert.match(await defer(h), /deferred for this round only/)
   assert.equal(h.state.permissions.length, 2)
 })
@@ -1234,6 +1327,7 @@ test("late approval cannot exempt an ended round or overwrite a later round's de
     h.state.rows = [user("u", "x".repeat(800))]
     let approve
     h.ctx.permission.assert = () => new Promise((resolve) => { approve = resolve })
+    await armGate(h)
     const pending = defer(h)
     await setImmediate()
     if (end === "event") h.controller.onRoundEnded("s")
@@ -1242,21 +1336,26 @@ test("late approval cannot exempt an ended round or overwrite a later round's de
     if (end === "delete") await h.controller.onDeleted("s")
     approve()
     assert.match(await pending, /round ended/, end)
+    // A stale gate re-arms at the first build and pays on the next; a repaid or
+    // cleared crossing is already compacting, so its build stays guard-blocked.
     await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    if (end !== "event") await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
     assert.equal(h.state.compact, 1, end)
   }
 
   const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
   let approve
   h.ctx.permission.assert = () => new Promise((resolve) => { approve = resolve })
+  await armGate(h)
   const old = defer(h)
   await setImmediate()
   h.state.info.time.busy = 2
   h.ctx.permission.assert = async () => {}
+  await armGate(h)
   await defer(h)
   approve()
   assert.match(await old, /round ended/)
-  h.state.rows = [user("u", "x".repeat(800))]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   assert.equal(h.state.compact, 0, "late approval leaves the later round's own approval intact")
 })
@@ -1265,6 +1364,7 @@ test("approved deferrals cannot leak across execution boundaries, sessions, or r
   for (const change of ["busy", "idle", "child", "fork", "reload", "unavailable"]) {
     const h = harness({ idle: false, budget: 40 })
     h.state.rows = [user("u", "x".repeat(800))]
+    await armGate(h)
     await defer(h)
     if (change === "busy") h.state.info.time.busy = 2
     if (change === "idle") h.state.info.time.idle = 2
@@ -1275,12 +1375,17 @@ test("approved deferrals cannot leak across execution boundaries, sessions, or r
     }
     const sessionID = change === "child" || change === "fork" ? change : "s"
     await h.controller.onContext({ ...event(sessionID), messages: projectHistory(h.state.rows).messages })
+    // A stale boundary re-arms at the first build and pays at the second; when the round
+    // stamp cannot be read at all, the first build already degrades to the plain cut.
+    if (change !== "unavailable") await h.controller.onContext({ ...event(sessionID), messages: projectHistory(h.state.rows).messages })
     assert.equal(h.state.compact, 1, change)
   }
 })
 
 test("steering messages within the same execution keep the current approval", async () => {
   const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u1", "x".repeat(800))]
+  await armGate(h)
   await defer(h)
   h.state.rows = [user("u1", "x".repeat(800)), user("u2", "A correction within the active round.")]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
@@ -1290,17 +1395,19 @@ test("steering messages within the same execution keep the current approval", as
 })
 
 test("empty reasons, disabled budgets, staged reverts, and sessions without a round never request permission", async () => {
-  const h = harness()
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  await armGate(h)
   assert.match(await h.controller.deferCompaction({ reason: "  " }, toolContext), /concrete current need/)
   assert.match(await h.controller.deferCompaction({ reason: "y".repeat(501) }, toolContext), /1 to 500 characters/)
   h.state.info.revert = { messageID: "old" }
   assert.match(await defer(h), /staged revert/)
   delete h.state.info.revert
   delete h.state.info.time.busy
-  assert.match(await defer(h), /active round/)
+  assert.match(await defer(h), /outside one/, "a session without a round has no open gate to defer")
   assert.equal(h.state.permissions.length, 0)
   const disabled = harness({ budget: false })
-  assert.match(await defer(disabled), /already disabled/)
+  assert.match(await defer(disabled), /outside one/, "a disabled budget never opens a gate")
   assert.equal(disabled.state.permissions.length, 0)
 })
 
@@ -1327,6 +1434,9 @@ test("budget compaction requires enough new growth and does not repeat on a larg
   await setImmediate()
   assert.equal(h.state.compact, 0, "225 new tokens are less than one quarter of the budget")
   h.state.rows = [prior, user("u1", "x".repeat(1_200))]
+  await h.controller.onContext(request("prior", "x".repeat(1_200)))
+  await setImmediate()
+  // The crossing arms at build N and pays at build N+1.
   await h.controller.onContext(request("prior", "x".repeat(1_200)))
   await setImmediate()
   assert.equal(h.state.compact, 1)
@@ -1406,8 +1516,8 @@ test("a host without the permission surface keeps recall and core hooks alive", 
 })
 
 test("setup registers success-only idle events and clears the subscription", async () => {
-  const h = harness({ idle: 1 })
-  h.state.rows = [user("u", "an idle session with work")]
+  const h = harness({ idle: 1, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
   let subscribed, closed = false, wake
   const queue = []
   h.ctx.event.subscribe = ({ types, signal }) => (async function* () {
@@ -1429,12 +1539,17 @@ test("setup registers success-only idle events and clears the subscription", asy
   assert.equal(h.state.tool.description, RECALL_DESCRIPTION)
   assert.deepEqual(h.state.tool.options, { codemode: false })
   const deferral = h.state.tools.get("defer_compaction")
+  // Each round's exemption expiring leaves no open gate behind; arm a fresh one before
+  // every call or the tool refuses without prompting.
+  const arm = () => armGate(h, (request) => h.state.hooks.get("context")(request))
+  await arm()
   await deferral.execute(deferralInput, toolContext)
   await h.state.hooks.get("context")({ ...event(), messages: projectHistory(h.state.rows).messages })
   for (const type of ["session.execution.failed", "session.execution.interrupted"]) {
     const before = h.state.permissions.length
     push(type)
     await setImmediate()
+    await arm()
     await deferral.execute(deferralInput, toolContext)
     assert.equal(h.state.permissions.length, before + 1, `${type} expires the round's exemption`)
   }
@@ -1448,6 +1563,7 @@ test("setup registers success-only idle events and clears the subscription", asy
   await setImmediate()
   assert.equal(h.state.compact, 0, "a granted round ends without a marker or a model call")
   const before = h.state.permissions.length
+  await arm()
   await deferral.execute(deferralInput, toolContext)
   assert.equal(h.state.permissions.length, before + 1, "success expires the round's exemption")
   await h.state.hooks.get("prompt")(prompt())

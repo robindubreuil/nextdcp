@@ -38,6 +38,13 @@ Raise the depth only when the question needs it. layer and page also work as dir
 
 Everything recall returns stays live for the rest of the episode.`
 
-export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction for the current round only. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval does not affect manual compaction or native overflow handling, and cannot cancel already-queued compaction; the next round starts from the full context and re-evaluates on its own.`
+/** Injected at the budget gate: one evaluation step before compaction proceeds. */
+export const budgetGateNotice = (tokens: number, budget: number) =>
+  `NextDCP budget gate — raw conversation is over the compaction budget (~${Math.round(tokens)} tokens, budget ${Math.round(budget)}). Compaction proceeds after your next step unless you request a deferral first. Compaction is the designed default: the cut is archived and originals come back with recall.
+1. Continue — compaction happens; recall what you still need.
+2. defer_compaction(reason) — only if the rest of this round genuinely needs simultaneous raw access (cross-file comparison, large diffs) and recall would materially impair the work. Every call prompts the user and is usually refused; prefer 3.
+3. Delegate — if the bulky work doesn't need this conversation's raw history, hand it to a general subagent with its own window and let it return a bounded result.`
+
+export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction for the current round only. Callable only while a NextDCP budget gate notice is active; anywhere else it refuses without prompting. Every call prompts the user for approval, so prefer delegating bulky work to a general subagent with its own window. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval leaves manual compaction and native overflow handling enabled; the next round starts from the full context and re-evaluates on its own.`
 
 
