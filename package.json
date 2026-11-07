@@ -18,7 +18,7 @@
     "prepack": "npm run build",
     "pretest": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/",
+    "test": "node --test \"test/*.test.mjs\"",
     "prerelease:local": "npm run typecheck && npm test",
     "release:local": "node scripts/release.mjs"
   },
