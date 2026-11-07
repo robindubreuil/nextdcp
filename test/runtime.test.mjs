@@ -236,9 +236,27 @@ test("archive-note hits show the note itself, not a fetch call that cannot repro
   const first = await compactRows(h, [user("u1", "some context"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   const found = await h.controller.recall("s", { query: "notekeyword", layer: "full" })
-  assert.match(found, /- E1 \(archive note, not original evidence\):/)
+  assert.match(found, /- recall E1 \(archive note, not original evidence\):/)
   assert.doesNotMatch(found, /- recall \{/, "no call that would fetch different content")
   assert.match(found, /page 1 of 1 \(1 hit\)/)
+})
+
+test("injected content homes in row originals and stays out of conversation search", async () => {
+  const h = harness()
+  const skillBody = Array.from({ length: 80 }, (_, index) => `companion directive ${index} for the bench phone camera`).join("\n")
+  const first = await compactRows(h, [
+    { id: "u1", type: "user", text: "activate the skill", skills: [{ name: "companion", text: skillBody }] },
+    running("c1"),
+  ])
+  h.state.rows = [completed("c1", first), user("live", "x")]
+  assert.match(await h.controller.recall("s", { query: "directive bench camera", layer: "conversation" }), /No matching snippets/, "the dialogue home carries only the tag")
+  const hit = await h.controller.recall("s", { query: "directive bench camera", layer: "tools" })
+  assert.match(hit.split("\n")[1], /^- recall u1 page 1:/, "the skill body's search home is its row original")
+  const fetched = await h.controller.recall("s", { id: "u1" })
+  assert.match(fetched, /\[Skill activated: companion\]\ncompanion directive 0 /)
+  assert.match(fetched, /companion directive 42/)
+  assert.ok(!fetched.includes("activate the skill"), "the user's words stay in the conversation home")
+  assert.match(await h.controller.recall("s", { id: "x".repeat(2_500) }), /^Use an id of at most 2,000 characters/)
 })
 
 test("a corrupt archived row and an out-of-range page return plain content, never a tool failure", async () => {

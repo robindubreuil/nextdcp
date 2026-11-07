@@ -481,6 +481,7 @@ export function createController(ctx: Plugin.Context) {
       if ((!id && !query) || (id && query)) return "Provide either id or query."
       if (!(LAYERS as readonly string[]).includes(layer)) return `layer must be one of: ${LAYERS.join(", ")}.`
       if (query.length > 2_000) return "Use a query of at most 2,000 characters; prefer exact identifiers and a few task keywords."
+      if (id.length > 2_000) return "Use an id of at most 2,000 characters; addresses are short handles like E57, call_01HZ2a3 or catalog."
       if (page !== undefined && (!Number.isSafeInteger(page) || page < 1)) return "Page must be a positive integer."
       const store = storeFor(sessionID)
       const target = id ? parseTarget(id) : undefined
@@ -565,7 +566,13 @@ export function createController(ctx: Plugin.Context) {
         }
         for (const row of facts.rows) {
           try {
-            if (JSON.parse(row.text).type === "shell") documents.push({ id: row.id, text: formatRow(row.text, (callID) => facts.byID.get(callID)), layer: "tools" })
+            // Shell output and injected content (skill and attachment text) home in their
+            // row originals; a user row with neither renders empty and joins no corpus.
+            const type = JSON.parse(row.text).type
+            if (type === "shell" || type === "user" || type === "skill") {
+              const text = formatRow(row.text, (callID) => facts.byID.get(callID))
+              if (text) documents.push({ id: row.id, text, layer: "tools" })
+            }
           } catch { /* unreadable row */ }
         }
         indexes.set(sessionID, { checkpoint, documents })
@@ -574,7 +581,7 @@ export function createController(ctx: Plugin.Context) {
       const hits = search(query, documents, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
       if (start >= hits.length) return at === 1 ? "No matching snippets. Try broader keywords or exact identifiers." : "No more search results."
       const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => {
-        const target = hit.note ? hit.id.split("#")[0] : `recall ${address(hit.id, hit.page)}`
+        const target = `recall ${hit.note ? hit.id.split("#")[0] : address(hit.id, hit.page)}`
         const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? location.id.split("#")[0] : address(location.id, location.page))).join(", ")})` : ""
         return `- ${target}${also}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`
       })

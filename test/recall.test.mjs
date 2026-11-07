@@ -387,6 +387,47 @@ test("tag caps land exactly: no marker at the boundary, no split surrogate pairs
   assert.match(emoji, /… \(\+\d+ chars\) → recall call-1\]/)
 })
 
+test("injected content tags in conversation, homes in the row original: skills and inline text", () => {
+  const skillBody = Array.from({ length: 60 }, (_, index) => `skill directive line ${index} for the bench phone`).join("\n")
+  const reportBody = Array.from({ length: 30 }, (_, index) => `report skill body line ${index}`).join("\n")
+  const logText = "attached bench log line ".repeat(300)
+  const rows = [
+    { id: "msg_user1", type: "user", text: "use the companion skill", skills: [{ name: "companion", text: skillBody }], files: [
+      { mime: "text/plain", name: "benchlog.txt", data: Buffer.from(logText).toString("base64") },
+      { mime: "image/png", name: "chart.png", data: "AAAA", source: { type: "uri", uri: "file:///chart.png" } },
+    ] },
+    { id: "msg_skill1", type: "skill", name: "report", text: reportBody },
+  ].map((row) => ({ id: row.id, text: JSON.stringify(row) }))
+
+  const conversationFiles = []
+  const conversation = formatTranscript("E2", rows, { layer: "conversation", files: conversationFiles })
+  assert.match(conversation, /\[User\]: use the companion skill/)
+  assert.match(conversation, new RegExp(`\\[Skill activated: companion \\(${skillBody.length} chars\\) → recall msg_user1\\]`))
+  assert.match(conversation, /\[Attached text\/plain: benchlog\.txt \(\d+ chars\) → recall msg_user1\]/)
+  assert.match(conversation, /\[Skill activated: report \(\d+ chars\) → recall msg_skill1\]/)
+  assert.match(conversation, /\[Attached image\/png: chart\.png\]/, "media stays a native label, not a counted tag")
+  assert.deepEqual(conversationFiles.map((item) => item.file.uri), ["data:image/png;base64,AAAA"])
+  assert.ok(!conversation.includes("skill directive line 30") && !conversation.includes("bench log line"), "injected bodies never ride the dialogue")
+
+  const full = formatTranscript("E2", rows, { layer: "full" })
+  assert.ok(full.includes(skillBody) && full.includes(logText) && full.includes(reportBody), "the full layer keeps everything inline")
+
+  const userHome = formatRow(rows[0].text)
+  assert.ok(userHome.includes(skillBody) && userHome.includes(logText))
+  assert.ok(!userHome.includes("use the companion skill"), "the user's words stay in the conversation home")
+  assert.equal(formatRow(rows[1].text), `[Skill activated: report]\n${reportBody}`)
+  assert.equal(formatRow(JSON.stringify({ id: "msg_plain", type: "user", text: "just words" })), "", "a user row without injected content joins no corpus")
+
+  const documents = [
+    { id: "E2", text: conversation, layer: "conversation" },
+    { id: "msg_user1", text: userHome, layer: "tools" },
+    { id: "msg_skill1", text: formatRow(rows[1].text), layer: "tools" },
+  ]
+  assert.deepEqual(search("directive", documents, 40, "conversation"), [], "skill bodies are not conversation homes")
+  assert.deepEqual(search("directive", documents, 40, "full").map((hit) => hit.id), ["msg_user1"])
+  assert.equal(search("report skill body", documents, 40, "tools")[0].id, "msg_skill1", "the skill row's own home ranks first for its body")
+})
+
 test("formatCatalog is a compact index by default, whole notes on the all view, and drops nothing", () => {
   const entries = [
     { id: "E2", note: "older body" },
@@ -419,6 +460,9 @@ test("parseTarget reads every rendered address and rejects what it cannot mean",
   assert.match(parseTarget("call_01HZ2a3 layer tools").message, /layer applies only to an episode/)
   assert.match(parseTarget("E57 sideways 2").message, /Cannot parse target near "sideways"/)
   assert.match(parseTarget("").message, /Provide a target/)
+  assert.match(parseTarget("E57 page 0").message, /Page must be a positive integer/, "a zero page in an address is a client error, not a failure")
+  assert.match(parseTarget("catalog E7 page 0").message, /Page must be a positive integer/)
+  assert.match(parseTarget(`E57 ${"q".repeat(300)}`).message, new RegExp(`near "${"q".repeat(120)}…`), "a pathological token is clipped, not echoed")
 })
 
 test("resolveHandle resolves like git: exact, then unique prefix, else ambiguous or unmatched", () => {
@@ -429,6 +473,8 @@ test("resolveHandle resolves like git: exact, then unique prefix, else ambiguous
   const ambiguous = resolveHandle("call", ids)
   assert.match(ambiguous.error, /Ambiguous target "call"; candidates: call-1, call-22/)
   assert.match(resolveHandle("nope", ids).error, /No matching episode, tool call, or archived row for "nope". Try a query search by content instead\./)
+  const flooded = resolveHandle("z".repeat(500), ids).error
+  assert.ok(flooded.length < 250 && flooded.includes(`"${"z".repeat(120)}…"`), "a giant unmatched handle is clipped, not echoed")
 })
 
 test("address renders the lean copy-paste target and layers fill only what the address omits", () => {

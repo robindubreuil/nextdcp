@@ -172,6 +172,14 @@ const tagBody = (value: string): string => {
   return `${value.slice(0, end)}… (+${value.length - end} chars)`
 }
 
+/** Error text quotes caller input; clip it so a pathological target cannot flood the reply. */
+const clip = (value: string, max = 120): string => {
+  if (value.length <= max) return value
+  let end = max
+  if (splitsPair(value, end)) end--
+  return `${value.slice(0, end)}…`
+}
+
 /** Carry exact attachment and echo offsets through nested formatting; labels may also occur in ordinary text. */
 function render(parts: readonly Fragment[], separator: string, files: RecallFile[], echoes: [number, number][] = []): string {
   let offset = 0
@@ -206,27 +214,44 @@ export function formatCall(call: ArchivedCall, files: RecallFile[] = [], echoes:
   return render([{ text: `Tool call ${call.id}\nTool: ${call.name}\nInput:\n${pretty(call.input)}\nOutput:\n` }, { text: output, files: outputFiles, ...mark }], "", files, echoes)
 }
 
-function attachment(value: unknown, files: RecallFile[]): string {
-  if (!object(value)) return ""
+const INLINE_TEXT_MIMES = ["text/plain", "application/x-directory"]
+
+/** An inline text attachment decodes so its bytes stay readable and searchable. In the
+ *  conversation layer it is a tag like any heavy input; the row original is its home. */
+function attachmentPart(value: unknown, layer: Layer, pointer?: string): Fragment {
+  if (!object(value)) return { text: "" }
   const source = text(value.uri) || (object(value.source) ? text(value.source.uri) : "")
   const mime = text(value.mime)
-  const uri = typeof value.data === "string" && mime ? `data:${mime};base64,${value.data}` : source
+  const data = typeof value.data === "string" ? value.data : ""
+  const uri = data && mime ? `data:${mime};base64,${data}` : source
   const name = text(value.name) || (source.startsWith("data:") ? "inline attachment" : source) || "inline attachment"
-  const label = `[Attached ${mime || "file"}: ${name}]`
-  if (typeof value.data === "string" && ["text/plain", "application/x-directory"].includes(mime)) {
+  if (data && INLINE_TEXT_MIMES.includes(mime)) {
     try {
-      return `${label}\n${text(value.description)}\n${new TextDecoder().decode(Uint8Array.from(atob(value.data), (char) => char.charCodeAt(0)))}`
+      const decoded = new TextDecoder().decode(Uint8Array.from(atob(data), (char) => char.charCodeAt(0)))
+      if (layer === "conversation" && pointer) return { text: `[Attached ${mime}: ${name} (${decoded.length} chars) → recall ${pointer}]` }
+      return { text: `[Attached ${mime}: ${name}]\n${text(value.description)}\n${decoded}` }
     } catch { /* Preserve malformed text as a native attachment rather than lose bytes. */ }
   }
+  const files: RecallFile[] = []
   if (uri && mime) files.push({ offset: 0, file: { type: "file", uri, mime, ...(text(value.name) ? { name: text(value.name) } : {}) } })
-  return label
+  return { text: `[Attached ${mime || "file"}: ${name}]`, files }
+}
+
+/** An activated skill is injected content, not dialogue: the conversation layer carries a
+ *  tag naming it; the row original is the skill text's home. */
+function skillText(name: string, body: string, layer: Layer, pointer: string): string {
+  if (!body) return `[Skill activated: ${name}]`
+  if (layer === "conversation" && pointer) return `[Skill activated: ${name} (${body.length} chars) → recall ${pointer}]`
+  return `[Skill activated: ${name}]\n${body}`
 }
 
 function toolContent(value: unknown, files: RecallFile[]): string {
   if (!Array.isArray(value)) return ""
   return render(value.map((item): Fragment => {
-    const local: RecallFile[] = []
-    return { text: !object(item) ? "" : item.type === "text" ? text(item.text) : attachment(item, local), files: local }
+    if (!object(item)) return { text: "" }
+    if (item.type === "text") return { text: text(item.text) }
+    // Tool output attachments always decode inline: the call original is their home.
+    return attachmentPart(item, "full")
   }), "\n", files)
 }
 
@@ -262,14 +287,14 @@ function transcriptRow(row: unknown, layer: Layer, resolve: Resolve | undefined,
   if (!object(row) || typeof row.type !== "string") throw new Error("Invalid archived row")
   const dialogue = layer !== "tools"
   if (row.type === "user") {
-    if (!dialogue) return ""
+    const pointer = text(row.id) ? shortId(text(row.id)) : ""
     const skills = Array.isArray(row.skills) ? row.skills.flatMap((skill) => object(skill) && text(skill.text)
-      ? [`[Skill activated: ${text(skill.name)}]\n${text(skill.text)}`] : []) : []
-    const attachments = Array.isArray(row.files) ? row.files.map((file): Fragment => {
-      const local: RecallFile[] = []
-      return { text: attachment(file, local), files: local }
-    }) : []
-    return render([...skills, `[User]: ${text(row.text)}`].map((value) => ({ text: value })).concat(attachments), "\n", files)
+      ? [{ text: skillText(text(skill.name), text(skill.text), layer, pointer) }] : []) : []
+    const attachments = Array.isArray(row.files) ? row.files.map((file) => attachmentPart(file, layer, pointer)) : []
+    // The tools layer drops the user's words (they live in the conversation home) but keeps
+    // injected content: this row original is the skill and attachment text's home.
+    const spoken = dialogue ? [{ text: `[User]: ${text(row.text)}` }] : []
+    return render([...skills, ...spoken, ...attachments], "\n", files)
   }
   if (row.type === "assistant") {
     if (!Array.isArray(row.content)) return ""
@@ -286,7 +311,7 @@ function transcriptRow(row: unknown, layer: Layer, resolve: Resolve | undefined,
     return `[Shell]: ${text(row.command)}\n${output}`
   }
   if (row.type === "synthetic") return dialogue ? `[Synthetic]: ${text(row.text)}` : ""
-  if (row.type === "skill") return dialogue ? `[Skill activated: ${text(row.name)}]\n${text(row.text)}` : ""
+  if (row.type === "skill") return skillText(text(row.name), text(row.text), layer, text(row.id) ? shortId(text(row.id)) : "")
   if (row.type === "system") return dialogue ? `[System]: ${text(row.text)}` : ""
   if (row.type === "location-switched" && object(row.location)) return dialogue ? `[User]: The working directory has been changed to ${text(row.location.directory)}.` : ""
   if (row.type === "compaction") return dialogue ? `[Checkpoint]: ${text(row.summary)}` : ""
@@ -321,6 +346,8 @@ export function formatTranscript(id: string, rows: readonly { readonly id: strin
 
 /** Render one stored row (its raw JSON) as a standalone tools-layer document:
     the exact text an opaque `recall msg_…` fetch returns, so search pages align.
+    For user and skill rows this is the home of injected content (skill text, decoded
+    inline attachments); dialogue itself stays in the episode conversation home.
     A row that cannot be parsed or rendered degrades to the transcript's gap
     marker, the same way episodes disclose unreadable rows. */
 export function formatRow(raw: string, resolve?: Resolve): string {
@@ -379,10 +406,14 @@ export function parseTarget(input: string): ParsedTarget {
     let entry: string | undefined, all = false, page: number | undefined
     for (let i = 1; i < tokens.length; i++) {
       const key = tokens[i], value = tokens[i + 1]
-      if (key === "page" && value !== undefined && /^\d+$/.test(value)) { page = Number(value); i++ }
+      if (key === "page" && value !== undefined && /^\d+$/.test(value)) {
+        if (Number(value) < 1) return { kind: "error", message: "Page must be a positive integer." }
+        page = Number(value)
+        i++
+      }
       else if (key === "all") all = true
       else if (/^E\d+$/.test(key) && entry === undefined) entry = key
-      else return { kind: "error", message: `Cannot parse catalog target near "${key}". Use: catalog [all | E<n>] [page N].` }
+      else return { kind: "error", message: `Cannot parse catalog target near "${clip(key)}". Use: catalog [all | E<n>] [page N].` }
     }
     if (all && entry !== undefined) return { kind: "error", message: "catalog takes one view: all, or one entry label (E<n>)." }
     return { kind: "catalog", ...(all ? { all: true } : {}), ...(entry !== undefined ? { entry } : {}), ...(page !== undefined ? { page } : {}) }
@@ -391,8 +422,12 @@ export function parseTarget(input: string): ParsedTarget {
   for (let i = 1; i < tokens.length; i++) {
     const key = tokens[i], value = tokens[i + 1]
     if (key === "layer" && value !== undefined && (LAYERS as readonly string[]).includes(value)) { layer = value as Layer; i++ }
-    else if (key === "page" && value !== undefined && /^\d+$/.test(value)) { page = Number(value); i++ }
-    else return { kind: "error", message: `Cannot parse target near "${key}". Use: <target> [layer conversation|tools|full] [page N].` }
+    else if (key === "page" && value !== undefined && /^\d+$/.test(value)) {
+      if (Number(value) < 1) return { kind: "error", message: "Page must be a positive integer." }
+      page = Number(value)
+      i++
+    }
+    else return { kind: "error", message: `Cannot parse target near "${clip(key)}". Use: <target> [layer conversation|tools|full] [page N].` }
   }
   if (/^E\d/.test(handle)) return { kind: "episode", handle, ...(layer !== undefined ? { layer } : {}), ...(page !== undefined ? { page } : {}) }
   if (layer !== undefined) return { kind: "error", message: "layer applies only to an episode (E57)." }
@@ -405,8 +440,8 @@ export function resolveHandle(handle: string, ids: readonly string[]): { readonl
   if (exact) return { id: exact }
   const matches = ids.filter((id) => id.startsWith(handle))
   if (matches.length === 1) return { id: matches[0] }
-  if (matches.length > 1) return { error: `Ambiguous target "${handle}"; candidates: ${matches.slice(0, 5).map(shortId).join(", ")}${matches.length > 5 ? ", …" : ""}` }
-  return { error: `No matching episode, tool call, or archived row for "${handle}". Try a query search by content instead.` }
+  if (matches.length > 1) return { error: `Ambiguous target "${clip(handle)}"; candidates: ${matches.slice(0, 5).map(shortId).join(", ")}${matches.length > 5 ? ", …" : ""}` }
+  return { error: `No matching episode, tool call, or archived row for "${clip(handle)}". Try a query search by content instead.` }
 }
 
 /** Return attachments only on the page where their label starts, never as base64 text.

@@ -24,7 +24,7 @@ id — fetch a target by its address. An address is exactly what the system rend
   recall E57                     an episode, conversation layer (the default)
   recall E57 layer tools page 2  that episode's tool output, page 2
   recall call_01HZ2a3            one exact tool call
-  recall msg_01HZ2a3b            one shell output
+  recall msg_01HZ2a3b            one archived row (shell output, skill/attachment text)
   recall catalog                 the episode catalog, newest first (one line per episode)
   recall catalog all             every episode's archive note
   recall catalog E7              one episode's archive note
@@ -33,8 +33,8 @@ An address is a handle (E57, call_…, msg_…) plus optional layer <conversatio
 query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original.
 
 layer (default conversation everywhere) is the depth to read or search:
-  conversation  what was said and asked — dialogue + tool/shell commands as tags (name + input head; heavy inputs and every output stay one recall hop away)
-  tools         what the tools returned — full tool calls + shell output
+  conversation  what was said and asked — dialogue plus tags for tool/shell commands, activated skills and attached text (name + head; heavy content and every output stay one recall hop away)
+  tools         what was returned or injected — full tool calls, shell output, and skill/attachment text in their row-original homes
   full          everything interleaved, plus archive notes
 Raise the depth only when the question needs it. layer and page also work as direct parameters: for a query they set the search depth and result page; for an id they fill in any depth or page the address omits.
 

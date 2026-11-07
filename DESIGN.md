@@ -207,8 +207,8 @@ needs it.
 
 | `layer` | `recall {id:"E57", layer}` | `recall {query, layer}` |
 |---|---|---|
-| **conversation** *(default)* | dialogue + tool/shell *commands* as tags (name + input head, no output) | search that conversation text |
-| **tools** | full calls + shell output, rendered from the `calls/` originals | search tool/shell output only |
+| **conversation** *(default)* | dialogue + tags for tool/shell commands, activated skills and attached text (name + head, no bodies) | search that conversation text |
+| **tools** | full calls + shell output + injected skill/attachment text, from the `calls/` and row originals | search that non-dialogue content only |
 | **full** | everything interleaved (the raw conversation) | search everything |
 
 `full` is the raw transcript. `conversation` is what was *said and asked*; `tools`
@@ -221,7 +221,10 @@ output is one hop away. A tag identifies a call, it does not carry it: a heavy
 input (a hand-rolled script written live, a long heredoc) reduces to its first
 200 characters plus the omitted count — the whole input stays in the call
 original, one hop away, and script-content search lands on that `tools` home
-instead of cluttering the dialogue. Hidden reasoning is stored but not rendered in any layer
+instead of cluttering the dialogue. The same rule covers injected content: an
+activated skill or an inline text attachment renders as a tag (name plus
+character count) pointing at its row original, which is that text's one home —
+injected bodies never ride the dialogue. Hidden reasoning is stored but not rendered in any layer
 yet; it joins the matrix later.
 
 #### The catalog: the only summary surface
@@ -260,9 +263,10 @@ one screen at any session length.
 
 #### Search corpus: one home per fact
 
-Every fact is indexed in exactly one place. Conversation documents carry only tool
-tags; each `calls/` original is its own document; each shell row is its own
-document. A query therefore hits *the fact itself*, and hit lines render runnable
+Every fact is indexed in exactly one place. Conversation documents carry only
+tags; each `calls/` original is its own document; each shell row and each
+skill/attachment-bearing user or skill row is its own document. A query therefore hits
+*the fact itself*, and hit lines render runnable
 targets (`recall call_01HZ2a3`, `recall E57 page 2`). `layer` filters which homes a
 search covers; archive-note hits surface only in unfiltered `full` search. A recall
 result's own output is marked an echo and excluded from ranking, so a
@@ -275,7 +279,8 @@ compaction — the only mutation that can change it — rebuilds it fresh.
 
 Media stays native: return text plus file content parts on the page containing each
 attachment label, without JSON/base64 expansion. Decode inline text attachments so
-they are searchable. Archived rows stay complete in compact JSON, but every
+they are searchable; their home is the row original, and the conversation layer
+carries only their tag. Archived rows stay complete in compact JSON, but every
 rendering and its search index show readable user, assistant, tool, shell, synthetic
 and checkpoint text — never row ids, timestamps, costs, provider metadata,
 signatures, or hidden reasoning. Tool output is not clipped.
