@@ -207,7 +207,7 @@ needs it.
 
 | `layer` | `recall {id:"E57", layer}` | `recall {query, layer}` |
 |---|---|---|
-| **conversation** *(default)* | dialogue + tool/shell *commands* as tags (name + input, no output) | search that conversation text |
+| **conversation** *(default)* | dialogue + tool/shell *commands* as tags (name + input head, no output) | search that conversation text |
 | **tools** | full calls + shell output, rendered from the `calls/` originals | search tool/shell output only |
 | **full** | everything interleaved (the raw conversation) | search everything |
 
@@ -217,7 +217,11 @@ is a `conversation` question, "what was the exact error" is a `tools` question, 
 a broad probe is `full`. Tool output renders from the `calls/` original, the
 canonical archive record. Tool tags in
 the conversation layer render the call target as `recall call_01HZ2a3`, so any
-output is one hop away. Hidden reasoning is stored but not rendered in any layer
+output is one hop away. A tag identifies a call, it does not carry it: a heavy
+input (a hand-rolled script written live, a long heredoc) reduces to its first
+200 characters plus the omitted count — the whole input stays in the call
+original, one hop away, and script-content search lands on that `tools` home
+instead of cluttering the dialogue. Hidden reasoning is stored but not rendered in any layer
 yet; it joins the matrix later.
 
 #### The catalog: the only summary surface

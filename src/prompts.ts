@@ -33,7 +33,7 @@ An address is a handle (E57, call_…, msg_…) plus optional layer <conversatio
 query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original.
 
 layer (default conversation everywhere) is the depth to read or search:
-  conversation  what was said and asked — dialogue + tool/shell commands as tags (name + input, no output)
+  conversation  what was said and asked — dialogue + tool/shell commands as tags (name + input head; heavy inputs and every output stay one recall hop away)
   tools         what the tools returned — full tool calls + shell output
   full          everything interleaved, plus archive notes
 Raise the depth only when the question needs it. layer and page also work as direct parameters: for a query they set the search depth and result page; for an id they fill in any depth or page the address omits.

@@ -161,6 +161,17 @@ export function paginate(text: string, page = 1, pageChars = RECALL_PAGE_CHARS):
 const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? "null"
 const text = (value: unknown) => typeof value === "string" ? value : ""
 
+/** A conversation tag identifies a call, it does not carry it: inputs past this size (a
+ *  hand-rolled script, a long heredoc) reduce to their head plus the omitted count, and
+ *  the whole original stays one hop away at the tag's recall pointer. */
+export const TAG_INPUT_CHARS = 200
+const tagBody = (value: string): string => {
+  if (value.length <= TAG_INPUT_CHARS) return value
+  let end = TAG_INPUT_CHARS
+  if (splitsPair(value, end)) end--
+  return `${value.slice(0, end)}… (+${value.length - end} chars)`
+}
+
 /** Carry exact attachment and echo offsets through nested formatting; labels may also occur in ordinary text. */
 function render(parts: readonly Fragment[], separator: string, files: RecallFile[], echoes: [number, number][] = []): string {
   let offset = 0
@@ -227,8 +238,9 @@ function toolPart(part: Record<string, unknown>, layer: Layer, resolve: Resolve 
   const state = object(part.state) ? part.state : {}
   const id = text(part.id), name = text(part.name)
   const input = JSON.stringify(state.input) ?? "null"
-  // In the conversation layer a call is only a runnable tag: its output is one hop away, never inline.
-  if (layer === "conversation") return { text: `[Tool ${name} ${input} → recall ${shortId(id)}]` }
+  // In the conversation layer a call is only a runnable tag: its output — and, when heavy,
+  // its input — is one hop away, never inline.
+  if (layer === "conversation") return { text: `[Tool ${name} ${tagBody(input)} → recall ${shortId(id)}]` }
   const outputFiles: RecallFile[] = []
   const original = resolve?.(id)
   let body: string
@@ -270,7 +282,7 @@ function transcriptRow(row: unknown, layer: Layer, resolve: Resolve | undefined,
   }
   if (row.type === "shell") {
     const output = object(row.output) ? text(row.output.output) : ""
-    if (layer === "conversation") return `[Shell ${text(row.command)} → recall ${shortId(text(row.id))}]`
+    if (layer === "conversation") return `[Shell ${tagBody(text(row.command))} → recall ${shortId(text(row.id))}]`
     return `[Shell]: ${text(row.command)}\n${output}`
   }
   if (row.type === "synthetic") return dialogue ? `[Synthetic]: ${text(row.text)}` : ""

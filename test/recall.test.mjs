@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, TAG_INPUT_CHARS, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
 import { formatSpan } from "../src/time.ts"
 
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
@@ -323,6 +323,68 @@ test("layer matrix: conversation renders runnable tags, tools the originals, ful
   assert.match(full, /^Episode E9: raw transcript/)
   for (const fragment of ["exact user question", "useful answer", "original output from calls/", "shell output"]) assert.ok(full.includes(fragment))
   for (const text of [conversation, tools, full]) assert.doesNotMatch(text, /hidden reasoning/, "reasoning is never rendered")
+})
+
+test("conversation tags identify heavy calls without carrying them; originals stay one hop away", () => {
+  const script = `#!/usr/bin/env python3\n` + Array.from({ length: 120 }, (_, i) => `print("step ${i} of the hand rolled script")`).join("\n")
+  const rows = [
+    { id: "u1", type: "user", text: "run the migration" },
+    { id: "a1", type: "assistant", content: [
+      { type: "text", text: "writing it live" },
+      { type: "tool", id: "call-write", name: "write", state: { status: "completed", input: { path: "migrate.py", content: script }, content: [] } },
+    ] },
+    { id: "sh1", type: "shell", command: `python3 - <<'EOF'\n${script}\nEOF`, output: { output: "done" } },
+  ].map((row) => ({ id: row.id, text: JSON.stringify(row) }))
+  const call = { id: "call-write", name: "write", input: { path: "migrate.py", content: script }, result: { type: "text", value: "wrote it" } }
+  const resolve = (id) => (id === "call-write" ? call : undefined)
+
+  const conversation = formatTranscript("E9", rows, { layer: "conversation", call: resolve })
+  const toolTag = conversation.split("\n").find((line) => line.startsWith("[Tool write"))
+  assert.ok(toolTag !== undefined)
+  assert.match(toolTag, /… \(\+\d+ chars\) → recall call-write\]$/)
+  assert.ok(toolTag.length < "[Tool write ".length + TAG_INPUT_CHARS + 30 + " → recall call-write]".length, "a heavy input leaves only its head in the tag")
+  assert.ok(!conversation.includes("step 119"), "the conversation layer carries the tag head, not the script body")
+
+  const shellStart = conversation.indexOf("[Shell python3")
+  const shellTag = conversation.slice(shellStart, conversation.indexOf("→ recall sh1]", shellStart) + 13)
+  assert.ok(shellTag.includes("… (+"), "a heredoc command is capped like a tool input")
+  assert.ok(!shellTag.includes("step 119"))
+
+  // What the tag drops stays one hop away: the full layer and the call original keep the script
+  // (the original carries it JSON-escaped; the full layer's shell row carries it raw).
+  const full = formatTranscript("E9", rows, { layer: "full", call: resolve })
+  assert.ok(full.includes(script), "the full layer stays the complete raw transcript")
+  const original = formatCall(call)
+  assert.ok(original.includes("step 119 of the hand rolled script"), "the call original keeps the whole input")
+
+  // Script content's search home is its original, not the dialogue.
+  const documents = [
+    { id: "E9", text: conversation, layer: "conversation" },
+    { id: "call-write", text: original, layer: "tools" },
+    { id: "sh1", text: formatRow(rows[2].text, resolve), layer: "tools" },
+  ]
+  assert.deepEqual(search("119", documents, 40, "conversation"), [], "script bodies are not conversation homes")
+  assert.deepEqual(new Set(search("119", documents, 40, "full").map((hit) => hit.id)), new Set(["call-write", "sh1"]))
+})
+
+test("tag caps land exactly: no marker at the boundary, no split surrogate pairs", () => {
+  const at = (path) => [{ id: "a", type: "assistant", content: [
+    { type: "tool", id: "call-1", name: "write", state: { status: "completed", input: { path }, content: [] } },
+  ] }]
+  const render = (path) => formatTranscript("E1", at(path).map((row) => ({ id: row.id, text: JSON.stringify(row) })), { layer: "conversation" })
+  // `{"path":"` + 189 + `"}` is exactly TAG_INPUT_CHARS: shown whole, no marker.
+  const exact = render("x".repeat(TAG_INPUT_CHARS - 11))
+  assert.ok(exact.includes(`[Tool write {"path":"${"x".repeat(TAG_INPUT_CHARS - 11)}"} → recall call-1]`))
+  assert.ok(!exact.includes("… (+"))
+  // One char over: the marker names exactly what was omitted.
+  assert.match(render("x".repeat(TAG_INPUT_CHARS - 10)), /… \(\+1 chars\) → recall call-1\]/)
+  // A surrogate pair straddling the cut is kept whole: the last shown char is not a lone high surrogate.
+  const emoji = render("x".repeat(TAG_INPUT_CHARS - 10) + "😀".repeat(30))
+  const head = emoji.slice(emoji.indexOf('"path":"') + 8, emoji.indexOf("… (+"))
+  const units = [...head]
+  const last = units.at(-1)
+  assert.ok(last !== undefined && last.length === 1 && last.charCodeAt(0) < 0xd800, "the cut never ends on a lone high surrogate")
+  assert.match(emoji, /… \(\+\d+ chars\) → recall call-1\]/)
 })
 
 test("formatCatalog is a compact index by default, whole notes on the all view, and drops nothing", () => {
