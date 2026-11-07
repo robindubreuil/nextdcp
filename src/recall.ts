@@ -1,6 +1,7 @@
 import type { ArchivedCall } from "./tokens.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
 import { formatSpan } from "./time.ts"
+import { object } from "./guards.ts"
 
 /** The depth within a chapter (episode) to read or search. `conversation` is the default everywhere. */
 export type Layer = "conversation" | "tools" | "full"
@@ -158,7 +159,6 @@ export function paginate(text: string, page = 1, pageChars = RECALL_PAGE_CHARS):
 }
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? "null"
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const text = (value: unknown) => typeof value === "string" ? value : ""
 
 /** Carry exact attachment and echo offsets through nested formatting; labels may also occur in ordinary text. */
@@ -290,11 +290,10 @@ export type TranscriptOptions = {
   readonly call?: Resolve
 }
 
-/** Render a stored episode. `options` is the documented shape; the legacy positional form
- *  `(id, rows, gap, files, echoes)` is accepted for internal callers and older tests. */
-export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], options: TranscriptOptions | boolean = {}, legacyFiles?: RecallFile[], legacyEchoes?: [number, number][]): string {
-  const opts: TranscriptOptions = typeof options === "boolean" ? { gap: options, files: legacyFiles, echoes: legacyEchoes } : options
-  const { layer = "full", gap = false, title, files = [], echoes = [], call } = opts
+/** Render a stored episode. `options` selects the layer, gap disclosure, title, and
+ *  the collectors for attachments, echoes, and call originals. */
+export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], options: TranscriptOptions = {}): string {
+  const { layer = "full", gap = false, title, files = [], echoes = [], call } = options
   const head = `Episode ${id}${title ? ` — ${title}` : ""}`
   const parts: Fragment[] = [{ text: layer === "tools" ? `${head} — tool output` : layer === "conversation" ? `${head} — conversation` : `${head}: raw transcript` }]
   if (gap) parts.push({ text: "Recall gap: some raw history was not archived." })
@@ -309,9 +308,15 @@ export function formatTranscript(id: string, rows: readonly { readonly id: strin
 }
 
 /** Render one stored row (its raw JSON) as a standalone tools-layer document:
-    the exact text an opaque `recall msg_…` fetch returns, so search pages align. */
+    the exact text an opaque `recall msg_…` fetch returns, so search pages align.
+    A row that cannot be parsed or rendered degrades to the transcript's gap
+    marker, the same way episodes disclose unreadable rows. */
 export function formatRow(raw: string, resolve?: Resolve): string {
-  return transcriptRow(JSON.parse(raw), "tools", resolve, [], [])
+  try {
+    return transcriptRow(JSON.parse(raw), "tools", resolve, [], [])
+  } catch {
+    return "[Invalid archived row; recall gap]"
+  }
 }
 
 export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }
@@ -394,8 +399,9 @@ export function resolveHandle(handle: string, ids: readonly string[]): { readonl
 
 /** Return attachments only on the page where their label starts, never as base64 text.
     Without page, return the whole original up to RECALL_ALL_CHARS in one call; an explicit
-    page steps through larger originals in RECALL_PAGE_CHARS pages. `base` is the lean target
-    (handle plus any layer), without the page. */
+    page steps through larger originals in RECALL_PAGE_CHARS pages. A page beyond the last
+    is reported as content naming the last page — a range hint, not a failure. `base` is
+    the lean target (handle plus any layer), without the page. */
 export function recallPage(base: string, text: string, page?: number, files: readonly RecallFile[] = []): RecallContent {
   const bounds = pageBounds(text, RECALL_PAGE_CHARS)
   const pages = bounds.length - 1
@@ -412,8 +418,10 @@ export function recallPage(base: string, text: string, page?: number, files: rea
     const whole = `${label}\n${text.slice(0, end)}`
     return attached.length ? [{ type: "text", text: whole }, ...attached] : whole
   }
-  const result = paginate(text, page)
+  if (!Number.isInteger(page) || page < 1) throw new RangeError("Invalid page")
+  if (page > pages) return `recall ${base} page ${page} is out of range: this original has ${pages} page${pages === 1 ? "" : "s"}; the last page is ${pages}.`
   const attached = attach(bounds[page - 1], bounds[page])
+  const result = paginate(text, page)
   const content = `recall ${base} page ${page} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
   return attached.length ? [{ type: "text", text: content }, ...attached] : content
 }

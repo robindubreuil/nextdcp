@@ -1,11 +1,11 @@
 import type { Plugin } from "@opencode/plugin"
 import { tokens } from "./tokens.ts"
 import { modelRpc, modelLabel, type ModelPreference, type ModelRef, type ModelState } from "./model-rpc.ts"
+import { object } from "./guards.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type ModelInfo = Awaited<ReturnType<Plugin.Context["model"]["list"]>>["data"][number]
 type HostRef = NonNullable<Parameters<Plugin.Context["experimental"]["generate"]["text"]>[0]["model"]>
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const ref = (value: unknown): value is ModelRef => object(value) && typeof value.providerID === "string" && !!value.providerID &&
   typeof value.id === "string" && !!value.id && Object.keys(value).every((key) => ["providerID", "id", "variant"].includes(key)) &&
   (value.variant === undefined || typeof value.variant === "string" && !!value.variant)

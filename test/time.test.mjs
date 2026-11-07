@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatDuration, formatSpan, formatStamp } from "../src/time.ts"
+import { formatDuration, formatSpan } from "../src/time.ts"
 
 // Pin the process timezone: the expected strings read local time back exactly as
 // the timestamps were constructed, and calendar spans (2026-10-02 -> 2026-11-03
@@ -36,27 +36,6 @@ test("formatDuration renders the two most-significant units and drops zero units
   assert.equal(formatDuration(63_072_000_000), "2y")
   assert.equal(formatDuration(70_956_000_000), "2y 3mo")
   assert.equal(formatDuration(60_444_000_000), "1y 11mo")
-})
-
-test("formatStamp cascades against the reference instant and re-anchors standalone", () => {
-  const standalone = new Date(2027, 0, 2, 9, 12).getTime()
-  const sameYear = new Date(2027, 5, 1, 8, 0).getTime()
-  const sameMonthOtherDay = new Date(2027, 10, 2, 9, 0).getTime()
-  const sameDay = new Date(2027, 10, 3, 9, 0).getTime()
-  const pastYear = new Date(2026, 10, 3, 9, 0).getTime()
-  const afternoon = new Date(2027, 10, 3, 14, 30).getTime()
-  // no reference: standalone fetch re-anchors at full precision
-  assert.equal(formatStamp(standalone), "2027-01-02 09:12")
-  // different year from the reference: full precision again
-  assert.equal(formatStamp(standalone, pastYear), "2027-01-02 09:12")
-  // same year: only the year is implied
-  assert.equal(formatStamp(afternoon, sameYear), "11-03 14:30")
-  // same year and month but a different day: the date is still shown
-  assert.equal(formatStamp(afternoon, sameMonthOtherDay), "11-03 14:30")
-  // same year, month, and day: only time remains
-  assert.equal(formatStamp(afternoon, sameDay), "14:30")
-  // fields are zero-padded to width
-  assert.equal(formatStamp(new Date(2027, 0, 2, 9, 5).getTime()), "2027-01-02 09:05")
 })
 
 test("formatSpan picks fields by elapsed and cascades the end against the start", () => {

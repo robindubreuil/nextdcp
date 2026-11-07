@@ -241,6 +241,35 @@ test("archive-note hits show the note itself, not a fetch call that cannot repro
   assert.match(found, /page 1 of 1 \(1 hit\)/)
 })
 
+test("a corrupt archived row and an out-of-range page return plain content, never a tool failure", async () => {
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "episode wording"), running("c1")])
+  h.state.rows = [completed("c1", first), user("live", "x")]
+  await h.storage.set("sessions/s/rows/u1", "corrupt not json {")
+  assert.equal(await h.controller.recall("s", { id: "u1" }), "recall u1 (whole output)\n[Invalid archived row; recall gap]")
+  assert.match(await h.controller.recall("s", { id: "E1" }), /Invalid archived row; recall gap/, "the episode transcript discloses the gap the same way")
+  assert.equal(await h.controller.recall("s", { id: "E1", page: 99 }), "recall E1 page 99 is out of range: this original has 1 page; the last page is 1.")
+  assert.match(await h.controller.recall("s", { query: "wording" }), /No matching snippets/, "search skips the unreadable row without failing")
+})
+
+test("the search corpus is cached per checkpoint: warm queries rescan nothing, a new cut rebuilds it fresh", async () => {
+  const h = harness()
+  let scans = 0
+  const scan = h.storage.scan.bind(h.storage)
+  h.storage.scan = async (options) => { scans++; return scan(options) }
+  const first = await compactRows(h, [user("u1", "firstcacheneedle wording"), running("c1")])
+  h.state.rows = [completed("c1", first), user("live", "x")]
+  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall E1 page 1/)
+  const cold = scans
+  assert.ok(cold > 0, "the cold query scans calls and rows")
+  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall E1 page 1/, "the warm query still answers")
+  assert.equal(scans, cold, "a warm query at the same checkpoint rescans nothing")
+  const second = await compactRows(h, [completed("c1", first), user("u2", "secondcacheneedle wording"), running("c2")])
+  h.state.rows = [completed("c1", first), user("u2", "secondcacheneedle wording"), completed("c2", second)]
+  assert.match(await h.controller.recall("s", { query: "secondcacheneedle" }), /recall E2 page 1/, "the rebuilt corpus sees the new episode")
+  assert.ok(scans > cold, "a new checkpoint invalidates the cache and rebuilds the corpus")
+})
+
 test("forks retain episode IDs and originals, branch independently, and survive parent deletion/reload", async () => {
   const h = harness()
   const first = await compactRows(h, [user("u1", "parent original uniqueparent"), running("c1")])

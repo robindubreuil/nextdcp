@@ -1,6 +1,7 @@
 // Token estimation matching OpenCode's native estimate (chars/4 with fixed
 // media costs). The budget gate, recall sizing and the memory budget check all
 // meter against it.
+import { object } from "./guards.ts"
 
 export type Part = { readonly type: string }
 export type Message = { readonly content: readonly Part[] }
@@ -17,7 +18,6 @@ export const tokens = (text: string): number => {
   return Math.max(0, Math.round((text.length - units) / 4 + wide))
 }
 
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const json = (value: unknown) => JSON.stringify(value) ?? ""
 export const mediaTokens = (mime: unknown) => {
   if (typeof mime !== "string") return 0
@@ -43,9 +43,3 @@ export function partTokens(part: Part): number {
 
 export const messageTokens = (messages: readonly Message[]) =>
   messages.reduce((sum, message) => sum + message.content.reduce((n, part) => n + partTokens(part), 0), 0)
-
-type HookTool = { readonly description: string; readonly input: unknown }
-export function requestTokens(request: { readonly system: readonly { readonly text: string }[]; readonly tools: Readonly<Record<string, HookTool>>; readonly messages: readonly Message[] }): number {
-  const toolTokens = Object.entries(request.tools).reduce((sum, [name, tool]) => sum + tokens(name + tool.description + json(tool.input)), 0)
-  return request.system.reduce((sum, part) => sum + tokens(part.text), 0) + toolTokens + messageTokens(request.messages)
-}

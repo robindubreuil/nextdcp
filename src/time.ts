@@ -56,22 +56,6 @@ const fieldsOf = (ms: number): Fields => {
 }
 
 /**
- * One timestamp cascaded against an optional `reference` instant the surrounding
- * context already states: only the leading date fields the reference already
- * implies are omitted, while time is always shown. A standalone stamp (no
- * reference) re-anchors at full precision: `YYYY-MM-DD HH:MM`.
- */
-export function formatStamp(ms: number, reference?: number): string {
-  const fields = fieldsOf(ms)
-  const time = `${fields.hour}:${fields.minute}`
-  if (reference === undefined) return `${fields.year}-${fields.month}-${fields.day} ${time}`
-  const ref = fieldsOf(reference)
-  if (ref.year !== fields.year) return `${fields.year}-${fields.month}-${fields.day} ${time}`
-  if (ref.month !== fields.month || ref.day !== fields.day) return `${fields.month}-${fields.day} ${time}`
-  return time
-}
-
-/**
  * `from → to (duration)`. Both the field-set and the cascade are chosen by
  * elapsed = end - start: spans under a day keep `YYYY-MM-DD HH:MM`, spans under
  * a year drop the time (`YYYY-MM-DD`), and spans of a year or more keep the

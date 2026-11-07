@@ -1,4 +1,5 @@
 import { tokens } from "./tokens.ts"
+import { object } from "./guards.ts"
 
 export const DEFAULT_MEMORY_BUDGET = 2_000
 export class HandoffError extends Error {}
@@ -14,7 +15,6 @@ export type Handoff = { readonly archive: string; readonly working: WorkingMemor
 /** Compact always-on archive pointer: how many episodes, since when, and how to open them. */
 export type Anchor = { readonly count: number; readonly first?: string; readonly last?: string; readonly span?: string }
 type UserRow = { readonly id: string; readonly type: string; readonly text?: unknown }
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const text = (value: unknown): value is string => typeof value === "string" && !!value.trim()
 const list = (value: unknown): value is string[] => Array.isArray(value) && value.every(text)
 const keys = (value: Record<string, unknown>, expected: readonly string[]) => Object.keys(value).every((key) => expected.includes(key))

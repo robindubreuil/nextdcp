@@ -99,7 +99,7 @@ test("formatTranscript marks recall renderings as echoes, and only those", () =>
     { type: "tool", name: "read", state: { input: { path: "a.ts" }, status: "completed", content: [{ type: "text", text: "genuine file content" }] } },
   ] }
   const echoes = []
-  const text = formatTranscript("E1", [{ id: "m1", text: JSON.stringify(row) }], false, [], echoes)
+  const text = formatTranscript("E1", [{ id: "m1", text: JSON.stringify(row) }], { echoes })
   assert.equal(echoes.length, 1)
   const [start, end] = echoes[0]
   assert.match(text.slice(start, end), /^\[Tool recall /)
@@ -200,7 +200,7 @@ test("episode transcripts render readable full content without row or provider m
     { id: "row-synthetic-secret", type: "synthetic", text: "continued" },
     { id: "row-checkpoint-secret", type: "compaction", status: "completed", summary: "checkpoint summary" },
   ]
-  const transcript = formatTranscript("E3", [...rows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), { id: "missing-secret" }], true)
+  const transcript = formatTranscript("E3", [...rows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), { id: "missing-secret" }], { gap: true })
   assert.match(transcript, /^Episode E3: raw transcript/)
   assert.match(transcript, /some raw history was not archived/)
   assert.match(transcript, /\[User\]: exact question/)
@@ -260,7 +260,7 @@ test("media recall returns original native files only on their own page, without
   const page = recallPage("media", text, 2, files)
   assert.deepEqual(page.slice(1), [image])
   assert.doesNotMatch(page[0].text, /base64|AAAA/)
-  assert.throws(() => recallPage("media", text, 3, files), /between/)
+  assert.equal(recallPage("media", text, 3, files), "recall media page 3 is out of range: this original has 2 pages; the last page is 2.")
   const errorFiles = []
   const error = formatCall({ id: "error", name: "read", input: {}, result: { type: "error", value: { error: "failed", content: [image] } } }, errorFiles)
   assert.match(error, /failed/)
@@ -282,7 +282,7 @@ test("user attachments retain inline bytes, searchable text, and native PDFs/ima
     { mime: "application/pdf", name: "doc.pdf", data: "BBBB", source: { type: "inline" } },
     { mime: "text/plain", name: "notes.txt", data: Buffer.from("searchable café").toString("base64"), source: { type: "inline" } },
   ] }
-  const text = formatTranscript("E1", [{ id: "u", text: JSON.stringify(input) }], false, files)
+  const text = formatTranscript("E1", [{ id: "u", text: JSON.stringify(input) }], { files })
   const result = recallPage("E1", text, 1, files)
   assert.deepEqual(result.slice(1).map((file) => file.uri), ["data:image/png;base64,AAAA", "data:application/pdf;base64,BBBB"])
   assert.match(result[0].text, /searchable café/)
@@ -393,6 +393,7 @@ test("formatRow renders the exact tools-layer bytes an opaque row fetch pages th
   const whole = recallPage(shortId("row-shell-1"), rendered)
   assert.ok(whole.endsWith(rendered), "a whole-output fetch returns the exact rendered bytes")
   assert.equal(typeof whole, "string", "text-only rows carry no file parts")
+  assert.equal(formatRow("corrupt not json {"), "[Invalid archived row; recall gap]", "a row that cannot parse degrades to the gap marker, not an error")
 })
 
 test("archive notes surface only in unfiltered full search", () => {

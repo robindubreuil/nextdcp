@@ -1,5 +1,6 @@
 import type { ArchivedCall } from "./tokens.ts"
 import { planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
+import { object } from "./guards.ts"
 
 // The v2 storage domain accepts JSON; storing serialized records also keeps rows as plain text.
 export type Storage = {
@@ -18,7 +19,6 @@ export type DeferredCompaction = {
   readonly tokens: number
 }
 
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const encode = (value: unknown): string => {
   const text = JSON.stringify(value)
   if (text === undefined) throw new Error("Record is not JSON serializable")

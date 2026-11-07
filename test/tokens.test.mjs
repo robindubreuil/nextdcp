@@ -1,14 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { partTokens, requestTokens, tokens } from "../src/tokens.ts"
+import { partTokens, tokens } from "../src/tokens.ts"
 
 const msg = (role, ...content) => ({ role, content })
-
-test("request estimates include system, tool definitions, content and native media estimates", () => {
-  const messages = [msg("user", { type: "text", text: "12345678" }, { type: "media", media: { mediaType: "image/png" } }, { type: "media", media: { mediaType: "application/pdf" } })]
-  const tools = { read: { description: "desc", input: { type: "object" } }, recall: { description: "retrieve", input: { type: "object", properties: {} } } }
-  assert.equal(requestTokens({ system: [{ text: "1234" }], tools, messages }), 1 + tokens("readdesc" + JSON.stringify(tools.read.input)) + tokens("recallretrieve" + JSON.stringify(tools.recall.input)) + 2 + 1500 + 2000)
-})
 
 test("token estimates count CJK scripts per character while keeping chars/4 elsewhere", () => {
   assert.equal(tokens("plain ascii text"), Math.round("plain ascii text".length / 4))

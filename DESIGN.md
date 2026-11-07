@@ -263,7 +263,9 @@ targets (`recall call_01HZ2a3`, `recall E57 page 2`). `layer` filters which home
 search covers; archive-note hits surface only in unfiltered `full` search. A recall
 result's own output is marked an echo and excluded from ranking, so a
 re-presentation of evidence never competes with the original it quotes. Immutable
-transcripts and originals are cached in memory (bounded LRU).
+transcripts and originals are cached in memory (bounded LRU), and the assembled
+corpus is cached per checkpoint: a warm query rescans nothing, and the next
+compaction — the only mutation that can change it — rebuilds it fresh.
 
 #### Content and privacy
 
@@ -276,8 +278,11 @@ signatures, or hidden reasoning. Tool output is not clipped.
 
 The tool description is the *entire* protocol the model needs to know. There is
 nothing in the system prompt, no message-ID tags, no nudges, no reminders and no
-priority labels. Recall results are ordinary tool outputs; the single compaction
-elision boundary keeps the system bounded.
+priority labels — with one exception: the budget-gate notice, a single system part
+sent only when the raw conversation crosses the compaction budget mid-round,
+because it must reach the model before its next step, not after it asks. Recall
+results are ordinary tool outputs; the single compaction elision boundary keeps the
+system bounded.
 
 ### Keeping context low (two compaction triggers)
 

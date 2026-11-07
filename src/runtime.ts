@@ -1,122 +1,51 @@
 import type { Plugin } from "@opencode/plugin"
 import type { SessionCompaction, SessionContext, SessionPrompt } from "@opencode/plugin/promise/session"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { mediaTokens, messageTokens, partTokens, tokens, type ArchivedCall, type Message, type Part } from "./tokens.ts"
+import { messageTokens, type ArchivedCall } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { budgetGateNotice, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
 import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
-import { createStore, exclusive, rowCalls } from "./store.ts"
+import { createStore, exclusive } from "./store.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
+import { object, positive, modelRef } from "./guards.ts"
+import { conversationTokens, growthAfter, responseTokens, usageScale, DEFER_WINDOW_SHARE, type ViewMessage } from "./estimate.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
 type Store = ReturnType<typeof createStore>
 type RecallInput = { readonly id?: string; readonly query?: string; readonly layer?: Layer; readonly page?: number }
-type ViewMessage = Message & { readonly id?: string; readonly role?: string }
 type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly echoes: readonly (readonly [number, number])[]; readonly size: number }
 type Round = { busy: number; idle?: number }
 type Deferral = Round & { approved: boolean }
 type Gate = Round & { checkpoint: string | null; growth: number }
+
+// All per-session runtime state in one record, so a session's lifecycle — above all
+// deletion — touches a single entry instead of a dozen maps keyed in parallel.
+type SessionState = {
+  guard?: ReturnType<typeof setTimeout>
+  admission?: Promise<void>
+  attempt?: { key: string; time: number }
+  cooldownUntil?: number
+  inheritance?: Promise<void>
+  view?: { checkpoint: string | null; tokens: number; after: string | null; response: number }
+  deferral?: Deferral
+  /** The open budget gate: one evaluation window per budget crossing, stamped with the round and checkpoint it belongs to. */
+  gate?: Gate
+  /** The queued message that triggered a deferred-marker compaction; evidence for the
+   *  working state, consumed only by whichever generation commits its handoff. Failed
+   *  generations keep the signal for their retry; the round's end clears what never ran. */
+  hint?: string
+  /** Prepared archive boundaries by checkpoint id, until their handoff commits. */
+  boundaries?: Map<string, Pending>
+}
 const sameRound = (round: Round | undefined, info: { time?: { busy?: number; idle?: number } }): boolean =>
   round !== undefined && round.busy === info.time?.busy && round.idle === info.time?.idle
-const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
-const positive = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
-const modelRef = (value: unknown) => object(value) && typeof value.providerID === "string" && typeof value.id === "string"
-  ? { providerID: value.providerID, id: value.id } : undefined
 const activeCheckpoint = (rows: readonly Row[]) => rows.findLast((row) => row.type === "compaction" && row.status === "completed")?.id ?? null
 const running = (rows: readonly Row[]) => rows.some((row) => row.type === "compaction" && row.status === "running")
 const GUARD_TIMEOUT = 3 * 60_000
 const TRANSCRIPT_CACHE_CHARS = 8_000_000
-
-/** Conversation tokens sent after the checkpoint message; undefined when that message is not identifiable. */
-function growthAfter(messages: readonly ViewMessage[], checkpoint: string | null): number | undefined {
-  const start = checkpoint === null ? 0 : messages.findIndex((message) => message.id === checkpoint) + 1
-  if (start === 0 && checkpoint !== null) return undefined
-  return messageTokens(messages.slice(start).filter((message) => message.role !== "system"))
-}
-
-/** Upper bound on the raw conversation a deferral may hold live, as a share of the window left after the output reserve. */
-const DEFER_WINDOW_SHARE = 0.8
-
-/** Estimated tokens of a user-row attachment: fixed media rates, decoded text size otherwise. */
-function attachmentTokens(file: unknown): number {
-  if (!object(file)) return 0
-  const media = mediaTokens(file.mime)
-  if (media) return media
-  if (typeof file.data !== "string") return 0
-  try { return tokens(new TextDecoder().decode(Uint8Array.from(atob(file.data), (char) => char.charCodeAt(0)))) }
-  catch { return Math.ceil(file.data.length * 3 / 16) }
-}
-
-/** Estimated tokens of the raw conversation a deferral would hold live,
- *  counting the same text and reasoning parts that responseTokens counts. */
-function conversationTokens(rows: readonly Row[]): number {
-  return rows.reduce((sum, row) => {
-    if (row.type === "user") {
-      const data = row as Row & Record<string, unknown>
-      const text = typeof data.text === "string" ? tokens(data.text) : 0
-      const files = Array.isArray(data.files) ? data.files.reduce<number>((n, file) => n + attachmentTokens(file), 0) : 0
-      return sum + text + files
-    }
-    if (row.type !== "assistant") return sum
-    const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || part.type === "reasoning") ? partTokens(part as Part) : 0), 0)
-    return sum + text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
-  }, 0)
-}
-
-/** Provider-reported billed tokens of a completed request: input plus cache traffic,
- *  read tolerantly across row shapes. Summing the cache fields is exact on the observed
- *  hosts and stays conservative if a provider folds them into input. */
-function billedTokens(row: Row): number {
-  const data = row as Row & { readonly tokens?: unknown }
-  if (!object(data.tokens)) return 0
-  const usage = data.tokens, cache = object(usage.cache) ? usage.cache : {}
-  return positive(usage.input, 0) + positive(usage.cacheRead ?? cache.read, 0) + positive(usage.cacheWrite ?? cache.write, 0)
-}
-
-/** Billed-token correction for estimates that face model window limits: the median ratio
- *  of provider-reported input growth to the estimator's count of the rows in between,
- *  over the last few completed requests of the rows' own model. Native chars/4 units
- *  (scale 1) apply until a usable pair of usage-bearing rows exists. */
-function usageScale(rows: readonly Row[]): number {
-  const samples: number[] = []
-  let later: { at: number; billed: number; model: string } | undefined
-  const key = (row: Row) => {
-    const model = modelRef((row as Row & { readonly model?: unknown }).model)
-    return model ? `${model.providerID}/${model.id}` : ""
-  }
-  for (let at = rows.length - 1; at >= 0 && samples.length < 3; at--) {
-    const row = rows[at]
-    if (row.type !== "assistant") continue
-    const billed = billedTokens(row)
-    if (billed <= 0) continue
-    if (later) {
-      // The earlier row's own output lands in the later request; a span holding a
-      // checkpoint or a model change cannot attribute billed growth to its rows.
-      const span = rows.slice(at, later.at), growth = later.billed - billed
-      const estimate = conversationTokens(span)
-      const usable = growth > 0 && estimate >= 256 && key(row) === later.model &&
-        !span.some((entry) => entry.type === "compaction" || entry.type === "model-switched")
-      const ratio = growth / estimate
-      if (usable && ratio >= 0.5 && ratio <= 2.5) samples.push(ratio)
-    }
-    later = { at, billed, model: key(row) }
-  }
-  if (!samples.length) return 1
-  const sorted = [...samples].sort((a, b) => a - b)
-  return sorted[Math.floor(sorted.length / 2)]
-}
-
-/** Only newly generated assistant rows, not a second projection of the history. */
-function responseTokens(rows: readonly Row[]): number {
-  return rows.reduce((sum, row) => {
-    if (row.type !== "assistant") return sum
-    const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || part.type === "reasoning") ? partTokens(part as Part) : 0), 0)
-    return sum + text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
-  }, 0)
-}
 
 /** Controller is independent of hook registration so fallback and concurrency can be tested. */
 export function createController(ctx: Plugin.Context) {
@@ -125,23 +54,20 @@ export function createController(ctx: Plugin.Context) {
   const idle = ctx.options.idle === false ? Infinity : positive(ctx.options.idle, 25_000)
   const budgetOption = ctx.options.budget === false ? Infinity : positive(ctx.options.budget, 0), memoryBudget = positive(rawMemory.budget, DEFAULT_MEMORY_BUDGET)
   const debug = ctx.options.debug === true
-  const guarded = new Map<string, ReturnType<typeof setTimeout>>()
-  const admissions = new Map<string, Promise<void>>()
-  const attempts = new Map<string, { key: string; time: number }>(), pending = new Map<string, Pending>()
-  const cooldown = new Map<string, number>()
-  const inherited = new Map<string, Promise<void>>()
-  const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
-  const deferrals = new Map<string, Deferral>()
-  // The open budget gate: one evaluation window per budget crossing, keyed on the
-  // session and stamped with the round and checkpoint it belongs to.
-  const gates = new Map<string, Gate>()
-  // The queued message that triggered a deferred-marker compaction; evidence for the
-  // working state, consumed only by whichever generation commits its handoff. Failed
-  // generations keep the signal for their retry; the round's end clears what never ran.
-  const hints = new Map<string, string>()
+  const sessions = new Map<string, SessionState>()
+  const state = (sessionID: string): SessionState => {
+    let entry = sessions.get(sessionID)
+    if (entry === undefined) sessions.set(sessionID, entry = {})
+    return entry
+  }
   const windows = new Map<string, Promise<{ context: number; output: number } | undefined>>()
   const transcripts = new Map<string, Transcript>()
   let transcriptChars = 0
+  // Search documents are immutable per id (rows and calls are write-once, transcripts
+  // never change), but the searchable set follows the archive and the active episode
+  // chain. The corpus is cached per session, keyed on the checkpoint, and dropped at
+  // every archive mutation; the next query rebuilds it from the cached transcripts.
+  const indexes = new Map<string, { checkpoint: string | null; documents: SearchDocument[] }>()
   const keyFor = (sessionID: string, id: string) => `${sessionID}\0${id}`
   const warn = (where: string, error?: unknown) => {
     const detail = error instanceof Error ? `: ${error.message}` : error === undefined ? "" : `: ${String(error)}`
@@ -153,7 +79,7 @@ export function createController(ctx: Plugin.Context) {
   const storeFor = (id: string) => createStore(ctx.storage, id, warn)
   const inheritSession = (sessionID: SessionID, rows: readonly Row[], seen = new Set<string>()): Promise<void> => {
     if (seen.has(sessionID)) return Promise.reject(new Error("Cyclic fork ancestry"))
-    const previous = inherited.get(sessionID)
+    const previous = sessions.get(sessionID)?.inheritance
     if (previous) return previous
     const work = (async () => {
       if (await storeFor(sessionID).hasInherited()) return
@@ -163,10 +89,13 @@ export function createController(ctx: Plugin.Context) {
       const snapshot = await storeFor(info.fork.sessionID).forkSnapshot(info.fork.boundary, source)
       const ancestry = new Set(seen).add(sessionID)
       await inheritSession(info.fork.sessionID, snapshot, ancestry)
+      // The import adds searchable rows, calls, and checkpoints to this archive.
+      indexes.delete(sessionID)
       await storeFor(sessionID).inherit(info.fork.sessionID, rows, snapshot)
     })()
-    inherited.set(sessionID, work)
-    void work.catch(() => { if (inherited.get(sessionID) === work) inherited.delete(sessionID) })
+    const entry = state(sessionID)
+    entry.inheritance = work
+    void work.catch(() => { if (entry.inheritance === work) entry.inheritance = undefined })
     return work
   }
   const windowSize = async (ref: unknown): Promise<{ context: number; output: number } | undefined> => {
@@ -192,33 +121,42 @@ export function createController(ctx: Plugin.Context) {
     }
   }
   const clearGuard = (sessionID: string) => {
-    const timer = guarded.get(sessionID)
-    if (timer !== undefined) clearTimeout(timer)
-    guarded.delete(sessionID)
+    const entry = sessions.get(sessionID)
+    if (entry === undefined) return
+    if (entry.guard !== undefined) clearTimeout(entry.guard)
+    entry.guard = undefined
   }
   const requestCompact = (sessionID: SessionID, checkpoint: string | null, growth: number): Promise<void> => {
-    const key = `${checkpoint ?? ""}:${growth}`
-    const previous = attempts.get(sessionID), now = Date.now()
-    if (guarded.has(sessionID) || (cooldown.get(sessionID) ?? 0) > now || (previous?.key === key && now - previous.time < GUARD_TIMEOUT)) return admissions.get(sessionID) ?? Promise.resolve()
+    const key = `${checkpoint ?? ""}:${growth}`, now = Date.now()
+    const entry = state(sessionID)
+    if (entry.guard !== undefined || (entry.cooldownUntil ?? 0) > now || (entry.attempt?.key === key && now - entry.attempt.time < GUARD_TIMEOUT)) return entry.admission ?? Promise.resolve()
     const attempt = { key, time: now }
-    attempts.set(sessionID, attempt)
+    entry.attempt = attempt
     const timer = setTimeout(() => {
-      if (guarded.get(sessionID) !== timer) return
-      guarded.delete(sessionID)
-      if (attempts.get(sessionID) === attempt) attempts.delete(sessionID)
+      const current = sessions.get(sessionID)
+      if (current?.guard !== timer) return
+      current.guard = undefined
+      if (current.attempt === attempt) current.attempt = undefined
     }, GUARD_TIMEOUT)
     const handle = timer as unknown as { unref?: () => void }
     handle.unref?.()
-    guarded.set(sessionID, timer)
+    entry.guard = timer
     // Prompt hooks await admission (not the summary) so the control is queued before
     // the new message. Context hooks must never wait on the runner.
     const admission = Promise.resolve().then(() => ctx.session.compact({ sessionID })).then(() => undefined).catch((error) => {
-      if (guarded.get(sessionID) === timer) clearGuard(sessionID)
-      if (attempts.get(sessionID) === attempt) attempts.delete(sessionID)
+      const current = sessions.get(sessionID)
+      if (current?.guard === timer) {
+        clearTimeout(timer)
+        current.guard = undefined
+      }
+      if (current?.attempt === attempt) current.attempt = undefined
       log("compact admission", error)
     })
-    admissions.set(sessionID, admission)
-    void admission.then(() => { if (admissions.get(sessionID) === admission) admissions.delete(sessionID) })
+    entry.admission = admission
+    void admission.then(() => {
+      const current = sessions.get(sessionID)
+      if (current?.admission === admission) current.admission = undefined
+    })
     return admission
   }
 
@@ -231,18 +169,19 @@ export function createController(ctx: Plugin.Context) {
       return
     }
     const checkpoint = activeCheckpoint(rows)
-    const decision = deferrals.get(event.sessionID)
+    const decision = sessions.get(event.sessionID)?.deferral
     let held = false
     if (decision?.approved) try {
       const info = await ctx.session.get({ sessionID: event.sessionID })
-      held = deferrals.get(event.sessionID) === decision && sameRound(decision, info)
+      held = sessions.get(event.sessionID)?.deferral === decision && sameRound(decision, info)
     } catch (error) { log("deferral scope", error) }
     // A granted deferral stops the budget trigger for its round; views keep tracking growth.
     try {
       const messages = event.messages as unknown as ViewMessage[]
       const growth = growthAfter(messages, checkpoint)
-      if (growth === undefined) { views.delete(event.sessionID); return }
-      views.set(event.sessionID, { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) })
+      const entry = state(event.sessionID)
+      if (growth === undefined) { entry.view = undefined; return }
+      entry.view = { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) }
       const limit = budgetOption || ((await windowSize(event.model))?.context ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
       // An unknown window disables the auto budget instead of assuming a size; surface
@@ -258,9 +197,10 @@ export function createController(ctx: Plugin.Context) {
       // A failed round-stamp read degrades to the plain trigger, never to a skipped cut.
       let info: SessionInfo | undefined
       try { info = await ctx.session.get({ sessionID: event.sessionID }) } catch (error) { log("budget gate", error) }
-      const gate = gates.get(event.sessionID)
-      if (gate) {
-        gates.delete(event.sessionID)
+      const current = state(event.sessionID)
+      if (current.gate) {
+        const gate = current.gate
+        current.gate = undefined
         // Build N+1 closes the gate it opened; a gate from another round or boundary is
         // stale and falls through to a fresh crossing. A held gate stays open so the
         // grant's idempotent re-affirmation keeps its round.
@@ -268,8 +208,8 @@ export function createController(ctx: Plugin.Context) {
       }
       // Arm the gate together with its notice; without a showable notice the crossing
       // stays silent and compacts as before.
-      if (info?.time?.busy !== undefined && !guarded.has(event.sessionID) && (cooldown.get(event.sessionID) ?? 0) <= Date.now() && !sameRound(deferrals.get(event.sessionID), info)) {
-        gates.set(event.sessionID, { busy: info.time.busy, idle: info.time.idle, checkpoint, growth })
+      if (info?.time?.busy !== undefined && current.guard === undefined && (current.cooldownUntil ?? 0) <= Date.now() && !sameRound(current.deferral, info)) {
+        current.gate = { busy: info.time.busy, idle: info.time.idle, checkpoint, growth }
         event.system.push({ type: "text", text: budgetGateNotice(estimate, budget) })
         return
       }
@@ -281,7 +221,6 @@ export function createController(ctx: Plugin.Context) {
   const ensureCheckpoint = async (sessionID: SessionID, id: string, row?: Row, rows?: readonly Row[], seen = new Set<string>()): Promise<void> => {
     if (seen.has(id)) throw new Error("Cyclic native checkpoint")
     seen.add(id)
-    const lock = keyFor(sessionID, id)
     const store = storeFor(sessionID), saved = await store.getCheckpoint(id)
     if (saved?.id === id) return
     if (!row) {
@@ -291,15 +230,18 @@ export function createController(ctx: Plugin.Context) {
     }
     // An encrypted native window cannot be represented by an empty textual episode.
     if (typeof row.summary !== "string" || !row.summary.trim()) throw new Error("Native checkpoint has no textual summary")
-    let boundary = await store.getPending(id) ?? pending.get(lock)
+    let boundary = await store.getPending(id) ?? sessions.get(sessionID)?.boundaries?.get(id)
     if (!boundary && rows?.some((item) => item.id === id)) {
       const cut = planCut(rows, id)
       boundary = { id, parent: cut.parent, rowIDs: cut.rowIDs, archived: false }
     }
     const parent = boundary?.parent
     if (parent) await ensureCheckpoint(sessionID, parent, rows?.find((item) => item.id === parent), rows, seen)
+    // Adoption adds an episode to the searchable chain.
+    indexes.delete(sessionID)
     await store.saveCheckpoint(adoptNative(row, await store.nextEpisode(), boundary))
-    pending.delete(lock)
+    const live = sessions.get(sessionID)
+    if (live?.boundaries) live.boundaries.delete(id)
   }
 
   const memoryAt = async (sessionID: SessionID, rows: readonly Row[], checkpoint: string | null) => {
@@ -314,6 +256,8 @@ export function createController(ctx: Plugin.Context) {
 
   const onCompaction = async (event: SessionCompaction) => {
     const store = storeFor(event.sessionID)
+    // Archival mutates the searchable set: rows, calls, and possibly the chain.
+    indexes.delete(event.sessionID)
     let rows: readonly Row[], boundary: Pending
     try {
       rows = await ctx.session.context({ sessionID: event.sessionID })
@@ -327,9 +271,10 @@ export function createController(ctx: Plugin.Context) {
       }
       const cut = planCut(rows)
       boundary = { id: cut.checkpoint, parent: cut.parent, rowIDs: cut.rowIDs, archived: false }
-      pending.set(keyFor(event.sessionID, boundary.id), boundary)
+      const boundaries = state(event.sessionID).boundaries ??= new Map()
+      boundaries.set(boundary.id, boundary)
       boundary = await store.prepareArchive(rows)
-      pending.delete(keyFor(event.sessionID, boundary.id))
+      boundaries.delete(boundary.id)
     } catch (error) {
       warn("archive before compaction; using native", error)
       await models.warning(event.sessionID, "Cannot prepare the episode archive; using native OpenCode compaction and its configured model.")
@@ -346,7 +291,7 @@ export function createController(ctx: Plugin.Context) {
       const users = transcriptRows.flatMap((row) => row.type === "user" && typeof (row as Row & { text?: unknown }).text === "string"
         ? [{ id: row.id, type: "user" as const, text: (row as Row & { text: string }).text }] : [])
       const gap = !boundary.archived || [...existing.catalog.values()].some((episode) => episode.gap)
-      const queued = hints.get(event.sessionID)
+      const queued = sessions.get(event.sessionID)?.hint
       const context = { through: id, budget: memoryBudget, previous: existing.working ?? renderHandoff(existing),
         archives: [...new Set([id, ...(existing.through ? [existing.through] : []), ...(existing.working?.references.map((ref) => ref.id) ?? [])])],
         users: users.map((user) => ({ id: user.id, start: user.text.slice(0, 160) })), ...(queued ? { queued } : {}) }
@@ -400,7 +345,8 @@ export function createController(ctx: Plugin.Context) {
       const record: Checkpoint = { id: boundary.id, parent: boundary.parent, episode, working: handoff.working,
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
-      hints.delete(event.sessionID) // The committed handoff is the signal's only consumer.
+      const live = sessions.get(event.sessionID)
+      if (live) live.hint = undefined // The committed handoff is the signal's only consumer.
       event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget, episodeNote(handoff.archive).title, archiveAnchor([...existing.episodes, episode])), metadata: { nextdcp: { version: 2 } } }
     } catch (error) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
@@ -409,39 +355,39 @@ export function createController(ctx: Plugin.Context) {
   }
 
   const onRoundEnded = (sessionID: SessionID) => {
+    const entry = sessions.get(sessionID)
+    if (entry === undefined) return
+    const { gate, deferral } = entry
+    entry.gate = entry.deferral = entry.hint = undefined
     // A failed or interrupted round has no later build to close its gate; the crossing it
     // consumed is repaid here unless a grant held the round.
-    const gate = gates.get(sessionID), decision = deferrals.get(sessionID)
-    gates.delete(sessionID)
-    deferrals.delete(sessionID)
-    hints.delete(sessionID)
-    if (gate && !decision?.approved) void requestCompact(sessionID, gate.checkpoint, gate.growth)
+    if (gate && !deferral?.approved) void requestCompact(sessionID, gate.checkpoint, gate.growth)
   }
   const onIdle = async (sessionID: SessionID) => {
     try {
       const [info, rows] = await Promise.all([
         ctx.session.get({ sessionID }), ctx.session.context({ sessionID }),
       ])
-      const decision = deferrals.get(sessionID)
+      const entry = sessions.get(sessionID)
+      const decision = entry?.deferral
       // The round ended, so its grant expires. A grant that carried through this verified
       // round owes no catch-up marker: the next round re-affirms or the mid-turn trigger
       // catches up in one bounded compaction. busy alone identifies the round, because
       // hosts stamp the new idle time when the round ends, before this event fires.
       const held = decision !== undefined && decision.approved && decision.busy === info.time?.busy
-      deferrals.delete(sessionID)
-      hints.delete(sessionID) // Round-scoped evidence dies with its round, as onRoundEnded clears it.
-      if (guarded.has(sessionID) && !running(rows)) clearGuard(sessionID)
+      if (entry) entry.deferral = entry.hint = undefined // Round-scoped evidence dies with its round, as onRoundEnded clears it.
+      if (entry?.guard !== undefined && !running(rows)) clearGuard(sessionID)
       // The round ended with an open gate: its evaluation window is over, so the crossing
       // it consumed is repaid unless a grant held the round or the boundary already moved.
-      const gate = gates.get(sessionID)
+      const gate = entry?.gate
       if (gate) {
-        gates.delete(sessionID)
+        if (entry) entry.gate = undefined
         if (!held && gate.checkpoint === activeCheckpoint(rows)) void requestCompact(sessionID, gate.checkpoint, gate.growth)
       }
       if (info.parentID || idle === Infinity) return
       // Add output produced after the last request, including an updated retry row.
       // Never reuse a view whose raw boundary disappeared or admitted another prompt.
-      const view = views.get(sessionID), checkpoint = activeCheckpoint(rows)
+      const view = entry?.view, checkpoint = activeCheckpoint(rows)
       if (!view || view.checkpoint !== checkpoint) return
       const start = view.after === null ? 0 : rows.findIndex((row) => row.id === view.after)
       if (start < 0 || rows.slice(view.after === null ? 0 : start + 1).some((row) => row.type === "user")) return
@@ -452,7 +398,8 @@ export function createController(ctx: Plugin.Context) {
         await storeFor(sessionID).saveDeferredCompaction({ checkpoint, after, tokens: growth })
       }
     } catch (error) {
-      deferrals.delete(sessionID)
+      const entry = sessions.get(sessionID)
+      if (entry) entry.deferral = undefined
       log("idle", error)
     }
   }
@@ -470,23 +417,25 @@ export function createController(ctx: Plugin.Context) {
       // The queued message is the strongest relevance signal for what the working
       // state must keep live; it stays evidence, never a summarized or obeyed row.
       const queued = event.prompt.text.trim().slice(0, 2_000)
-      if (queued) hints.set(event.sessionID, queued)
+      if (queued) state(event.sessionID).hint = queued
       await requestCompact(event.sessionID, deferred.checkpoint, deferred.tokens)
     } catch (error) { log("deferred compaction; admitting prompt unchanged", error) }
   }
   const onCompactionFinished = (sessionID: string, failed = false) => {
     clearGuard(sessionID)
+    const entry = state(sessionID)
     // A failing compaction must not be retried on every following step.
-    if (failed) cooldown.set(sessionID, Date.now() + GUARD_TIMEOUT)
+    if (failed) entry.cooldownUntil = Date.now() + GUARD_TIMEOUT
     else {
-      cooldown.delete(sessionID)
+      entry.cooldownUntil = undefined
       // A completed cut moved the boundary; its open gate is stale now.
-      gates.delete(sessionID)
+      entry.gate = undefined
     }
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
-    for (const map of [admissions, attempts, cooldown, views, inherited, deferrals, hints, gates]) map.delete(sessionID)
+    sessions.delete(sessionID)
+    indexes.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)
@@ -565,7 +514,8 @@ export function createController(ctx: Plugin.Context) {
 
       const rows = await ctx.session.context({ sessionID })
       await inheritSession(sessionID, rows)
-      const memory = await memoryAt(sessionID, rows, activeCheckpoint(rows))
+      const checkpoint = activeCheckpoint(rows)
+      const memory = await memoryAt(sessionID, rows, checkpoint)
       if (target?.kind === "catalog") {
         const entries = [...memory.catalog.values()].map((episode) => {
           const { title, body } = episodeNote(episode.summary)
@@ -584,8 +534,8 @@ export function createController(ctx: Plugin.Context) {
         return recallPage(`catalog${target.all ? " all" : ""}`, formatCatalog(entries, target.all ? "all" : "compact"), target.page ?? page ?? 1)
       }
 
-      const facts = await readFacts()
       if (target?.kind === "episode") {
+        const facts = await readFacts()
         const resolved = resolveHandle(target.handle, [...memory.catalog.keys()])
         if ("error" in resolved) return resolved.error
         const depth = target.layer ?? layer
@@ -596,23 +546,29 @@ export function createController(ctx: Plugin.Context) {
       // One home per fact: dialogue and tool/shell tags in the episode's conversation home,
       // tool output in its call original, shell output in its row; summaries surface only as
       // labeled pointer hits. Every search page therefore lands on fetchable text.
-      const documents: SearchDocument[] = []
-      for (const episode of memory.catalog.values()) {
-        const full = await transcript(sessionID, store, episode.id, memory.catalog, "conversation", facts.byID)
-        documents.push({ id: episode.id, text: full.text, echoes: full.echoes, layer: "conversation" })
-        const { title, body } = episodeNote(episode.summary)
-        const note = [title, body].filter(Boolean).join("\n")
-        if (note) documents.push({ id: `${episode.id}#note`, note: true, text: note })
-      }
-      for (const call of facts.calls) {
-        const callEchoes: [number, number][] = []
-        const text = formatCall(call, [], callEchoes)
-        documents.push({ id: call.id, text, layer: "tools", ...(callEchoes.length ? { echoes: callEchoes } : {}) })
-      }
-      for (const row of facts.rows) {
-        try {
-          if (JSON.parse(row.text).type === "shell") documents.push({ id: row.id, text: formatRow(row.text, (callID) => facts.byID.get(callID)), layer: "tools" })
-        } catch { /* unreadable row */ }
+      const cached = indexes.get(sessionID)
+      let documents = cached?.checkpoint === checkpoint ? cached.documents : undefined
+      if (documents === undefined) {
+        documents = []
+        const facts = await readFacts()
+        for (const episode of memory.catalog.values()) {
+          const full = await transcript(sessionID, store, episode.id, memory.catalog, "conversation", facts.byID)
+          documents.push({ id: episode.id, text: full.text, echoes: full.echoes, layer: "conversation" })
+          const { title, body } = episodeNote(episode.summary)
+          const note = [title, body].filter(Boolean).join("\n")
+          if (note) documents.push({ id: `${episode.id}#note`, note: true, text: note })
+        }
+        for (const call of facts.calls) {
+          const callEchoes: [number, number][] = []
+          const text = formatCall(call, [], callEchoes)
+          documents.push({ id: call.id, text, layer: "tools", ...(callEchoes.length ? { echoes: callEchoes } : {}) })
+        }
+        for (const row of facts.rows) {
+          try {
+            if (JSON.parse(row.text).type === "shell") documents.push({ id: row.id, text: formatRow(row.text, (callID) => facts.byID.get(callID)), layer: "tools" })
+          } catch { /* unreadable row */ }
+        }
+        indexes.set(sessionID, { checkpoint, documents })
       }
       if (!documents.length) return "Nothing is archived to search yet."
       const hits = search(query, documents, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
@@ -637,13 +593,14 @@ export function createController(ctx: Plugin.Context) {
       log("deferral gate", error)
       return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
     }
-    const gate = gates.get(sessionID)
+    const gate = sessions.get(sessionID)?.gate
     if (!gate || !sameRound(gate, info) || gate.checkpoint !== activeCheckpoint(rows))
       return "Compaction deferral is only available at an open NextDCP budget gate; this request is outside one. Normal compaction and recall remain enabled."
     const reason = input.reason.trim()
     if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
     if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
-    const previous = deferrals.get(sessionID)
+    const entry = state(sessionID)
+    const previous = entry.deferral
     if (previous && sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
 
     // Physics before consent: a grant must fit the window, so no approval is spent on a
@@ -666,14 +623,14 @@ export function createController(ctx: Plugin.Context) {
 
     // An unapproved record also prevents concurrent requests and retries after refusal.
     const decision: Deferral = { busy: info.time.busy, idle: info.time.idle, approved: false }
-    deferrals.set(sessionID, decision)
+    entry.deferral = decision
     // Preserve native rejection/interruption errors; returning them would change host control flow.
     await ctx.permission.assert({
       sessionID, agent: context.agent, action: "defer_compaction", resources: [reason], save: ["*"],
       source: { type: "tool", messageID: context.messageID, id: context.id },
     })
     const current = await ctx.session.get({ sessionID })
-    if (deferrals.get(sessionID) !== decision || !sameRound(decision, current)) return "That round ended before deferral could take effect; normal compaction remains enabled."
+    if (sessions.get(sessionID)?.deferral !== decision || !sameRound(decision, current)) return "That round ended before deferral could take effect; normal compaction remains enabled."
     decision.approved = true
     return deferredNotice
   }
