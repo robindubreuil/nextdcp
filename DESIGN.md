@@ -41,8 +41,9 @@ The rendered handoff ends with one compact **archive anchor** line — the episo
 count, the first and last episode titles, and the covered time span at adaptive
 precision, then `Browse: recall catalog; search: recall(query)`. It is the only
 always-on archive context: a fixed, self-explanatory pointer that says the archive
-exists, roughly when it covers, and how to open it. The full catalog is fetched
-on demand and arrives whole in one call.
+exists, roughly when it covers, and how to open it. The catalog is fetched on
+demand: a compact line per episode, one page per call, with one episode's whole
+note or the full-note view one request away.
 
 The normal working-state ceiling is 2,000 estimated tokens for the complete
 rendered handoff, with a prompt target of about 1,000 or less. The estimate is
@@ -183,11 +184,16 @@ the model sees is copy-paste runnable:
 recall E57                   an episode, conversation layer (default)
 recall E57 layer tools page 2  an episode's tool output, page 2
 recall call_01HZ2a3          one exact tool call
-recall catalog               the episode catalog (newest first)
+recall catalog               the episode catalog, newest first (one line per episode)
+recall catalog all           every episode's archive note
+recall catalog E7            one episode's archive note
 ```
 
 An address is a handle (`E57`, `call_01HZ2a3`, `catalog`) plus optional
-`layer <conversation|tools|full>` and `page <n>` pairs; `catalog` takes neither.
+`layer <conversation|tools|full>` and `page <n>` pairs; `catalog` instead takes
+an optional view — `all`, or one exact entry label (`E7`). Listings return one
+page per call and continue at `page <n>`; a single entry note fetches whole like
+any original.
 The same `layer` and `page` also work as direct parameters — for a query they set
 the search depth and result page, for an id they fill in what the address omits,
 and the address wins where both set one.

@@ -5,7 +5,7 @@ import { mediaTokens, messageTokens, partTokens, tokens, type ArchivedCall, type
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { budgetGateNotice, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
-import { address, formatCall, formatCatalog, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
+import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, exclusive, rowCalls } from "./store.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
@@ -567,13 +567,21 @@ export function createController(ctx: Plugin.Context) {
       await inheritSession(sessionID, rows)
       const memory = await memoryAt(sessionID, rows, activeCheckpoint(rows))
       if (target?.kind === "catalog") {
-        return formatCatalog([...memory.catalog.values()].map((episode) => {
+        const entries = [...memory.catalog.values()].map((episode) => {
           const { title, body } = episodeNote(episode.summary)
           return {
             id: episode.id, ...(title ? { title } : {}), note: body,
             ...(episode.start !== undefined && episode.end !== undefined ? { start: episode.start, end: episode.end } : {})
           }
-        }))
+        })
+        if (!entries.length) return "Nothing is archived yet."
+        if (target.entry !== undefined) {
+          const entry = entries.find((one) => one.id === target.entry)
+          if (!entry) return `No catalog entry "${target.entry}"; recall the catalog for current labels.`
+          return recallPage(`catalog ${entry.id}`, formatCatalogEntry(entry), target.page ?? page)
+        }
+        // Listings page like search hits: one page per call, never a whole dump.
+        return recallPage(`catalog${target.all ? " all" : ""}`, formatCatalog(entries, target.all ? "all" : "compact"), target.page ?? page ?? 1)
       }
 
       const facts = await readFacts()

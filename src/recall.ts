@@ -316,22 +316,21 @@ export function formatRow(raw: string, resolve?: Resolve): string {
 
 export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }
 
-/** The sole summary surface: episode labels newest-first (numeric ID), whole in one call up
-    to RECALL_ALL_CHARS — the oldest labels drop rather than page. */
-export function formatCatalog(entries: readonly CatalogEntry[]): string {
+const catalogLine = (entry: CatalogEntry): string =>
+  `${entry.id}${entry.title ? ` — ${entry.title}` : ""}${entry.start !== undefined && entry.end !== undefined ? ` (${formatSpan(entry.start, entry.end)})` : ""}`
+
+/** One entry's label and whole note: the fetchable original behind a catalog line. */
+export function formatCatalogEntry(entry: CatalogEntry): string {
+  return `${catalogLine(entry)}\n${entry.note}`
+}
+
+/** The sole summary surface: episode labels newest-first (numeric ID). Compact by default —
+    one line per entry — with `all` as the whole-note view. Both are plain text that
+    recallPage pages like any other target; nothing ever drops silently. */
+export function formatCatalog(entries: readonly CatalogEntry[], view: "compact" | "all" = "compact"): string {
   const ordered = [...entries].sort((a, b) => Number(b.id.slice(1)) - Number(a.id.slice(1)) || (a.id < b.id ? -1 : 1))
-  const parts: Fragment[] = [{ text: "Archive catalog (newest first)" }]
-  let used = 0
-  for (const entry of ordered) {
-    const span = entry.start !== undefined && entry.end !== undefined ? ` (${formatSpan(entry.start, entry.end)})` : ""
-    const line = `${entry.id}${entry.title ? ` — ${entry.title}` : ""}${span}\n${entry.note}`
-    if (parts.length > 1 && used + line.length > RECALL_ALL_CHARS) break
-    parts.push({ text: line })
-    used += line.length + 2
-  }
-  const hidden = ordered.length - parts.length + 1
-  if (hidden > 0) parts.push({ text: `…${hidden} older episode${hidden === 1 ? "" : "s"} omitted.` })
-  return render(parts, "\n\n", [])
+  const header = "Archive catalog (newest first) — one entry's note: recall id=catalog E<n>; every note: recall id=catalog all"
+  return [header, ...ordered.map((entry) => (view === "all" ? formatCatalogEntry(entry) : catalogLine(entry)))].join(view === "all" ? "\n\n" : "\n")
 }
 
 /** A rendered ID is its unique 12-character prefix; recall resolves any unambiguous prefix. */
@@ -348,26 +347,35 @@ export function address(id: string, page?: number, layer?: Layer): string {
 }
 
 export type ParsedTarget =
-  | { readonly kind: "catalog" }
+  | { readonly kind: "catalog"; readonly entry?: string; readonly all?: boolean; readonly page?: number }
   | { readonly kind: "episode"; readonly handle: string; readonly layer?: Layer; readonly page?: number }
   | { readonly kind: "opaque"; readonly handle: string; readonly page?: number }
   | { readonly kind: "error"; readonly message: string }
 
-/** Parse a lean target address: a handle plus optional `layer <L>` and `page <n>` pairs. */
+/** Parse a lean target address: a handle plus optional `layer <L>` and `page <n>` pairs.
+    `catalog` instead takes an optional view: `all` or one exact entry label (E<n>). */
 export function parseTarget(input: string): ParsedTarget {
   const tokens = input.trim().split(/\s+/).filter(Boolean)
   if (!tokens.length) return { kind: "error", message: "Provide a target: catalog, an episode (E57), a tool call, or an archived row." }
   const handle = tokens[0]
+  if (handle === "catalog") {
+    let entry: string | undefined, all = false, page: number | undefined
+    for (let i = 1; i < tokens.length; i++) {
+      const key = tokens[i], value = tokens[i + 1]
+      if (key === "page" && value !== undefined && /^\d+$/.test(value)) { page = Number(value); i++ }
+      else if (key === "all") all = true
+      else if (/^E\d+$/.test(key) && entry === undefined) entry = key
+      else return { kind: "error", message: `Cannot parse catalog target near "${key}". Use: catalog [all | E<n>] [page N].` }
+    }
+    if (all && entry !== undefined) return { kind: "error", message: "catalog takes one view: all, or one entry label (E<n>)." }
+    return { kind: "catalog", ...(all ? { all: true } : {}), ...(entry !== undefined ? { entry } : {}), ...(page !== undefined ? { page } : {}) }
+  }
   let layer: Layer | undefined, page: number | undefined
   for (let i = 1; i < tokens.length; i++) {
     const key = tokens[i], value = tokens[i + 1]
     if (key === "layer" && value !== undefined && (LAYERS as readonly string[]).includes(value)) { layer = value as Layer; i++ }
     else if (key === "page" && value !== undefined && /^\d+$/.test(value)) { page = Number(value); i++ }
     else return { kind: "error", message: `Cannot parse target near "${key}". Use: <target> [layer conversation|tools|full] [page N].` }
-  }
-  if (handle === "catalog") {
-    if (layer !== undefined || page !== undefined) return { kind: "error", message: "catalog takes no layer or page." }
-    return { kind: "catalog" }
   }
   if (/^E\d/.test(handle)) return { kind: "episode", handle, ...(layer !== undefined ? { layer } : {}), ...(page !== undefined ? { page } : {}) }
   if (layer !== undefined) return { kind: "error", message: "layer applies only to an episode (E57)." }

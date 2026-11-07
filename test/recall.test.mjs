@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { address, formatCall, formatCatalog, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
 import { formatSpan } from "../src/time.ts"
 
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
@@ -325,34 +325,35 @@ test("layer matrix: conversation renders runnable tags, tools the originals, ful
   for (const text of [conversation, tools, full]) assert.doesNotMatch(text, /hidden reasoning/, "reasoning is never rendered")
 })
 
-test("formatCatalog lists newest first with spans, optional titles, and a bounded drop-oldest tail", () => {
+test("formatCatalog is a compact index by default, whole notes on the all view, and drops nothing", () => {
   const entries = [
     { id: "E2", note: "older body" },
     { id: "E10", title: "Recall fixes", start: 1_000, end: 2_000, note: "newest body" },
     { id: "E1", note: "oldest body" },
   ]
-  const catalog = formatCatalog(entries)
-  assert.ok(catalog.indexOf("\n\nE10 —") < catalog.indexOf("\n\nE2\n") && catalog.indexOf("\n\nE2\n") < catalog.indexOf("\n\nE1\n"), "numeric ids sort newest first")
-  assert.ok(catalog.startsWith("Archive catalog (newest first)\n\nE10 — Recall fixes (" + formatSpan(1_000, 2_000) + ")\nnewest body"))
-  assert.ok(catalog.includes("\n\nE2\nolder body"))
-  assert.ok(catalog.includes("\n\nE1\noldest body"))
+  const header = "Archive catalog (newest first) — one entry's note: recall id=catalog E<n>; every note: recall id=catalog all"
+  const labeled = `E10 — Recall fixes (${formatSpan(1_000, 2_000)})`
+  assert.equal(formatCatalog(entries), [header, labeled, "E2", "E1"].join("\n"), "compact: one line per entry, newest first, no note bodies")
+  assert.equal(formatCatalog(entries, "all"), [header, `${labeled}\nnewest body`, "E2\nolder body", "E1\noldest body"].join("\n\n"), "all: every whole note")
+  assert.equal(formatCatalogEntry(entries[1]), `${labeled}\nnewest body`, "an entry fetch is its label and whole note")
 
-  const note = "n".repeat(7_000)
-  const full = formatCatalog(Array.from({ length: 6 }, (_, index) => ({ id: `E${index + 1}`, note })))
-  assert.ok(full.includes("E6\n"), "newest kept")
-  assert.ok(full.includes("E3\n"))
-  assert.ok(!full.includes("E2\n") && !full.includes("E1\n"), "oldest labels drop rather than page")
-  assert.ok(full.endsWith("\n\n…2 older episodes omitted."))
+  const many = Array.from({ length: 40 }, (_, index) => ({ id: `E${index + 1}`, note: "n".repeat(2_000) }))
+  assert.equal(formatCatalog(many).split("\n").length, 41, "every entry gets its line; paging replaces the old drop-oldest tail")
 })
 
 test("parseTarget reads every rendered address and rejects what it cannot mean", () => {
   assert.deepEqual(parseTarget("catalog"), { kind: "catalog" })
+  assert.deepEqual(parseTarget("catalog all"), { kind: "catalog", all: true })
+  assert.deepEqual(parseTarget("catalog E7"), { kind: "catalog", entry: "E7" })
+  assert.deepEqual(parseTarget("catalog E7 page 2"), { kind: "catalog", entry: "E7", page: 2 })
+  assert.deepEqual(parseTarget("catalog all page 3"), { kind: "catalog", all: true, page: 3 })
   assert.deepEqual(parseTarget("E57"), { kind: "episode", handle: "E57" })
   assert.deepEqual(parseTarget("E57 layer tools page 2"), { kind: "episode", handle: "E57", layer: "tools", page: 2 })
   assert.deepEqual(parseTarget("call_01HZ2a3"), { kind: "opaque", handle: "call_01HZ2a3" })
   assert.deepEqual(parseTarget("msg_9f page 3"), { kind: "opaque", handle: "msg_9f", page: 3 })
-  assert.match(parseTarget("catalog layer full").message, /catalog takes no layer or page/)
-  assert.match(parseTarget("catalog page 2").message, /catalog takes no layer or page/)
+  assert.match(parseTarget("catalog layer full").message, /Cannot parse catalog target near "layer"/)
+  assert.match(parseTarget("catalog all E7").message, /one view/)
+  assert.match(parseTarget("catalog E7 E8").message, /Cannot parse catalog target near "E8"/)
   assert.match(parseTarget("call_01HZ2a3 layer tools").message, /layer applies only to an episode/)
   assert.match(parseTarget("E57 sideways 2").message, /Cannot parse target near "sideways"/)
   assert.match(parseTarget("").message, /Provide a target/)

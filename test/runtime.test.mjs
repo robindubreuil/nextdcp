@@ -165,6 +165,36 @@ test("compaction archives every original before generation and recall retrieves 
   assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive integer/)
 })
 
+test("catalog listings are compact and paged on demand; an entry note fetches whole like any original", async () => {
+  const h = harness()
+  h.state.handoff.archive = "Title: Alpha title\nalpha archive note"
+  h.state.rows = [user("u1", "first work"), running("c1")]
+  const first = event()
+  await h.controller.onCompaction(first)
+  h.state.handoff.archive = "Title: Beta title\nbeta archive note"
+  h.state.rows = [completed("c1", first.result), user("u2", "second work"), running("c2")]
+  const second = event()
+  await h.controller.onCompaction(second)
+  h.state.rows = [completed("c1", first.result), user("u2", "second work"), completed("c2", second.result)]
+
+  const compact = await h.controller.recall("s", { id: "catalog" })
+  assert.match(compact, /recall catalog page 1 \(page 1 of 1\)/, "listings return one page per call, never a whole dump")
+  assert.ok(compact.includes("\nE2 — Beta title") && compact.includes("\nE1 — Alpha title"), "one labeled line per entry")
+  assert.ok(compact.indexOf("\nE2") < compact.indexOf("\nE1"), "newest first")
+  assert.doesNotMatch(compact, /archive note/, "compact lines carry no note bodies")
+  const all = await h.controller.recall("s", { id: "catalog all" })
+  assert.match(all, /alpha archive note/, "the all view carries every note")
+  assert.match(all, /beta archive note/)
+  const entry = await h.controller.recall("s", { id: "catalog E1" })
+  assert.match(entry, /recall catalog E1 \(whole output\)/)
+  assert.match(entry, /alpha archive note/)
+  assert.doesNotMatch(entry, /beta archive note/, "an entry label is exact")
+  assert.match(await h.controller.recall("s", { id: "catalog E9" }), /No catalog entry "E9"/)
+
+  const empty = harness()
+  assert.match(await empty.controller.recall("s", { id: "catalog" }), /Nothing is archived yet/)
+})
+
 test("the checkpoint summary titles the new episode from its Title line", async () => {
   const h = harness()
   h.state.handoff.archive = "Title: Recall fixes\nWork: preserve the exact request."

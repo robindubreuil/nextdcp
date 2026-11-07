@@ -25,8 +25,10 @@ id — fetch a target by its address. An address is exactly what the system rend
   recall E57 layer tools page 2  that episode's tool output, page 2
   recall call_01HZ2a3            one exact tool call
   recall msg_01HZ2a3b            one shell output
-  recall catalog                 the episode catalog (newest first)
-An address is a handle (E57, call_…, msg_…) plus optional layer <conversation|tools|full> and page <n> pairs; catalog takes neither. Any unambiguous id prefix resolves. A fetch returns the whole original in one call up to 30,000 characters; larger ones show where paging continues.
+  recall catalog                 the episode catalog, newest first (one line per episode)
+  recall catalog all             every episode's archive note
+  recall catalog E7              one episode's archive note
+An address is a handle (E57, call_…, msg_…) plus optional layer <conversation|tools|full> and page <n> pairs; catalog takes [all | E<n>] instead of layer. Any unambiguous id prefix resolves. A fetch returns the whole original in one call up to 30,000 characters; larger ones show where paging continues. Catalog listings (catalog and catalog all) return one page per call; page <n> continues.
 
 query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original.
 
