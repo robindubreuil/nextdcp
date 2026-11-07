@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatCall, formatTranscript, recallPage, paginate, search, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { address, formatCall, formatCatalog, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { formatSpan } from "../src/time.ts"
 
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
   const documents = [
@@ -34,8 +35,9 @@ test("identical evidence is deduplicated and archive-only search notes are expli
   const hits = search("needle", [{ id: "E2", text: "same needle evidence" }, { id: "E1", text: "same needle evidence" }])
   assert.deepEqual(hits.map((hit) => hit.id), ["E1"])
   assert.deepEqual(hits[0].also, [{ id: "E2", page: 1 }])
-  const [note] = search("selector", [{ id: "E3", text: "The raw transcript uses other words.", summary: "Compaction model selector; src/picker.ts." }])
+  const [note] = search("selector", [{ id: "E3", text: "The raw transcript uses other words." }, { id: "E3#note", note: true, text: "Compaction model selector; src/picker.ts." }])
   assert.equal(note.note, true)
+  assert.equal(note.id, "E3#note")
   assert.equal(note.page, 1)
   assert.match(note.snippet, /selector/)
 })
@@ -152,16 +154,16 @@ test("~1.5k-token pages preserve every character and have explicit continuation"
 test("id recall without page returns the whole original in one call", () => {
   const small = "a".repeat(RECALL_PAGE_CHARS * 3)
   const whole = recallPage("call-1", small)
-  assert.match(whole, /^recall \{"id":"call-1"\} \(whole output\)\n/)
+  assert.match(whole, /^recall call-1 \(whole output\)\n/)
   assert.ok(whole.endsWith(small))
   const big = "b".repeat(RECALL_PAGE_CHARS * 7) + "😀 tail"
   const head = recallPage("call-2", big)
   const body = head.slice(head.indexOf("\n") + 1)
-  assert.match(head, /^recall \{"id":"call-2"\} \(whole output too large: first 30000 of 42007 characters; use a query to locate the relevant page first, or continue at page 6\)\n/)
+  assert.match(head, /^recall call-2 \(whole output too large: first 30000 of 42007 characters; use a query to locate the relevant page first, or continue at page 6\)\n/)
   assert.equal(body, big.slice(0, RECALL_ALL_CHARS))
   const rest = Array.from({ length: 3 }, (_, index) => paginate(big, index + 6).content).join("")
   assert.equal(body + rest, big)
-  assert.equal(recallPage("empty", ""), 'recall {"id":"empty"} (whole output)\n')
+  assert.equal(recallPage("empty", ""), "recall empty (whole output)\n")
   const files = []
   const text = formatCall({ id: "call-3", name: "read", input: {}, result: { type: "content", value: [{ type: "text", text: "x ".repeat(3_500) }, { type: "file", uri: "file:///x", mime: "image/png" }] } }, files)
   const withFile = recallPage("call-3", text, undefined, files)
@@ -286,4 +288,137 @@ test("user attachments retain inline bytes, searchable text, and native PDFs/ima
   assert.match(result[0].text, /searchable café/)
   assert.doesNotMatch(result[0].text, /AAAA|BBBB|base64/)
   assert.equal(search("searchable", [{ id: "E1", text }]).length, 1)
+})
+
+test("layer matrix: conversation renders runnable tags, tools the originals, full interleaves both", () => {
+  const rows = [
+    { id: "u1", type: "user", text: "exact user question", time: { created: 1 } },
+    { id: "a1", type: "assistant", time: { created: 2 }, content: [
+      { type: "reasoning", text: "hidden reasoning" },
+      { type: "text", text: "useful answer" },
+      { type: "tool", id: "call-1", name: "read", state: { status: "completed", input: { path: "a.ts" }, content: [{ type: "text", text: "inline state output" }] } },
+      { type: "tool", id: "call-echo", name: "recall", state: { status: "completed", input: { query: "old" }, content: [{ type: "text", text: "quoted old evidence" }] } },
+    ] },
+    { id: "sh1", type: "shell", command: "node test", output: { output: "shell output" } },
+  ].map((row) => ({ id: row.id, text: JSON.stringify(row) }))
+  const call = (id) => id === "call-1" ? { id, name: "read", input: { path: "a.ts" }, result: { type: "text", value: "original output from calls/" } } : undefined
+
+  const conversation = formatTranscript("E9", rows, { layer: "conversation", call })
+  assert.match(conversation, /^Episode E9 — conversation/)
+  assert.match(conversation, /\[User\]: exact user question/)
+  assert.match(conversation, /\[Assistant\]: useful answer/)
+  assert.match(conversation, /\[Tool read \{"path":"a\.ts"\} → recall call-1\]/)
+  assert.match(conversation, /\[Tool recall \{"query":"old"\} → recall call-echo\]/)
+  assert.match(conversation, /\[Shell node test → recall sh1\]/)
+  assert.doesNotMatch(conversation, /inline state output|original output from calls\/|shell output|quoted old evidence/, "commands are tags; every output is one hop away")
+
+  const tools = formatTranscript("E9", rows, { layer: "tools", call })
+  assert.match(tools, /^Episode E9 — tool output/)
+  assert.ok(tools.includes(`[Tool read {"path":"a.ts"}]:\noriginal output from calls/`), "tools layer renders the call original, not the in-row state")
+  assert.ok(tools.includes(`[Tool recall {"query":"old"}]:\nquoted old evidence`))
+  assert.ok(tools.includes(`[Shell]: node test\nshell output`))
+  assert.doesNotMatch(tools, /exact user question|useful answer/, "no dialogue at the tools depth")
+
+  const full = formatTranscript("E9", rows, { layer: "full", call })
+  assert.match(full, /^Episode E9: raw transcript/)
+  for (const fragment of ["exact user question", "useful answer", "original output from calls/", "shell output"]) assert.ok(full.includes(fragment))
+  for (const text of [conversation, tools, full]) assert.doesNotMatch(text, /hidden reasoning/, "reasoning is never rendered")
+})
+
+test("formatCatalog lists newest first with spans, optional titles, and a bounded drop-oldest tail", () => {
+  const entries = [
+    { id: "E2", note: "older body" },
+    { id: "E10", title: "Recall fixes", start: 1_000, end: 2_000, note: "newest body" },
+    { id: "E1", note: "oldest body" },
+  ]
+  const catalog = formatCatalog(entries)
+  assert.ok(catalog.indexOf("\n\nE10 —") < catalog.indexOf("\n\nE2\n") && catalog.indexOf("\n\nE2\n") < catalog.indexOf("\n\nE1\n"), "numeric ids sort newest first")
+  assert.ok(catalog.startsWith("Archive catalog (newest first)\n\nE10 — Recall fixes (" + formatSpan(1_000, 2_000) + ")\nnewest body"))
+  assert.ok(catalog.includes("\n\nE2\nolder body"))
+  assert.ok(catalog.includes("\n\nE1\noldest body"))
+
+  const note = "n".repeat(7_000)
+  const full = formatCatalog(Array.from({ length: 6 }, (_, index) => ({ id: `E${index + 1}`, note })))
+  assert.ok(full.includes("E6\n"), "newest kept")
+  assert.ok(full.includes("E3\n"))
+  assert.ok(!full.includes("E2\n") && !full.includes("E1\n"), "oldest labels drop rather than page")
+  assert.ok(full.endsWith("\n\n…2 older episodes omitted."))
+})
+
+test("parseTarget reads every rendered address and rejects what it cannot mean", () => {
+  assert.deepEqual(parseTarget("catalog"), { kind: "catalog" })
+  assert.deepEqual(parseTarget("E57"), { kind: "episode", handle: "E57" })
+  assert.deepEqual(parseTarget("E57 layer tools page 2"), { kind: "episode", handle: "E57", layer: "tools", page: 2 })
+  assert.deepEqual(parseTarget("call_01HZ2a3"), { kind: "opaque", handle: "call_01HZ2a3" })
+  assert.deepEqual(parseTarget("msg_9f page 3"), { kind: "opaque", handle: "msg_9f", page: 3 })
+  assert.match(parseTarget("catalog layer full").message, /catalog takes no layer or page/)
+  assert.match(parseTarget("catalog page 2").message, /catalog takes no layer or page/)
+  assert.match(parseTarget("call_01HZ2a3 layer tools").message, /layer applies only to an episode/)
+  assert.match(parseTarget("E57 sideways 2").message, /Cannot parse target near "sideways"/)
+  assert.match(parseTarget("").message, /Provide a target/)
+})
+
+test("resolveHandle resolves like git: exact, then unique prefix, else ambiguous or unmatched", () => {
+  const ids = ["call-1", "call-22", "msg-row"]
+  assert.deepEqual(resolveHandle("call-1", ids), { id: "call-1" }, "an exact id wins even when it prefixes another")
+  assert.deepEqual(resolveHandle("call-2", ids), { id: "call-22" })
+  assert.deepEqual(resolveHandle("msg", ["msg-row", "msg"]), { id: "msg" })
+  const ambiguous = resolveHandle("call", ids)
+  assert.match(ambiguous.error, /Ambiguous target "call"; candidates: call-1, call-22/)
+  assert.match(resolveHandle("nope", ids).error, /No matching episode, tool call, or archived row for "nope". Try a query search by content instead\./)
+})
+
+test("address renders the lean copy-paste target and layers fill only what the address omits", () => {
+  assert.equal(address("E57"), "E57")
+  assert.equal(address("E57", 2), "E57 page 2")
+  assert.equal(address("E57", 2, "conversation"), "E57 page 2", "the default layer is never spelled out")
+  assert.equal(address("E57", undefined, "full"), "E57 layer full")
+  assert.equal(address("E57", 2, "tools"), "E57 layer tools page 2")
+  assert.equal(address("call_01HZ2a3bcdef456"), "call_01HZ2a3", "rendered ids are unique 12-character prefixes")
+  const parsed = parseTarget(address("E57", 2, "tools"))
+  assert.deepEqual(parsed, { kind: "episode", handle: "E57", layer: "tools", page: 2 })
+  const opaque = parseTarget(address("call_01HZ2a3bcdef456", 3))
+  assert.deepEqual(resolveHandle(opaque.handle, ["call_01HZ2a3bcdef456"]), { id: "call_01HZ2a3bcdef456" }, "every rendered address resolves back to its original")
+  for (const layer of LAYERS) assert.ok(parseTarget(address("E57", 1, layer)).kind === "episode")
+})
+
+test("formatRow renders the exact tools-layer bytes an opaque row fetch pages through", () => {
+  const row = { id: "row-shell-1", type: "shell", command: "node test", output: { output: "rowneedle " + "x ".repeat(4_000) } }
+  const rendered = formatRow(JSON.stringify(row))
+  assert.ok(rendered.startsWith("[Shell]: node test\nrowneedle "))
+  const hit = search("rowneedle", [{ id: "row-shell-1", text: rendered, layer: "tools" }], 10, "tools")[0]
+  assert.equal(hit.page, 1)
+  assert.equal(paginate(rendered, hit.page).content + paginate(rendered, hit.page + 1).content, rendered, "hit pages join back to the exact fetched bytes")
+  const whole = recallPage(shortId("row-shell-1"), rendered)
+  assert.ok(whole.endsWith(rendered), "a whole-output fetch returns the exact rendered bytes")
+  assert.equal(typeof whole, "string", "text-only rows carry no file parts")
+})
+
+test("archive notes surface only in unfiltered full search", () => {
+  const documents = [
+    { id: "E1", text: "conversation text", layer: "conversation" },
+    { id: "E1#note", note: true, text: "cold archive note with selector keyword" },
+    { id: "call-1", text: "tool output home", layer: "tools" },
+  ]
+  assert.deepEqual(search("selector", documents, 10, "conversation"), [])
+  assert.deepEqual(search("selector", documents, 10, "tools"), [])
+  const [note] = search("selector", documents, 10, "full")
+  assert.equal(note.id, "E1#note")
+  assert.equal(note.note, true)
+  assert.deepEqual(search("conversation", documents, 10, "conversation").map((hit) => hit.id), ["E1"])
+  assert.deepEqual(search("tool output", documents, 10, "tools").map((hit) => hit.id), ["call-1"])
+})
+
+test("formatCall marks a recall original's output as an echo, never its input", () => {
+  const output = "Historical evidence, page 1\n- recall E1 page 1: quoted original evidence"
+  const echoes = []
+  const text = formatCall({ id: "call-r", name: "recall", input: { query: "needlequery" }, result: { type: "text", value: output } }, [], echoes)
+  assert.equal(echoes.length, 1)
+  assert.equal(text.slice(echoes[0][0], echoes[0][1]), output)
+  assert.deepEqual(search("Historical", [{ id: "call-r", text, echoes, layer: "tools" }], 10, "tools").map((hit) => hit.id), [], "a re-presentation never ranks")
+  assert.deepEqual(search("needlequery", [{ id: "call-r", text, echoes, layer: "tools" }], 10, "tools").map((hit) => hit.id), ["call-r"], "the call input stays findable")
+  assert.deepEqual(search("Historical", [{ id: "call-r", text, echoes, layer: "tools" }, { id: "E1", text: "Historical original evidence", layer: "conversation" }], 10, "full").map((hit) => hit.id), ["E1"])
+  const plain = []
+  formatCall({ id: "call-1", name: "read", input: {}, result: { type: "text", value: output } }, [], plain)
+  assert.deepEqual(plain, [], "only recall outputs are echoes")
 })

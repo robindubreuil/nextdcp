@@ -11,6 +11,8 @@ export type WorkingMemory = {
 }
 type Retirement = { readonly constraint: string; readonly messageID: string; readonly quote: string }
 export type Handoff = { readonly archive: string; readonly working: WorkingMemory; readonly retiredConstraints: readonly Retirement[] }
+/** Compact always-on archive pointer: how many episodes, since when, and how to open them. */
+export type Anchor = { readonly count: number; readonly first?: string; readonly last?: string; readonly span?: string }
 type UserRow = { readonly id: string; readonly type: string; readonly text?: unknown }
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const text = (value: unknown): value is string => typeof value === "string" && !!value.trim()
@@ -29,13 +31,25 @@ export function episodeNote(summary: string): { readonly title?: string; readonl
   return match ? { title: match[1], body: summary.slice(match[0].length).replace(/^\r?\n/, "") } : { body: summary }
 }
 
-/** Old archives are evidence, not an instruction stream or a permanent episode directory. */
-export function renderWorking(working: WorkingMemory, through: string, gap = false, title?: string): string {
+/** Old archives are evidence, not an instruction stream or a permanent episode directory.
+ *  The handoff ends with one compact archive anchor: episode count, the covered span at
+ *  adaptive precision, and how to browse or search — the only always-on archive context. */
+export function renderWorking(working: WorkingMemory, through: string, gap = false, title?: string, anchor?: Anchor): string {
   const section = (name: string, items: readonly string[]) => items.length ? `\n\n${name}:\n${items.map((item) => `- ${item}`).join("\n")}` : ""
+  // The latest episode's title is already shown as the boundary; the anchor bounds the other
+  // end without repeating it. With no boundary title, name both endpoints.
+  let range = ""
+  if (anchor?.count) {
+    const { first, last } = anchor
+    if (title) { if (first && first !== title) range = ` since "${first}"` }
+    else if (first && last && first !== last) range = ` "${first}" … "${last}"`
+    else if (first || last) range = ` "${first ?? last}"`
+  }
+  const tail = anchor?.count ? ` — ${anchor.count} episode${anchor.count === 1 ? "" : "s"}${range}${anchor.span ? `, ${anchor.span}` : ""}` : ""
   return `## Current working state\nObjective: ${working.objective}` +
     section("Applicable user constraints", working.constraints) + section("Relevant state and decisions", working.state) +
     section("Unfinished work and next action", working.next) + section("Evidence references", working.references.map((ref) => `${ref.id}: ${ref.why}`)) +
-    `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are available with recall(query); they are not listed here.` +
+    `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are archived${tail}. Browse: recall catalog; search: recall(query).` +
     (gap ? " Some original history was not archived; recall reports these gaps." : "")
 }
 
@@ -61,8 +75,8 @@ export function parseHandoff(raw: string, previous: WorkingMemory | undefined, u
   return { archive: value.archive.trim(), working: { ...value.working, constraints }, retiredConstraints: value.retiredConstraints as Retirement[] }
 }
 
-export function assertMemoryBudget(working: WorkingMemory, through: string, gap: boolean, budget: number, title?: string): string {
-  const rendered = renderWorking(working, through, gap, title)
+export function assertMemoryBudget(working: WorkingMemory, through: string, gap: boolean, budget: number, title?: string, anchor?: Anchor): string {
+  const rendered = renderWorking(working, through, gap, title, anchor)
   const size = tokens(rendered)
   if (size > budget) throw new HandoffError(`Working state exceeds its budget (${size} > ${budget} estimated tokens); active constraints were not truncated`)
   return rendered

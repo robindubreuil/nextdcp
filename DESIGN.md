@@ -38,6 +38,13 @@ Completed work does not earn permanent context space because it shares a topic.
 The archive retains full original rows/tool calls; no topic graph, embeddings,
 background observer, automatic per-turn retrieval, or merge generation is needed.
 
+The rendered handoff ends with one compact **archive anchor** line — the episode
+count, the first and last episode titles, and the covered time span at adaptive
+precision, then `Browse: recall catalog; search: recall(query)`. It is the only
+always-on archive context: a fixed, self-explanatory pointer that says the archive
+exists, roughly when it covers, and how to open it. The full catalog is fetched
+on demand and arrives whole in one call.
+
 The normal working-state ceiling is 2,000 estimated tokens for the complete
 rendered handoff, with a prompt target of about 1,000 or less. The estimate is
 chars/4 — with Han, kana and hangul characters counting as roughly one token
@@ -103,7 +110,7 @@ model to summarize it.
   of stub, keeping the input a valid object with the same keys. The full input
   stays recallable by call id.
 - **Rendering:** a short stub naming the tool, its estimated size, and how to get
-  the original back (`recall {"id":"toolu_…"}`). Re-runnable tools (`read`,
+  the original back (`recall toolu_…`). Re-runnable tools (`read`,
   `grep`, `glob`) also suggest re-running for current content. The adjacent call
   already shows the input, so the output stub omits it; leave an output unmasked
   if its notice would save nothing. The part, id and name are kept, so tool-call
@@ -157,7 +164,10 @@ When a compaction fires (native trigger, or the deferred / hard-budget triggers)
 
 The episode chain is keyed by compaction-row id (each record points to its parent
 checkpoint). Rendering follows the chain from the *current* checkpoint, so reverts
-and undos are handled for free. **Native checkpoint without `nextdcp` metadata**
+and undos are handled for free. Each episode records a `start`/`end` span from its
+rows' `time.created` — one pair per episode, never per turn — used only to render
+time in the catalog and the anchor line. **Native checkpoint without `nextdcp`
+metadata**
 (after a fallback, a fork, or lost storage): adopt its native summary text as one
 episode (`Ek (native)`) and continue the chain from it.
 
@@ -183,28 +193,101 @@ archived tool call can still be retrieved directly by id.
 ### `recall` tool (the only tool and the only prompt surface)
 
 ```
-recall({ id?: string, query?: string, page?: number })
+recall({ query?: string, id?: string, layer?: string, page?: number })
 ```
 
-- `id` is an episode (`E3`) or a tool call id from a stub. It returns the whole
-  original in one call up to 30,000 characters; larger originals show where
-  paging continues.
-- `query` is keyword (BM25) search over complete episode transcripts and the
-  archived originals of elided tool data, before pagination. Every hit carries an
-  id and the page where the matching token starts; a token spanning a page
-  boundary remains searchable. Rendered recall output is marked as an echo and
-  excluded from ranking, so a re-presentation of evidence never competes with the
-  original it quotes. Visible, unmasked content is not indexed because the model
-  can already see it. Immutable episode transcripts and their native attachments
-  are cached in memory (bounded LRU, including inline file-URI sizes).
-- Media stays native: return text plus file content parts on the page containing
-  each attachment label, without JSON/base64 expansion in the readable transcript.
-  Decode inline text attachments so they are searchable. Provider media support
-  and continued availability of URI-only files remain host/model constraints.
-- Archived rows stay complete in compact JSON, but transcript output and its
-  search index render readable user, assistant, tool, shell, synthetic and
-  checkpoint text. Tool output is not clipped; row ids, timestamps, costs,
-  provider metadata, signatures and reasoning are omitted from this rendering.
+Two calls, one grammar. `query` searches the archive; `id` is a **target
+address** — the same lean string the system renders everywhere, so any address
+the model sees is copy-paste runnable:
+
+```
+recall E57                   an episode, conversation layer (default)
+recall E57 layer tools page 2  an episode's tool output, page 2
+recall call_01HZ2a3          one exact tool call
+recall catalog               the episode catalog (newest first)
+```
+
+An address is a handle (`E57`, `call_01HZ2a3`, `catalog`) plus optional
+`layer <conversation|tools|full>` and `page <n>` pairs; `catalog` takes neither.
+The same `layer` and `page` also work as direct parameters — for a query they set
+the search depth and result page, for an id they fill in what the address omits,
+and the address wins where both set one.
+
+#### Layers: the depth within a chapter
+
+An episode is a chapter; `layer` selects the depth to read or search. The default
+is **`conversation` everywhere** — for fetching an episode and for searching — so
+there is exactly one rule to remember. Raise the depth only when the question
+needs it.
+
+| `layer` | `recall {id:"E57", layer}` | `recall {query, layer}` |
+|---|---|---|
+| **conversation** *(default)* | dialogue + tool/shell *commands* as tags (name + input, no output) | search that conversation text |
+| **tools** | full calls + shell output, rendered from the `calls/` originals | search tool/shell output only |
+| **full** | everything interleaved (the raw conversation) | search everything |
+
+`full` is the raw transcript. `conversation` is what was *said and asked*; `tools`
+is what the tools *returned*. That separation is the point: "why did we decide X"
+is a `conversation` question, "what was the exact error" is a `tools` question, and
+a broad probe is `full`. Rendering tool output from the `calls/` original (not the
+row, which may hold a committed stub) closes a latent fidelity gap. Tool tags in
+the conversation layer render the call target as `recall call_01HZ2a3`, so any
+output is one hop away. Hidden reasoning is stored but not rendered in any layer
+yet; it joins the matrix later.
+
+#### The catalog: the only summary surface
+
+`recall catalog` returns the episode list — id, title, time span, and the cold
+archive note — **newest first**, the whole thing in one call up to 30,000
+characters. Episode notes are labels, not content: they live here and nowhere else
+except as labeled `archive note` hits in unfiltered `full` search (the cheap "which
+episode was about X" probe). There is no summary *layer* to reach for a single note
+— triage is the catalog's job.
+
+#### Addresses and IDs
+
+Every rendered target — tool-call tags, search hits, elision notices, page labels —
+reads `recall <address>`. IDs abbreviate to their unique 12-character prefix
+(`call_01HZ2a3` for `call_01HZ2a3b4c5…`), and recall resolves any unambiguous
+prefix git-style: an exact ID wins, a unique prefix resolves, an ambiguous one
+errors listing its candidates. Full IDs keep working, so nothing stored breaks and
+old addresses stay valid.
+
+#### Time: one rule, three surfaces
+
+*A span renders at the unit its own elapsed time justifies; a stamp renders only
+the fields its reference can't already imply; a standalone fetch re-anchors at full
+precision.*
+
+- **Span unit-matching:** elapsed < 1 day → times; ≥ 1 day → days (times dropped);
+  ≥ 1 year → years — plus a compact duration at that scale (`14h 32m`, `32d`,
+  `2y 3mo`).
+- **Stamp cascade:** `14:30` → `11-03 14:30` → `2027-01-02 09:12` — each stamp omits
+  what the surrounding rendering already states; the date-day is atomic. Episode
+  times come from rows' `time.created`, recorded once per episode as `start`/`end`.
+
+The archive anchor line and the catalog use this ladder, so they stay one line and
+one screen at any session length.
+
+#### Search corpus: one home per fact
+
+Every fact is indexed in exactly one place. Conversation documents carry only tool
+tags; each `calls/` original is its own document; each shell row is its own
+document. A query therefore hits *the fact itself*, and hit lines render runnable
+targets (`recall call_01HZ2a3`, `recall E57 page 2`). `layer` filters which homes a
+search covers; archive-note hits surface only in unfiltered `full` search. A recall
+result's own output is marked an echo and excluded from ranking, so a
+re-presentation of evidence never competes with the original it quotes. Immutable
+transcripts and originals are cached in memory (bounded LRU).
+
+#### Content and privacy
+
+Media stays native: return text plus file content parts on the page containing each
+attachment label, without JSON/base64 expansion. Decode inline text attachments so
+they are searchable. Archived rows stay complete in compact JSON, but every
+rendering and its search index show readable user, assistant, tool, shell, synthetic
+and checkpoint text — never row ids, timestamps, costs, provider metadata,
+signatures, or hidden reasoning. Tool output is not clipped.
 
 The tool description is the *entire* protocol the model needs to know. There is
 nothing in the system prompt, no message-ID tags, no nudges, no reminders and no

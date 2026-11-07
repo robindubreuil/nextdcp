@@ -185,11 +185,11 @@ test("request estimates include system, tool definitions, content and native med
   assert.equal(requestTokens({ system: [{ text: "1234" }], tools, messages }), 1 + tokens("readdesc" + JSON.stringify(tools.read.input)) + tokens("recallretrieve" + JSON.stringify(tools.recall.input)) + 2 + 1500 + 2000)
 })
 
-test("stub templates escape identifiers without repeating the tool input", () => {
+test("stub templates render the lean recall target without repeating the tool input", () => {
   const id = 'a"b'
-  assert.equal(outputStub(3_100, id, "write"), '[Output elided to save context: write, ~3.1k tokens. Retrieve with recall {"id":"a\\"b"}]')
-  assert.equal(outputStub(3_100, id, "read"), '[Output elided to save context: read, ~3.1k tokens. Re-run it for current content, or recall {"id":"a\\"b"} for the original]')
-  assert.equal(inputStub("write", 901, id), '[Input elided to save context: write, ~901 tokens. Retrieve with recall {"id":"a\\"b"}]')
+  assert.equal(outputStub(3_100, id, "write"), '[Output elided to save context: write, ~3.1k tokens. Retrieve with recall a"b]')
+  assert.equal(outputStub(3_100, id, "read"), '[Output elided to save context: read, ~3.1k tokens. Re-run it for current content, or recall a"b for the original]')
+  assert.equal(inputStub("write", 901, id), '[Input elided to save context: write, ~901 tokens. Retrieve with recall a"b]')
   const messages = [msg("assistant", call("id", "write", { text: "x".repeat(5_000) })), msg("tool", result("id", "write", "o".repeat(1_000))), tail()]
   assert.ok(planMask(messages, [], options()).masks[0].output, "short notice allows useful output masking even for a large input")
   const short = [msg("assistant", call("id", "read", { path: "x" })), msg("tool", result("id", "read", "tiny")), tail()]

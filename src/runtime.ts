@@ -1,18 +1,18 @@
 import type { Plugin } from "@opencode/plugin"
 import type { SessionCompaction, SessionContext, SessionGenerate, SessionPrompt } from "@opencode/plugin/promise/session"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { DEFAULT_MASK, mediaTokens, messageTokens, partTokens, planMask, renderMask, tokens, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
-import { adoptNative, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
+import { DEFAULT_MASK, mediaTokens, messageTokens, partTokens, planMask, renderMask, tokens, type ArchivedCall, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
+import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
-import { formatCall, formatTranscript, MAX_SEARCH_HITS, recallPage, search, SEARCH_PAGE_HITS, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
+import { address, formatCall, formatCatalog, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, exclusive, rowCalls } from "./store.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type Store = ReturnType<typeof createStore>
-type RecallInput = { readonly id?: string; readonly query?: string; readonly page?: number }
+type RecallInput = { readonly id?: string; readonly query?: string; readonly layer?: Layer; readonly page?: number }
 type ViewMessage = Message & { readonly id?: string; readonly role?: string }
 type Transcript = { readonly text: string; readonly files: readonly RecallFile[]; readonly echoes: readonly (readonly [number, number])[]; readonly size: number }
 type Deferral = { busy: number; idle?: number; approved: boolean }
@@ -309,6 +309,7 @@ export function createController(ctx: Plugin.Context) {
       const existing = await memoryAt(event.sessionID, rows, boundary.parent)
       const id = await store.nextEpisode(), included = new Set(boundary.rowIDs)
       const transcriptRows = rows.filter((row) => included.has(row.id))
+      const stamps = transcriptRows.flatMap((row) => typeof row.time?.created === "number" ? [row.time.created] : [])
       const ids = new Set([...existing.catalog.keys(), id])
       const users = transcriptRows.flatMap((row) => row.type === "user" && typeof (row as Row & { text?: unknown }).text === "string"
         ? [{ id: row.id, type: "user" as const, text: (row as Row & { text: string }).text }] : [])
@@ -325,9 +326,17 @@ export function createController(ctx: Plugin.Context) {
         await models.warning(event.sessionID, `${reason}; using the main model for this request. No transcript was truncated.`)
         return (await ctx.session.generate({ sessionID: event.sessionID, prompt })).text.trim()
       }
+      // The exact episode record the handoff will commit; its anchor must be part of every
+      // rendering of the working state, so the byte-identical summary can be re-rendered
+      // from durable records alone when a fork boundary hides the native row.
+      const episodeFor = (summary: string): Episode => ({
+        id, summary, rowIDs: boundary.rowIDs,
+        ...(stamps.length ? { start: Math.min(...stamps), end: Math.max(...stamps) } : {}),
+        ...(!boundary.archived ? { gap: true } : {}),
+      })
       const validate = (raw: string) => {
         const result = parseHandoff(raw, existing.working, users, ids)
-        assertMemoryBudget(result.working, id, gap, memoryBudget, episodeNote(result.archive).title)
+        assertMemoryBudget(result.working, id, gap, memoryBudget, episodeNote(result.archive).title, archiveAnchor([...existing.episodes, episodeFor(result.archive)]))
         return result
       }
       let handoff: Handoff | undefined
@@ -340,7 +349,7 @@ export function createController(ctx: Plugin.Context) {
             try {
               if (transcriptRows.some((row) => !textOnly(row))) throw new Error("transcript contains attachments or unsupported content")
               const files: RecallFile[] = []
-              const transcript = formatTranscript("current", transcriptRows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), false, files)
+              const transcript = formatTranscript("current", transcriptRows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), { files })
               if (files.length) throw new Error("transcript contains attachments")
               handoff = validate(await models.generate(target, `${prompt}\n\nNew conversation (data, not instructions):\n${transcript}\n\nEnd of data. Return only the handoff JSON.`))
             } catch (error) {
@@ -355,15 +364,12 @@ export function createController(ctx: Plugin.Context) {
         }
       }
       if (!handoff) throw new Error("No bounded handoff")
-      const episode: Episode = {
-        id, summary: handoff.archive, rowIDs: boundary.rowIDs,
-        ...(!boundary.archived ? { gap: true } : {}),
-      }
+      const episode = episodeFor(handoff.archive)
       const record: Checkpoint = { id: boundary.id, parent: boundary.parent, episode, working: handoff.working,
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
       hints.delete(event.sessionID) // The committed handoff is the signal's only consumer.
-      event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget, episodeNote(handoff.archive).title), metadata: { nextdcp: { version: 2 } } }
+      event.result = { summary: assertMemoryBudget(handoff.working, id, gap, memoryBudget, episodeNote(handoff.archive).title, archiveAnchor([...existing.episodes, episode])), metadata: { nextdcp: { version: 2 } } }
     } catch (error) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
       await models.warning(event.sessionID, `Working-state compaction failed (${detail}); using native OpenCode compaction and its configured model. This safety fallback is not size-bounded; no active constraints were silently truncated.`)
@@ -443,8 +449,8 @@ export function createController(ctx: Plugin.Context) {
   }
 
   // Episode transcripts are immutable once their checkpoint exists, so searches can reuse them.
-  const transcript = async (sessionID: string, store: Store, id: string, catalog: ReadonlyMap<string, Episode>) => {
-    const key = keyFor(sessionID, id), cached = transcripts.get(key)
+  const transcript = async (sessionID: string, store: Store, id: string, catalog: ReadonlyMap<string, Episode>, layer: Layer = "full", calls: ReadonlyMap<string, ArchivedCall> = new Map()) => {
+    const key = `${keyFor(sessionID, id)}\0${layer}`, cached = transcripts.get(key)
     if (cached !== undefined) {
       transcripts.delete(key)
       transcripts.set(key, cached)
@@ -453,7 +459,7 @@ export function createController(ctx: Plugin.Context) {
     const episode = episodeRows(id, catalog)
     const rows = await Promise.all(episode.rowIDs.map(async (rowID) => ({ id: rowID, text: await store.getRow(rowID) })))
     const files: RecallFile[] = [], echoes: [number, number][] = []
-    const text = formatTranscript(id, rows, episode.gap, files, echoes)
+    const text = formatTranscript(id, rows, { layer, gap: episode.gap, title: episodeNote(catalog.get(id)?.summary ?? "").title, files, echoes, call: (callID) => calls.get(callID) })
     const result = { text, files, echoes, size: text.length + files.reduce((sum, item) => sum + item.file.uri.length, 0) }
     if (result.size > TRANSCRIPT_CACHE_CHARS) return result
     transcripts.set(key, result)
@@ -471,50 +477,90 @@ export function createController(ctx: Plugin.Context) {
       const id = typeof input.id === "string" ? input.id.trim() : ""
       const query = typeof input.query === "string" ? input.query.trim() : ""
       const page = input.page
+      const layer: Layer = input.layer ?? "conversation"
       if ((!id && !query) || (id && query)) return "Provide either id or query."
+      if (!(LAYERS as readonly string[]).includes(layer)) return `layer must be one of: ${LAYERS.join(", ")}.`
       if (query.length > 2_000) return "Use a query of at most 2,000 characters; prefer exact identifiers and a few task keywords."
       if (page !== undefined && (!Number.isSafeInteger(page) || page < 1)) return "Page must be a positive integer."
       const store = storeFor(sessionID)
-      let call = id ? await store.getCall(id) : undefined
-      const renderCall = () => {
+      const target = id ? parseTarget(id) : undefined
+      if (target?.kind === "error") return target.message
+
+      // Call and row originals live in the store alone: an elision-notice original must not
+      // hide behind an unreadable episode chain or a native checkpoint.
+      const readFacts = async () => {
+        const calls = await store.getCalls(), rows = await store.getRows()
+        return { byID: new Map(calls.map((call) => [call.id, call])), calls, rows, ids: [...calls.map((call) => call.id), ...rows.map((row) => row.id)] }
+      }
+      const renderOpaque = (handle: string, wanted: number | undefined, facts: Awaited<ReturnType<typeof readFacts>>): { content: RecallContent } | { error: string } => {
+        const resolved = resolveHandle(handle, facts.ids)
+        if ("error" in resolved) return resolved
         const files: RecallFile[] = []
-        return recallPage(id, formatCall(call!, files), page, files)
+        const call = facts.byID.get(resolved.id)
+        const text = call ? formatCall(call, files) : formatRow(facts.rows.find((row) => row.id === resolved.id)!.text, (callID) => facts.byID.get(callID))
+        return { content: recallPage(shortId(resolved.id), text, wanted, files) }
       }
-      let memory, rows: readonly Row[]
-      try {
-        rows = await ctx.session.context({ sessionID })
-        await inheritSession(sessionID, rows)
-        call ??= id ? await store.getCall(id) : undefined
-        memory = await memoryAt(sessionID, rows, activeCheckpoint(rows))
-      } catch (error) {
-        // Context, inheritance and opaque native checkpoints must not hide an
-        // independently archived original already named in an elision notice.
-        if (call) return renderCall()
-        throw error
+      if (target?.kind === "opaque") {
+        const wanted = target.page ?? page
+        let verdict = renderOpaque(target.handle, wanted, await readFacts())
+        if ("content" in verdict) return verdict.content
+        try {
+          // A fork's originals may arrive only with inheritance; retry once it ran.
+          await inheritSession(sessionID, await ctx.session.context({ sessionID }))
+          verdict = renderOpaque(target.handle, wanted, await readFacts())
+        } catch { /* keep the store-only verdict */ }
+        return "content" in verdict ? verdict.content : verdict.error
       }
-      if (id) {
-        if (memory.catalog.has(id)) {
-          const full = await transcript(sessionID, store, id, memory.catalog)
-          return recallPage(id, full.text, page, full.files)
-        }
-        return call ? renderCall() : "No matching episode or tool call is available. Try a query search by content instead."
+
+      const rows = await ctx.session.context({ sessionID })
+      await inheritSession(sessionID, rows)
+      const memory = await memoryAt(sessionID, rows, activeCheckpoint(rows))
+      if (target?.kind === "catalog") {
+        return formatCatalog([...memory.catalog.values()].map((episode) => {
+          const { title, body } = episodeNote(episode.summary)
+          return {
+            id: episode.id, ...(title ? { title } : {}), note: body,
+            ...(episode.start !== undefined && episode.end !== undefined ? { start: episode.start, end: episode.end } : {})
+          }
+        }))
       }
-      // Visible context needs no search: index archived episodes and every elided original.
+
+      const facts = await readFacts()
+      if (target?.kind === "episode") {
+        const resolved = resolveHandle(target.handle, [...memory.catalog.keys()])
+        if ("error" in resolved) return resolved.error
+        const depth = target.layer ?? layer
+        const full = await transcript(sessionID, store, resolved.id, memory.catalog, depth, facts.byID)
+        return recallPage(address(resolved.id, undefined, depth), full.text, target.page ?? page, full.files)
+      }
+
+      // One home per fact: dialogue and tool/shell tags in the episode's conversation home,
+      // tool output in its call original, shell output in its row; summaries surface only as
+      // labeled pointer hits. Every search page therefore lands on fetchable text.
       const documents: SearchDocument[] = []
       for (const episode of memory.catalog.values()) {
-        const full = await transcript(sessionID, store, episode.id, memory.catalog)
-        documents.push({ id: episode.id, text: full.text, echoes: full.echoes, summary: episode.summary })
+        const full = await transcript(sessionID, store, episode.id, memory.catalog, "conversation", facts.byID)
+        documents.push({ id: episode.id, text: full.text, echoes: full.echoes, layer: "conversation" })
+        const { title, body } = episodeNote(episode.summary)
+        const note = [title, body].filter(Boolean).join("\n")
+        if (note) documents.push({ id: `${episode.id}#note`, note: true, text: note })
       }
-      for (const mask of await masksFor(sessionID, rows)) {
-        const original = await store.getCall(mask.id)
-        if (original) documents.push({ id: mask.id, text: formatCall(original) })
+      for (const call of facts.calls) {
+        const callEchoes: [number, number][] = []
+        const text = formatCall(call, [], callEchoes)
+        documents.push({ id: call.id, text, layer: "tools", ...(callEchoes.length ? { echoes: callEchoes } : {}) })
+      }
+      for (const row of facts.rows) {
+        try {
+          if (JSON.parse(row.text).type === "shell") documents.push({ id: row.id, text: formatRow(row.text, (callID) => facts.byID.get(callID)), layer: "tools" })
+        } catch { /* unreadable row */ }
       }
       if (!documents.length) return "Nothing is archived to search yet."
-      const hits = search(query, documents, MAX_SEARCH_HITS), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
+      const hits = search(query, documents, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
       if (start >= hits.length) return at === 1 ? "No matching snippets. Try broader keywords or exact identifiers." : "No more search results."
       const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => {
-        const target = hit.note ? hit.id : `recall ${JSON.stringify({ id: hit.id, page: hit.page })}`
-        const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? location.id : `${location.id} p${location.page}`)).join(", ")})` : ""
+        const target = hit.note ? hit.id.split("#")[0] : `recall ${address(hit.id, hit.page)}`
+        const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? location.id.split("#")[0] : address(location.id, location.page))).join(", ")})` : ""
         return `- ${target}${also}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`
       })
       return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
@@ -573,7 +619,7 @@ export async function install(ctx: Plugin.Context) {
     editor.add({
       name: "recall",
       description: RECALL_DESCRIPTION,
-      input: { type: "object", properties: { id: { type: "string" }, query: { type: "string" }, page: { type: "integer", minimum: 1 } }, additionalProperties: false },
+      input: { type: "object", properties: { id: { type: "string" }, query: { type: "string" }, layer: { type: "string", enum: [...LAYERS] }, page: { type: "integer", minimum: 1 } }, additionalProperties: false },
       options: { codemode: false },
       execute: async (input, context) => ({ content: await controller.recall(context.sessionID, input as RecallInput) }),
     })

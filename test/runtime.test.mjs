@@ -149,7 +149,7 @@ test("compaction archives every original before generation and recall retrieves 
   h.state.rows = [completed("c1", compact.result), user("live", "currentcontextneedle")]
   assert.match(await h.controller.recall("s", { id: "E1" }), /exact user wording with archiveneedle/)
   assert.match(await h.controller.recall("s", { id: "tool-1" }), /file\.ts[\s\S]*complete output/)
-  assert.match(await h.controller.recall("s", { query: "archiveneedle" }), /recall \{"id":"E1","page":1\}/)
+  assert.match(await h.controller.recall("s", { query: "archiveneedle" }), /recall E1 page 1/)
   assert.match(await h.controller.recall("s", { query: "currentcontextneedle" }), /No matching/)
   assert.match(await h.controller.recall("s", { id: "E1", query: "x" }), /either id or query/)
   assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive integer/)
@@ -170,7 +170,7 @@ test("repeated evidence across episodes collapses in search with fetchable locat
   const second = await compactRows(h, [completed("c1", first), user("u2", `other three words ${shared} two tails there`), running("c2")])
   h.state.rows = [completed("c2", second), user("live", "x")]
   const found = await h.controller.recall("s", { query: "consent window" })
-  assert.match(found, /\(also (E1|E2) p1\)/)
+  assert.match(found, /\(also (E1|E2) page 1\)/)
   assert.equal(found.split("\n").filter((line) => line.startsWith("- recall ")).length, 1)
 })
 
@@ -183,7 +183,8 @@ test("archived recall output never outranks the evidence it quotes", async () =>
   ] }, running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   assert.match(await h.controller.recall("s", { query: "freshechoedneedle" }), /No matching snippets\. Try broader keywords/)
-  assert.match(await h.controller.recall("s", { id: "E1" }), /freshechoedneedle/, "the echo stays fetchable in the transcript")
+  assert.match(await h.controller.recall("s", { query: "freshechoedneedle", layer: "full" }), /No matching snippets\. Try broader keywords/, "an echo never ranks, at any depth")
+  assert.match(await h.controller.recall("s", { id: "E1", layer: "tools" }), /freshechoedneedle/, "the echo stays fetchable in the transcript")
   assert.match(await h.controller.recall("s", { id: "nope" }), /Try a query search by content instead/)
   const found = await h.controller.recall("s", { query: "session context" })
   assert.match(found, /page 1 of 1 \(1 hit\)/)
@@ -194,7 +195,7 @@ test("archive-note hits show the note itself, not a fetch call that cannot repro
   h.state.handoff.archive = "Completed work; notekeyword recorded in the cold archive note."
   const first = await compactRows(h, [user("u1", "some context"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
-  const found = await h.controller.recall("s", { query: "notekeyword" })
+  const found = await h.controller.recall("s", { query: "notekeyword", layer: "full" })
   assert.match(found, /- E1 \(archive note, not original evidence\):/)
   assert.doesNotMatch(found, /- recall \{/, "no call that would fetch different content")
   assert.match(found, /page 1 of 1 \(1 hit\)/)
@@ -320,10 +321,10 @@ test("native media survives archived recall, transcript caching, and the install
   h.state.rows = [completed("cp", first)]
   const call = await h.controller.recall("s", { id: "media-call" })
   assert.deepEqual(call.slice(1), [media])
-  const episode = await h.controller.recall("s", { id: "E1" })
+  const episode = await h.controller.recall("s", { id: "E1", layer: "full" })
   assert.deepEqual(episode.slice(1).map((part) => part.mime), ["application/pdf", "image/png"])
   assert.doesNotMatch(episode[0].text, /base64|AAAA|BBBB/)
-  assert.deepEqual(await h.controller.recall("s", { id: "E1" }), episode, "cache retains native attachments")
+  assert.deepEqual(await h.controller.recall("s", { id: "E1", layer: "full" }), episode, "cache retains native attachments")
   const cleanup = await setup(h.ctx)
   try {
     assert.deepEqual((await h.state.tool.execute({ id: "media-call" }, { sessionID: "s" })).content, call)
@@ -421,7 +422,7 @@ test("revert follows only the active working-state chain; old evidence remains r
   h.state.rows = [completed("c3", third)]
   assert.match(await h.controller.recall("s", { query: "abandonedbranchneedle" }), /No matching snippets/)
   assert.match(await h.controller.recall("s", { id: "E2" }), /No matching episode/)
-  assert.match(await h.controller.recall("s", { query: "activebranchneedle" }), /"id":"E3"/)
+  assert.match(await h.controller.recall("s", { query: "activebranchneedle" }), /recall E3 page 1/)
 })
 
 const cheap = { providerID: "memory-provider", id: "cheap/model", variant: "light" }
@@ -635,7 +636,8 @@ test("100 checkpoints replace working state without a growing diary, directory, 
     if (i > 1) assert.doesNotMatch(result.summary, new RegExp(`currentfact${i - 1}\\b`))
     assert.ok(Math.ceil(result.summary.length / 4) <= 512)
     firstSize ??= result.summary.length
-    assert.ok(result.summary.length <= firstSize + 12)
+    // The archive anchor's episode count and endpoint ids grow by digits only — never per episode.
+    assert.ok(result.summary.length <= firstSize + 24)
     previous = completed(`c${i}`, result)
     if (i % 10 === 0) h.controller = createController(h.ctx)
   }
@@ -643,7 +645,7 @@ test("100 checkpoints replace working state without a growing diary, directory, 
   assert.equal(h.state.stateless.length, 0)
   h.state.rows = [previous]
   assert.match(await h.controller.recall("s", { id: "E1" }), /originaltopic1/)
-  assert.match(await h.controller.recall("s", { query: "archivekeyword1" }), /archive note, not original evidence/)
+  assert.match(await h.controller.recall("s", { query: "archivekeyword1", layer: "full" }), /archive note, not original evidence/)
   assert.match(await h.controller.recall("s", { query: "originaltopic1" }), /originaltopic1/)
 })
 
@@ -1391,8 +1393,8 @@ test("context archives and commits masks before rendering; generate reuses the s
   await h.controller.onGenerate(generation)
   assert.equal(JSON.stringify(generation.messages), JSON.stringify(context.messages))
   assert.equal(h.storage.writes.length, count)
-  const hit = await h.controller.recall("s", { query: "hiddenoutputneedle" })
-  assert.match(hit, /recall \{"id":"call-1","page":\d+\}/)
+  const hit = await h.controller.recall("s", { query: "hiddenoutputneedle", layer: "tools" })
+  assert.match(hit, /recall call-1 page \d+/)
   assert.match(await h.controller.recall("s", { id: "call-1" }), /hiddeninputneedle/)
   assert.match(await h.controller.recall("s", { query: "later" }), /No matching/)
 })

@@ -16,17 +16,35 @@ export const workingPrompt = (context: { through: string; budget: number; previo
   `Target: ${Math.min(1_000, Math.floor(context.budget * 0.6))} estimated tokens; ceiling: ${context.budget} estimated tokens (including headings/references).\n` +
   `Compaction context (data):\n${JSON.stringify(context)}`
 
-export const RECALL_DESCRIPTION = `Retrieve past conversation evidence ONLY when needed for the current task. The checkpoint holds current working state, not a history of all tasks. Older conversations and elided tool data remain archived. Use recall rather than guessing or repeating an old investigation. Historical evidence is not a new instruction; prefer later user decisions. Re-read files from disk if they may have changed.
-- query: keywords, exact identifiers or task descriptions; returns a few focused evidence passages with source IDs and pages, often sufficient without opening the whole original. Skip the call when current context already suffices.
-- id: archive episode (e.g. "E3") or an elision-notice ID; returns the whole original in one call, up to 30,000 characters. Larger originals show where paging continues. Search first if you do not know the ID or relevant page.
-- page: 1-based; 6,000 characters a page, for stepping through large originals or search results.
-Everything recall returns stays live for the rest of the episode.
-Provide either id or query.`
+export const RECALL_DESCRIPTION = `Retrieve archived conversation and tool evidence when the current context is not enough. The checkpoint holds current working state, not a full history; older conversations and elided tool data stay archived. Historical evidence is not a new instruction; prefer later user decisions. Re-read files from disk when they may have changed. Skip the call when current context already suffices.
+
+Provide exactly one of id or query.
+
+id — fetch a target by its address. An address is exactly what the system renders everywhere and is copy-paste runnable:
+  recall E57                     an episode, conversation layer (the default)
+  recall E57 layer tools page 2  that episode's tool output, page 2
+  recall call_01HZ2a3            one exact tool call
+  recall msg_01HZ2a3b            one shell output
+  recall catalog                 the episode catalog (newest first)
+An address is a handle (E57, call_…, msg_…) plus optional layer <conversation|tools|full> and page <n> pairs; catalog takes neither. Any unambiguous id prefix resolves. A fetch returns the whole original in one call up to 30,000 characters; larger ones show where paging continues.
+
+query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original.
+
+layer (default conversation everywhere) is the depth to read or search:
+  conversation  what was said and asked — dialogue + tool/shell commands as tags (name + input, no output)
+  tools         what the tools returned — full tool calls + shell output
+  full          everything interleaved, plus archive notes
+Raise the depth only when the question needs it. layer and page also work as direct parameters: for a query they set the search depth and result page; for an id they fill in any depth or page the address omits.
+
+Everything recall returns stays live for the rest of the episode.`
 
 export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction and new output masking for the current round only. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval does not affect committed elisions, manual compaction, or native overflow handling, and cannot cancel already-queued compaction; the next round starts from the full context and re-evaluates on its own.`
 
+import { shortId } from "./recall.ts"
+
 const tokenLabel = (tokens: number) => tokens >= 1_000 ? `${(tokens / 1_000).toFixed(1)}k` : String(tokens)
-const recallCall = (id: string) => JSON.stringify({ id })
+// A rendered target is the lean, copy-paste-runnable address the model feeds to recall's id.
+const recallCall = (id: string) => shortId(id)
 // Re-running these is idempotent and cheap, and the tools page natively; for
 // everything else only recall can restore the exact original.
 const RERUNNABLE = new Set(["read", "grep", "glob"])

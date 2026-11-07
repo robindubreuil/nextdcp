@@ -1,7 +1,19 @@
 import type { ArchivedCall } from "./mask.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
+import { formatSpan } from "./time.ts"
 
-export type SearchDocument = { readonly id: string; readonly text: string; readonly summary?: string; readonly echoes?: readonly (readonly [number, number])[] }
+/** The depth within a chapter (episode) to read or search. `conversation` is the default everywhere. */
+export type Layer = "conversation" | "tools" | "full"
+export const LAYERS: readonly Layer[] = ["conversation", "tools", "full"]
+export type SearchDocument = {
+  readonly id: string
+  readonly text: string
+  /** The fact's home; selects which layer a search covers. Notes carry no home. */
+  readonly layer?: "conversation" | "tools"
+  /** An archive-note doc (a label, not content): a pointer hit surfaced only in unfiltered search. */
+  readonly note?: boolean
+  readonly echoes?: readonly (readonly [number, number])[]
+}
 type Location = { readonly id: string; readonly page: number }
 export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly also?: readonly Location[] }
 export const RECALL_PAGE_CHARS = 6_000
@@ -9,6 +21,7 @@ export const RECALL_PAGE_CHARS = 6_000
 export const RECALL_ALL_CHARS = 5 * RECALL_PAGE_CHARS
 export const SEARCH_PAGE_HITS = 4
 export const MAX_SEARCH_HITS = 40
+export const SHORT_ID_CHARS = 12
 export type RecallFile = { readonly offset: number; readonly file: { readonly type: "file"; readonly uri: string; readonly mime: string; readonly name?: string } }
 export type RecallContent = NonNullable<Result["content"]>
 type Fragment = { readonly text: string; readonly files?: readonly RecallFile[]; readonly echoes?: readonly (readonly [number, number])[] }
@@ -40,16 +53,18 @@ function snippet(text: string, index: number): string {
   return `${start ? "…" : ""}${text.slice(start, end).replace(/\s+/gu, " ").trim()}${end < text.length ? "…" : ""}`
 }
 
-/** Rank small passages, not whole histories. Prefer a cluster covering the query over its first word. */
-export function search(query: string, documents: readonly SearchDocument[], limit = 10): SearchHit[] {
+/** Rank small passages, not whole histories. Prefer a cluster covering the query over its first word.
+ *  `layer` selects which fact homes a search covers; `full` (default) covers every home plus notes. */
+export function search(query: string, documents: readonly SearchDocument[], limit = 10, layer: Layer = "full"): SearchHit[] {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Search limit must be a positive integer")
   const terms = [...new Set(words(query).map((word) => word.text))]
-  if (!terms.length || !documents.length) return []
+  const homes = documents.filter((document) => layer === "full" ? true : document.layer === layer && !document.note)
+  if (!terms.length || !homes.length) return []
   const termSet = new Set(terms)
-  const corpus = documents.flatMap((document) => {
+  const corpus = homes.flatMap((document) => {
     const bounds = pageBounds(document.text, RECALL_PAGE_CHARS)
     const pages = bounds.slice(1).map((_, index) => ({ id: document.id, page: index + 1, text: document.text,
-      parsed: [] as Word[], counts: new Map<string, number>(), note: false }))
+      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note }))
     let page = 0
     const echoes = document.echoes ?? []
     let echo = 0
@@ -61,7 +76,6 @@ export function search(query: string, documents: readonly SearchDocument[], limi
       if (echo < echoes.length && word.index >= echoes[echo][0]) continue
       pages[page].parsed.push(word)
     }
-    if (document.summary) pages.push({ id: document.id, page: 1, text: document.summary, parsed: words(document.summary), counts: new Map(), note: true })
     for (const item of pages) for (const word of item.parsed) if (termSet.has(word.text)) item.counts.set(word.text, (item.counts.get(word.text) ?? 0) + 1)
     return pages
   })
@@ -162,16 +176,23 @@ function render(parts: readonly Fragment[], separator: string, files: RecallFile
   return chunks.join(separator)
 }
 
-export function formatCall(call: ArchivedCall, files: RecallFile[] = []): string {
-  const outputFiles: RecallFile[] = []
-  let output: string
-  if (call.result.type === "text" && typeof call.result.value === "string") output = call.result.value
-  else if (call.result.type === "content") output = toolContent(call.result.value, outputFiles)
-  else if (call.result.type === "error" && object(call.result.value) && Array.isArray(call.result.value.content)) {
+function callOutput(call: ArchivedCall, files: RecallFile[]): string {
+  if (call.result.type === "text" && typeof call.result.value === "string") return call.result.value
+  if (call.result.type === "content") return toolContent(call.result.value, files)
+  if (call.result.type === "error" && object(call.result.value) && Array.isArray(call.result.value.content)) {
     const contentFiles: RecallFile[] = []
-    output = render([{ text: pretty(call.result.value.error) }, { text: toolContent(call.result.value.content, contentFiles), files: contentFiles }], "\n", outputFiles)
-  } else output = pretty(call.result.value)
-  return render([{ text: `Tool call ${call.id}\nTool: ${call.name}\nInput:\n${pretty(call.input)}\nOutput:\n` }, { text: output, files: outputFiles }], "", files)
+    return render([{ text: pretty(call.result.value.error) }, { text: toolContent(call.result.value.content, contentFiles), files: contentFiles }], "\n", files)
+  }
+  return pretty(call.result.value)
+}
+
+export function formatCall(call: ArchivedCall, files: RecallFile[] = [], echoes: [number, number][] = []): string {
+  const outputFiles: RecallFile[] = []
+  const output = callOutput(call, outputFiles)
+  // A recall output re-presents evidence archived elsewhere: marked as echo so search never
+  // ranks it against the original it quotes, while pages stay byte-aligned with the fetch.
+  const mark = call.name === "recall" && output ? { echoes: [[0, output.length]] as [number, number][] } : {}
+  return render([{ text: `Tool call ${call.id}\nTool: ${call.name}\nInput:\n${pretty(call.input)}\nOutput:\n` }, { text: output, files: outputFiles, ...mark }], "", files, echoes)
 }
 
 function attachment(value: unknown, files: RecallFile[]): string {
@@ -198,65 +219,176 @@ function toolContent(value: unknown, files: RecallFile[]): string {
   }), "\n", files)
 }
 
-/** Render the useful contents of a stored row, without transport or provider metadata. */
-function transcriptRow(row: unknown, files: RecallFile[], echoes: [number, number][] = []): string {
+type Resolve = (id: string) => ArchivedCall | undefined
+
+/** Render one tool call inline as a fragment. The output is sourced from the stored `calls/`
+ *  original when a resolver is supplied (the authoritative first original), else from row state. */
+function toolPart(part: Record<string, unknown>, layer: Layer, resolve: Resolve | undefined): Fragment {
+  const state = object(part.state) ? part.state : {}
+  const id = text(part.id), name = text(part.name)
+  const input = JSON.stringify(state.input) ?? "null"
+  // In the conversation layer a call is only a runnable tag: its output is one hop away, never inline.
+  if (layer === "conversation") return { text: `[Tool ${name} ${input} → recall ${shortId(id)}]` }
+  const outputFiles: RecallFile[] = []
+  const original = resolve?.(id)
+  let body: string
+  if (original) body = callOutput(original, outputFiles)
+  else {
+    const error = state.status === "error" ? object(state.error) ? text(state.error.message) : text(state.error) : ""
+    const output = ["completed", "error"].includes(text(state.status)) ? toolContent(state.content, outputFiles) : ""
+    body = render([{ text: error }, { text: output }], "\n", outputFiles)
+  }
+  const files: RecallFile[] = []
+  const tool = render([{ text: `[Tool ${name} ${input}]:` }, { text: body, files: outputFiles }], "\n", files)
+  // A recall rendering is a re-presentation of evidence archived elsewhere: marked as echo so
+  // search never ranks it against the original it quotes.
+  return { text: tool, files, ...(name === "recall" ? { echoes: [[0, tool.length]] as [number, number][] } : {}) }
+}
+
+/** Render the useful contents of a stored row at a given layer, without transport or provider metadata. */
+function transcriptRow(row: unknown, layer: Layer, resolve: Resolve | undefined, files: RecallFile[], echoes: [number, number][] = []): string {
   if (!object(row) || typeof row.type !== "string") throw new Error("Invalid archived row")
+  const dialogue = layer !== "tools"
   if (row.type === "user") {
+    if (!dialogue) return ""
     const skills = Array.isArray(row.skills) ? row.skills.flatMap((skill) => object(skill) && text(skill.text)
       ? [`[Skill activated: ${text(skill.name)}]\n${text(skill.text)}`] : []) : []
     const attachments = Array.isArray(row.files) ? row.files.map((file): Fragment => {
       const local: RecallFile[] = []
       return { text: attachment(file, local), files: local }
     }) : []
-    return render([...skills, `[User]: ${text(row.text)}`].map((text) => ({ text })).concat(attachments), "\n", files)
+    return render([...skills, `[User]: ${text(row.text)}`].map((value) => ({ text: value })).concat(attachments), "\n", files)
   }
   if (row.type === "assistant") {
     if (!Array.isArray(row.content)) return ""
     return render(row.content.flatMap((part): Fragment[] => {
       if (!object(part)) return []
-      if (part.type === "text") return [{ text: `[Assistant]: ${text(part.text)}` }]
+      if (part.type === "text") return dialogue ? [{ text: `[Assistant]: ${text(part.text)}` }] : []
       if (part.type !== "tool" || !object(part.state)) return []
-      const state = part.state
-      const input = JSON.stringify(state.input) ?? "null"
-      const label = `[Tool ${text(part.name)} ${input}]:`
-      const local: RecallFile[] = [], outputFiles: RecallFile[] = []
-      const error = state.status === "error" ? object(state.error) ? text(state.error.message) : text(state.error) : ""
-      const output = ["completed", "error"].includes(text(state.status)) ? toolContent(state.content, outputFiles) : ""
-      const tool = render([{ text: label }, { text: error }, { text: output, files: outputFiles }], "\n", local)
-      // A recall rendering is a re-presentation of evidence archived elsewhere: marked as echo
-      // so search never ranks it against the original it quotes.
-      return [{ text: tool, files: local, ...(text(part.name) === "recall" ? { echoes: [[0, tool.length]] } : {}) }]
+      return [toolPart(part, layer, resolve)]
     }), "\n", files, echoes)
   }
   if (row.type === "shell") {
     const output = object(row.output) ? text(row.output.output) : ""
+    if (layer === "conversation") return `[Shell ${text(row.command)} → recall ${shortId(text(row.id))}]`
     return `[Shell]: ${text(row.command)}\n${output}`
   }
-  if (row.type === "synthetic") return `[Synthetic]: ${text(row.text)}`
-  if (row.type === "skill") return `[Skill activated: ${text(row.name)}]\n${text(row.text)}`
-  if (row.type === "system") return `[System]: ${text(row.text)}`
-  if (row.type === "location-switched" && object(row.location)) return `[User]: The working directory has been changed to ${text(row.location.directory)}.`
-  if (row.type === "compaction") return `[Checkpoint]: ${text(row.summary)}`
+  if (row.type === "synthetic") return dialogue ? `[Synthetic]: ${text(row.text)}` : ""
+  if (row.type === "skill") return dialogue ? `[Skill activated: ${text(row.name)}]\n${text(row.text)}` : ""
+  if (row.type === "system") return dialogue ? `[System]: ${text(row.text)}` : ""
+  if (row.type === "location-switched" && object(row.location)) return dialogue ? `[User]: The working directory has been changed to ${text(row.location.directory)}.` : ""
+  if (row.type === "compaction") return dialogue ? `[Checkpoint]: ${text(row.summary)}` : ""
   return ""
 }
 
-export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], gap = false, files: RecallFile[] = [], echoes: [number, number][] = []): string {
-  const parts: Fragment[] = [{ text: `Episode ${id}: raw transcript` }]
+export type TranscriptOptions = {
+  readonly layer?: Layer
+  readonly gap?: boolean
+  readonly title?: string
+  readonly files?: RecallFile[]
+  readonly echoes?: [number, number][]
+  readonly call?: Resolve
+}
+
+/** Render a stored episode. `options` is the documented shape; the legacy positional form
+ *  `(id, rows, gap, files, echoes)` is accepted for internal callers and older tests. */
+export function formatTranscript(id: string, rows: readonly { readonly id: string; readonly text?: string }[], options: TranscriptOptions | boolean = {}, legacyFiles?: RecallFile[], legacyEchoes?: [number, number][]): string {
+  const opts: TranscriptOptions = typeof options === "boolean" ? { gap: options, files: legacyFiles, echoes: legacyEchoes } : options
+  const { layer = "full", gap = false, title, files = [], echoes = [], call } = opts
+  const head = `Episode ${id}${title ? ` — ${title}` : ""}`
+  const parts: Fragment[] = [{ text: layer === "tools" ? `${head} — tool output` : layer === "conversation" ? `${head} — conversation` : `${head}: raw transcript` }]
   if (gap) parts.push({ text: "Recall gap: some raw history was not archived." })
   for (const row of rows) {
     if (row.text === undefined) { parts.push({ text: "[Unavailable archived row; recall gap]" }); continue }
     try {
       const local: RecallFile[] = [], rowEchoes: [number, number][] = []
-      parts.push({ text: transcriptRow(JSON.parse(row.text), local, rowEchoes), files: local, echoes: rowEchoes })
+      parts.push({ text: transcriptRow(JSON.parse(row.text), layer, call, local, rowEchoes), files: local, echoes: rowEchoes })
     } catch { parts.push({ text: "[Invalid archived row; recall gap]" }) }
   }
   return render(parts, "\n\n", files, echoes)
 }
 
+/** Render one stored row (its raw JSON) as a standalone tools-layer document:
+    the exact text an opaque `recall msg_…` fetch returns, so search pages align. */
+export function formatRow(raw: string, resolve?: Resolve): string {
+  return transcriptRow(JSON.parse(raw), "tools", resolve, [], [])
+}
+
+export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }
+
+/** The sole summary surface: episode labels newest-first (numeric ID), whole in one call up
+    to RECALL_ALL_CHARS — the oldest labels drop rather than page. */
+export function formatCatalog(entries: readonly CatalogEntry[]): string {
+  const ordered = [...entries].sort((a, b) => Number(b.id.slice(1)) - Number(a.id.slice(1)) || (a.id < b.id ? -1 : 1))
+  const parts: Fragment[] = [{ text: "Archive catalog (newest first)" }]
+  let used = 0
+  for (const entry of ordered) {
+    const span = entry.start !== undefined && entry.end !== undefined ? ` (${formatSpan(entry.start, entry.end)})` : ""
+    const line = `${entry.id}${entry.title ? ` — ${entry.title}` : ""}${span}\n${entry.note}`
+    if (parts.length > 1 && used + line.length > RECALL_ALL_CHARS) break
+    parts.push({ text: line })
+    used += line.length + 2
+  }
+  const hidden = ordered.length - parts.length + 1
+  if (hidden > 0) parts.push({ text: `…${hidden} older episode${hidden === 1 ? "" : "s"} omitted.` })
+  return render(parts, "\n\n", [])
+}
+
+/** A rendered ID is its unique 12-character prefix; recall resolves any unambiguous prefix. */
+export function shortId(id: string): string {
+  return id.length <= SHORT_ID_CHARS ? id : id.slice(0, SHORT_ID_CHARS)
+}
+
+/** The lean, copy-paste-runnable target the system renders everywhere: `E57 layer tools page 2`. */
+export function address(id: string, page?: number, layer?: Layer): string {
+  let out = shortId(id)
+  if (layer && layer !== "conversation") out += ` layer ${layer}`
+  if (page !== undefined) out += ` page ${page}`
+  return out
+}
+
+export type ParsedTarget =
+  | { readonly kind: "catalog" }
+  | { readonly kind: "episode"; readonly handle: string; readonly layer?: Layer; readonly page?: number }
+  | { readonly kind: "opaque"; readonly handle: string; readonly page?: number }
+  | { readonly kind: "error"; readonly message: string }
+
+/** Parse a lean target address: a handle plus optional `layer <L>` and `page <n>` pairs. */
+export function parseTarget(input: string): ParsedTarget {
+  const tokens = input.trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return { kind: "error", message: "Provide a target: catalog, an episode (E57), a tool call, or an archived row." }
+  const handle = tokens[0]
+  let layer: Layer | undefined, page: number | undefined
+  for (let i = 1; i < tokens.length; i++) {
+    const key = tokens[i], value = tokens[i + 1]
+    if (key === "layer" && value !== undefined && (LAYERS as readonly string[]).includes(value)) { layer = value as Layer; i++ }
+    else if (key === "page" && value !== undefined && /^\d+$/.test(value)) { page = Number(value); i++ }
+    else return { kind: "error", message: `Cannot parse target near "${key}". Use: <target> [layer conversation|tools|full] [page N].` }
+  }
+  if (handle === "catalog") {
+    if (layer !== undefined || page !== undefined) return { kind: "error", message: "catalog takes no layer or page." }
+    return { kind: "catalog" }
+  }
+  if (/^E\d/.test(handle)) return { kind: "episode", handle, ...(layer !== undefined ? { layer } : {}), ...(page !== undefined ? { page } : {}) }
+  if (layer !== undefined) return { kind: "error", message: "layer applies only to an episode (E57)." }
+  return { kind: "opaque", handle, ...(page !== undefined ? { page } : {}) }
+}
+
+/** git-style resolution: an exact ID wins, a unique prefix resolves, an ambiguous one lists candidates. */
+export function resolveHandle(handle: string, ids: readonly string[]): { readonly id: string } | { readonly error: string } {
+  const exact = ids.find((id) => id === handle)
+  if (exact) return { id: exact }
+  const matches = ids.filter((id) => id.startsWith(handle))
+  if (matches.length === 1) return { id: matches[0] }
+  if (matches.length > 1) return { error: `Ambiguous target "${handle}"; candidates: ${matches.slice(0, 5).map(shortId).join(", ")}${matches.length > 5 ? ", …" : ""}` }
+  return { error: `No matching episode, tool call, or archived row for "${handle}". Try a query search by content instead.` }
+}
+
 /** Return attachments only on the page where their label starts, never as base64 text.
     Without page, return the whole original up to RECALL_ALL_CHARS in one call; an explicit
-    page steps through larger originals in RECALL_PAGE_CHARS pages. */
-export function recallPage(id: string, text: string, page?: number, files: readonly RecallFile[] = []): RecallContent {
+    page steps through larger originals in RECALL_PAGE_CHARS pages. `base` is the lean target
+    (handle plus any layer), without the page. */
+export function recallPage(base: string, text: string, page?: number, files: readonly RecallFile[] = []): RecallContent {
   const bounds = pageBounds(text, RECALL_PAGE_CHARS)
   const pages = bounds.length - 1
   const attach = (from: number, to: number) => files.filter(({ offset }) => offset >= from && offset < to).map(({ file }) => file)
@@ -267,13 +399,13 @@ export function recallPage(id: string, text: string, page?: number, files: reado
     // The label reports the call that was made; paging advice stays in the parenthetical,
     // and originals beyond the cap point at query-first retrieval before raw paging.
     const label = shown < pages
-      ? `recall ${JSON.stringify({ id })} (whole output too large: first ${end} of ${text.length} characters; use a query to locate the relevant page first, or continue at page ${shown + 1})`
-      : `recall ${JSON.stringify({ id })} (whole output)`
+      ? `recall ${base} (whole output too large: first ${end} of ${text.length} characters; use a query to locate the relevant page first, or continue at page ${shown + 1})`
+      : `recall ${base} (whole output)`
     const whole = `${label}\n${text.slice(0, end)}`
     return attached.length ? [{ type: "text", text: whole }, ...attached] : whole
   }
   const result = paginate(text, page)
   const attached = attach(bounds[page - 1], bounds[page])
-  const content = `recall ${JSON.stringify({ id, page })} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
+  const content = `recall ${base} page ${page} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
   return attached.length ? [{ type: "text", text: content }, ...attached] : content
 }
