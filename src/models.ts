@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode/plugin"
-import { tokens } from "./mask.ts"
+import { tokens } from "./tokens.ts"
 import { modelRpc, modelLabel, type ModelPreference, type ModelRef, type ModelState } from "./model-rpc.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]

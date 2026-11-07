@@ -27,7 +27,9 @@ test("memory appends without rewriting previous episodes and reverts follow the 
   ])
   const first = renderMemory(resolveMemory("c1", records).episodes)
   const originalBranch = resolveMemory("c2", records)
-  assert.ok(renderMemory(originalBranch.episodes).startsWith(first + "\n\n"))
+  // Rendering is bounded: an older episode keeps its heading, the latest its whole note.
+  assert.equal(first, "## Episode E1\nFirst summary")
+  assert.equal(renderMemory(originalBranch.episodes), "## Episode E1\n\n## Episode E2\nSecond summary")
   assert.deepEqual(originalBranch.episodes.map((item) => item.id), ["E1", "E2"])
   const reverted = resolveMemory("c3", records)
   assert.deepEqual(reverted.episodes.map((item) => item.id), ["E1", "E3"])
@@ -42,6 +44,17 @@ test("the episode header takes its title from the Title line without repeating i
   assert.equal(renderMemory([ep("E2", "Title: Finished")]), "## Episode E2 — Finished")
   assert.equal(renderMemory([ep("E3", "Untitled native summary", [], { native: true })]), "## Episode E3 (native)\nUntitled native summary")
   assert.equal(renderMemory([ep("E4", "Title: A\r\n\r\nFiles touched:\r\n- x")]), "## Episode E4 — A\nFiles touched:\r\n- x")
+})
+
+test("the episode chain fallback is bounded so old bodies cannot overflow the memory budget", () => {
+  const episodes = [...Array.from({ length: 8 }, (_, index) =>
+    ep(`E${index + 1}`, `Title: Task ${index + 1}\n${"stale body ".repeat(200)}`)),
+    ep("E9", "Title: Task 9\nkept note for the newest episode")]
+  const rendered = renderMemory(episodes)
+  assert.match(rendered, /## Episode E1 — Task 1/)
+  assert.match(rendered, /## Episode E9 — Task 9\nkept note for the newest episode/)
+  assert.doesNotMatch(rendered, /stale body/)
+  assert.ok(Math.ceil(rendered.length / 4) < 2_000, "nine episodes with fat notes once rendered ~8.7k estimated tokens against the 2,000-token budget")
 })
 
 test("native fallback adopts the summary and discloses an unknown archive gap", () => {

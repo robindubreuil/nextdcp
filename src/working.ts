@@ -1,4 +1,4 @@
-import { tokens } from "./mask.ts"
+import { tokens } from "./tokens.ts"
 
 export const DEFAULT_MEMORY_BUDGET = 2_000
 export class HandoffError extends Error {}

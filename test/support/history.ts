@@ -1,5 +1,5 @@
 // Test-only projection of persisted rows into provider messages (mirrors OpenCode v2.2.0).
-import { messageTokens, renderMask, type ArchivedCall, type Mask, type Message, type Part } from "../../src/mask.ts"
+import { messageTokens, type ArchivedCall, type Message, type Part } from "../../src/tokens.ts"
 import type { Row } from "../../src/memory.ts"
 
 type ProjectedMessage = Message & { readonly id?: string; readonly role: string }
@@ -86,8 +86,8 @@ export function projectHistory(rows: readonly Row[]): { messages: ProjectedMessa
 }
 
 /** Kept recent-context belongs to the checkpoint, not to the subsequent conversation. */
-export function conversationGrowth(rows: readonly Row[], masks: readonly Mask[]): { checkpoint: string | null; tokens: number } {
+export function conversationGrowth(rows: readonly Row[]): { checkpoint: string | null; tokens: number } {
   const index = rows.findLastIndex((row) => row.type === "compaction" && row.status === "completed")
   const messages = projectHistory(rows.slice(index + 1)).messages
-  return { checkpoint: index < 0 ? null : rows[index].id, tokens: messageTokens(renderMask(messages, masks)) }
+  return { checkpoint: index < 0 ? null : rows[index].id, tokens: messageTokens(messages) }
 }

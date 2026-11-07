@@ -1,9 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { conversationGrowth, projectHistory } from "./support/history.ts"
-import { messageTokens, planMask, renderMask } from "../src/mask.ts"
+import { messageTokens } from "../src/tokens.ts"
 
-const options = { minTokens: 10, distance: 0, batch: 1, protected: [] }
 const tool = (id, input, output, extra = {}) => ({
   type: "tool", id, name: "write", ...extra,
   state: { status: "completed", input, content: [{ type: "text", text: output }] },
@@ -30,21 +29,18 @@ test("v2 rows project paired tool parts, content and attachments for estimation"
   assert.ok(messageTokens(messages) >= 1_500)
 })
 
-test("idle growth excludes the checkpoint and kept tail, and counts the committed masked view", () => {
+test("idle growth excludes the checkpoint and kept tail, and counts the raw view", () => {
   const checkpoint = { id: "cp", type: "compaction", status: "completed", summary: "huge".repeat(10_000), metadata: { recent: "tail".repeat(10_000) } }
-  assert.deepEqual(conversationGrowth([checkpoint, { id: "idle", type: "idle" }], []), { checkpoint: "cp", tokens: 0 })
+  assert.deepEqual(conversationGrowth([checkpoint, { id: "idle", type: "idle" }]), { checkpoint: "cp", tokens: 0 })
   const rows = [checkpoint,
     { id: "a", type: "assistant", content: [tool("c1", { content: "IN".repeat(4_000) }, "OUT".repeat(5_000))] },
     { id: "u", type: "user", text: "new context after the call" },
   ]
   const raw = projectHistory(rows.slice(1)).messages
-  const plan = planMask(raw, [], options)
-  assert.equal(plan.commit, true)
-  const growth = conversationGrowth(rows, plan.masks)
+  const growth = conversationGrowth(rows)
   assert.equal(growth.checkpoint, "cp")
-  assert.equal(growth.tokens, messageTokens(renderMask(raw, plan.masks)))
-  assert.ok(growth.tokens < messageTokens(raw) / 10)
-  assert.deepEqual(conversationGrowth([{ id: "u", type: "user", text: "12345678" }], []), { checkpoint: null, tokens: 2 })
+  assert.equal(growth.tokens, messageTokens(raw))
+  assert.deepEqual(conversationGrowth([{ id: "u", type: "user", text: "12345678" }]), { checkpoint: null, tokens: 2 })
 })
 
 test("duplicate call IDs do not get an ambiguous live-call index", () => {

@@ -1,7 +1,5 @@
 import assert from "node:assert/strict"
-import { readFile } from "node:fs/promises"
 import test from "node:test"
-import { DEFAULT_MASK, planMask, renderMask } from "../src/mask.ts"
 import { adoptNative, resolveMemory } from "../src/memory.ts"
 import { createStore } from "../src/store.ts"
 
@@ -25,8 +23,6 @@ class MemoryStorage {
   }
 }
 
-const fixture = async () => JSON.parse(await readFile(new URL("./fixtures/before-mask.json", import.meta.url), "utf8"))
-const options = { ...DEFAULT_MASK, minTokens: 400, distance: 100, batch: 1 }
 const rows = () => [
   { id: "old/checkpoint", type: "compaction", status: "completed", summary: "previous" },
   { id: "user/one", type: "user", text: "A question 🧠" },
@@ -97,7 +93,7 @@ test("200 cumulative compactions write each historical raw row only once", async
   assert.equal(writtenBytes, storedBytes, "no cumulative raw-archive write amplification")
 })
 
-test("fork import copies only its branch and live masks, reserves IDs, and survives parent deletion", async () => {
+test("fork import copies only its branch, reserves IDs, and survives parent deletion", async () => {
   const kv = new MemoryStorage(), parent = createStore(kv, "parent"), child = createStore(kv, "child")
   const c1 = { id: "c1", type: "compaction", status: "completed", summary: "first" }
   const c2 = { id: "c2", type: "compaction", status: "completed", summary: "second" }
@@ -107,8 +103,7 @@ test("fork import copies only its branch and live masks, reserves IDs, and survi
   await parent.saveCheckpoint({ id: "c2", parent: "c1", episode: { id: "E8", summary: "second", rowIDs: ["u2"] } })
   await parent.saveCheckpoint({ id: "other-cp", parent: "c1", episode: { id: "E9", summary: "unrelated", rowIDs: ["other"] } })
   const call = await parent.getCall("live-call")
-  const mask = { id: "live-call", name: "read", output: "[elided]" }
-  await parent.commitMask({ commit: true, base: [], masks: [mask, { id: "future-call", name: "read", output: "future" }], calls: [call, { ...call, id: "future-call" }], savedTokens: 100 }, "c2")
+  await parent.saveCall({ id: "unreferenced", name: "read", input: { path: "no" }, result: { type: "text", value: "no" } })
   await child.inherit("parent", [c2, live])
   const memory = resolveMemory("c2", await child.chain("c2"))
   assert.deepEqual(memory.episodes.map((episode) => episode.id), ["E7", "E8"])
@@ -116,8 +111,7 @@ test("fork import copies only its branch and live masks, reserves IDs, and survi
   assert.equal(JSON.parse(await child.getRow("u1")).text, "first original")
   assert.equal(await child.getRow("other"), undefined)
   assert.equal(await child.getCheckpoint("other-cp"), undefined)
-  assert.equal(await child.getCall("future-call"), undefined)
-  assert.deepEqual(await child.getMasks("c2"), [mask])
+  assert.equal(await child.getCall("unreferenced"), undefined, "calls outside the branch are not copied")
   assert.deepEqual(await child.getCall("live-call"), call)
   assert.equal(await child.nextEpisode(), "E9", "seed from imported IDs even without an existing counter")
   const writes = kv.writes.length
@@ -174,82 +168,20 @@ test("a hidden native checkpoint retains its original summary without fabricatin
   assert.equal(await store.getRow("c1"), undefined, "Matching metadata is not an original transcript row")
 })
 
-test("mask batches archive successful originals first and skip failed calls", async () => {
-  const messages = await fixture(), plan = planMask(messages, [], { ...options, distance: 0 })
-  assert.equal(plan.calls.length, 2)
-  const kv = new MemoryStorage(), reports = [], store = createStore(kv, "s", (message) => reports.push(message))
-  kv.fail = (key) => key.endsWith(`/calls/${encodeURIComponent(plan.calls[1].id)}`)
-  const partial = await store.commitMask(plan)
-  assert.equal(partial.committed, true)
-  assert.deepEqual(partial.masks.map((mask) => mask.id), [plan.calls[0].id])
-  assert.deepEqual(await store.getMasks(), partial.masks)
-  assert.deepEqual(await store.getCall(plan.calls[0].id), plan.calls[0])
-  assert.equal(await store.getCall(plan.calls[1].id), undefined)
-  assert.ok(reports.some((message) => message.includes(plan.calls[1].id)))
-  kv.fail = () => false
-  const retry = planMask(messages, partial.masks, { ...options, distance: 0 })
-  assert.equal((await store.commitMask(retry)).committed, true)
-  assert.deepEqual(await store.getMasks(), plan.masks)
-  assert.deepEqual(await store.getCall(plan.calls[1].id), plan.calls[1])
-  const callWrite = kv.writes.findLastIndex(({ key }) => key.includes("/calls/"))
-  const maskWrite = kv.writes.findLastIndex(({ key }) => key.endsWith("/masks/root"))
-  assert.ok(callWrite < maskWrite)
-
-  const otherKV = new MemoryStorage(), other = createStore(otherKV, "s")
-  otherKV.fail = (key) => key.endsWith("/masks/root")
-  await assert.rejects(other.commitMask(plan), /injected storage failure/)
-  assert.deepEqual(await other.getMasks(), [])
-  assert.equal((await other.getCalls()).length, 2)
-  otherKV.fail = () => false
-  assert.equal((await other.commitMask(plan)).committed, true)
-})
-
-test("concurrent stale mask plans cannot erase committed stubs or start an undersized batch", async () => {
-  const original = await fixture()
-  const extended = [...original, { role: "user", content: [{ type: "text", text: "x".repeat(8_000) }] }]
-  const first = planMask(original, [], options), stale = planMask(extended, [], options)
-  assert.equal(first.masks.length, 1)
-  assert.equal(stale.masks.length, 2)
-  const kv = new MemoryStorage(), a = createStore(kv, "s"), b = createStore(kv, "s")
-  assert.deepEqual((await Promise.all([a.commitMask(first), b.commitMask(stale)])).map((result) => result.committed), [true, false])
-  const committed = await b.getMasks()
-  assert.deepEqual(committed, first.masks)
-  const fresh = planMask(extended, committed, options)
-  assert.equal((await b.commitMask(fresh)).committed, true)
-  const final = await a.getMasks()
-  assert.equal(final.length, 2)
-  assert.deepEqual(final[0], first.masks[0])
-})
-
-test("first complete call wins; conflicts are logged and only exact elisions are accepted", async () => {
+test("the first complete original wins; conflicting rewrites are logged and rejected", async () => {
   const kv = new MemoryStorage(), reports = []
   const report = (message) => reports.push(message)
   const a = createStore(kv, "s", report), b = createStore(kv, "s", report)
   const original = { id: "call/1", name: "read", input: { path: "x", content: "i".repeat(4_000) }, result: { type: "text", value: "o".repeat(20_000) } }
-  const messages = [
-    { role: "assistant", content: [{ type: "tool-call", id: original.id, name: original.name, input: original.input }] },
-    { role: "tool", content: [{ type: "tool-result", id: original.id, name: original.name, result: original.result }] },
-    { role: "user", content: [{ type: "text", text: "later" }] },
-  ]
   await Promise.all([a.saveCall(original), b.saveCall(original)])
-  const plan = planMask(messages, [], { ...options, minTokens: 10, distance: 0 })
-  assert.equal((await a.commitMask(plan)).committed, true)
-  const rendered = renderMask(messages, plan.masks)
-  const elided = { ...original, input: rendered[0].content[0].input, result: rendered[1].content[0].result }
-  assert.equal(await b.saveCall(elided), true)
+  assert.equal(await a.saveCall(original), true, "an identical rewrite is idempotent")
   assert.deepEqual(await a.getCall("call/1"), original)
   assert.deepEqual(await b.getCalls(), [original])
   assert.equal(await a.saveCall({ ...original, name: "write" }), false)
   assert.equal(await a.saveCall({ ...original, input: { path: "other" } }), false)
   assert.equal(await a.saveCall({ ...original, result: { type: "text", value: "different original" } }), false)
-  assert.equal(await a.saveCall({ ...elided, input: { ...elided.input, path: "other" } }), false)
-  assert.equal(await a.saveCall({ ...elided, result: { type: "text", value: "[Output elided to save context: counterfeit]" } }), false)
-  assert.equal(reports.filter((message) => message.includes("Conflicting archived tool call id")).length, 5)
+  assert.equal(reports.filter((message) => message.includes("Conflicting archived tool call id")).length, 3)
   assert.deepEqual(await a.getCall("call/1"), original)
-  kv.values.delete("sessions/s/calls/call%2F1")
-  assert.equal(await a.saveCall(elided), false)
-  assert.ok(reports.some((message) => message.includes("Missing original for committed mask")))
-  assert.equal(await a.getCall(original.id), undefined)
 })
 
 test("empty tool content and bad calls do not block later calls or rows", async () => {
@@ -267,20 +199,6 @@ test("empty tool content and bad calls do not block later calls or rows", async 
   assert.ok(await store.getRow("after"))
   assert.ok(reports.some((message) => message.includes("Unable to archive tool call bad")))
   assert.ok(reports.some((message) => message.includes("Conflicting archived tool call id empty")))
-})
-
-test("mask state is isolated per checkpoint and survives switching branches", async () => {
-  const messages = await fixture(), plan = planMask(messages, [], { ...options, distance: 0 })
-  const kv = new MemoryStorage(), store = createStore(kv, "s")
-  assert.equal((await store.commitMask(plan, "checkpoint/one")).committed, true)
-  assert.deepEqual(await store.getMasks("checkpoint/one"), plan.masks)
-  assert.deepEqual(await store.getMasks("checkpoint/two"), [])
-  assert.deepEqual(await store.getMasks(), [])
-  assert.equal((await store.commitMask(plan, "checkpoint/two")).committed, true)
-  assert.deepEqual(await store.getMasks("checkpoint/two"), plan.masks)
-  assert.deepEqual(await store.getMasks("checkpoint/one"), plan.masks)
-  assert.ok(kv.values.has("sessions/s/masks/checkpoint%2Fone"))
-  assert.ok(kv.values.has("sessions/s/masks/checkpoint%2Ftwo"))
 })
 
 test("episode IDs are monotonic under concurrent callers, isolated by session, and retryable", async () => {
@@ -335,15 +253,12 @@ test("search scans all storage pages without crossing session boundaries", async
 
 test("corrupt storage is an error rather than silently discarding previous state", async () => {
   const kv = new MemoryStorage(), store = createStore(kv, "s")
-  kv.values.set("sessions/s/masks/root", "not json")
-  await assert.rejects(store.getMasks(), /Invalid stored JSON/)
-  await assert.rejects(store.commitMask(planMask(await fixture(), [], options)), /Invalid stored JSON/)
-  assert.equal(kv.writes.length, 0)
-  kv.values.set("sessions/s/masks/root", JSON.stringify([{ id: "x", name: "read", input: [{ path: "invalid", stub: "x" }] }]))
-  await assert.rejects(store.getMasks(), /Invalid stored masks/)
+  kv.values.set("sessions/s/calls/x", "not json")
+  await assert.rejects(store.getCall("x"), /Invalid stored JSON/)
   kv.values.set("sessions/s/calls/x", JSON.stringify({ id: "x", name: "read" }))
   await assert.rejects(store.getCall("x"), /Invalid archived call/)
   await assert.rejects(store.getCalls(), /Invalid archived call/)
+  assert.equal(kv.writes.length, 0)
 })
 
 test("deferred compaction is durable, session-scoped, validated and removed with its session", async () => {

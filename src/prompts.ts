@@ -38,20 +38,6 @@ Raise the depth only when the question needs it. layer and page also work as dir
 
 Everything recall returns stays live for the rest of the episode.`
 
-export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction and new output masking for the current round only. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval does not affect committed elisions, manual compaction, or native overflow handling, and cannot cancel already-queued compaction; the next round starts from the full context and re-evaluates on its own.`
+export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction for the current round only. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval does not affect manual compaction or native overflow handling, and cannot cancel already-queued compaction; the next round starts from the full context and re-evaluates on its own.`
 
-import { shortId } from "./recall.ts"
 
-const tokenLabel = (tokens: number) => tokens >= 1_000 ? `${(tokens / 1_000).toFixed(1)}k` : String(tokens)
-// A rendered target is the lean, copy-paste-runnable address the model feeds to recall's id.
-const recallCall = (id: string) => shortId(id)
-// Re-running these is idempotent and cheap, and the tools page natively; for
-// everything else only recall can restore the exact original.
-const RERUNNABLE = new Set(["read", "grep", "glob"])
-export const outputStub = (tokens: number, id: string, name = "tool") =>
-  `[Output elided to save context: ${name}, ~${tokenLabel(tokens)} tokens. ${
-    RERUNNABLE.has(name) ? `Re-run it for current content, or recall ${recallCall(id)} for the original` : `Retrieve with recall ${recallCall(id)}`
-  }]`
-
-export const inputStub = (name: string, tokens: number, id: string) =>
-  `[Input elided to save context: ${name}, ~${tokenLabel(tokens)} tokens. Retrieve with recall ${recallCall(id)}]`

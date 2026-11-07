@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin"
-import type { SessionCompaction, SessionContext, SessionGenerate, SessionPrompt } from "@opencode/plugin/promise/session"
+import type { SessionCompaction, SessionContext, SessionPrompt } from "@opencode/plugin/promise/session"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { DEFAULT_MASK, mediaTokens, messageTokens, partTokens, planMask, renderMask, tokens, type ArchivedCall, type Mask, type MaskOptions, type Message, type Part } from "./mask.ts"
+import { mediaTokens, messageTokens, partTokens, tokens, type ArchivedCall, type Message, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { assertMemoryBudget, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, parseHandoff, type Handoff } from "./working.ts"
@@ -20,7 +20,6 @@ const sameRound = (decision: Deferral | undefined, info: { time?: { busy?: numbe
   decision !== undefined && decision.busy === info.time?.busy && decision.idle === info.time?.idle
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
 const positive = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
-const nonnegative = (value: unknown, fallback: number) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback
 const modelRef = (value: unknown) => object(value) && typeof value.providerID === "string" && typeof value.id === "string"
   ? { providerID: value.providerID, id: value.id } : undefined
 const activeCheckpoint = (rows: readonly Row[]) => rows.findLast((row) => row.type === "compaction" && row.status === "completed")?.id ?? null
@@ -48,7 +47,7 @@ function attachmentTokens(file: unknown): number {
   catch { return Math.ceil(file.data.length * 3 / 16) }
 }
 
-/** Estimated tokens of the raw, unmasked conversation a deferral would hold live,
+/** Estimated tokens of the raw conversation a deferral would hold live,
  *  counting the same text and reasoning parts that responseTokens counts. */
 function conversationTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
@@ -64,6 +63,49 @@ function conversationTokens(rows: readonly Row[]): number {
   }, 0)
 }
 
+/** Provider-reported billed tokens of a completed request: input plus cache traffic,
+ *  read tolerantly across row shapes. Summing the cache fields is exact on the observed
+ *  hosts and stays conservative if a provider folds them into input. */
+function billedTokens(row: Row): number {
+  const data = row as Row & { readonly tokens?: unknown }
+  if (!object(data.tokens)) return 0
+  const usage = data.tokens, cache = object(usage.cache) ? usage.cache : {}
+  return positive(usage.input, 0) + positive(usage.cacheRead ?? cache.read, 0) + positive(usage.cacheWrite ?? cache.write, 0)
+}
+
+/** Billed-token correction for estimates that face model window limits: the median ratio
+ *  of provider-reported input growth to the estimator's count of the rows in between,
+ *  over the last few completed requests of the rows' own model. Native chars/4 units
+ *  (scale 1) apply until a usable pair of usage-bearing rows exists. */
+function usageScale(rows: readonly Row[]): number {
+  const samples: number[] = []
+  let later: { at: number; billed: number; model: string } | undefined
+  const key = (row: Row) => {
+    const model = modelRef((row as Row & { readonly model?: unknown }).model)
+    return model ? `${model.providerID}/${model.id}` : ""
+  }
+  for (let at = rows.length - 1; at >= 0 && samples.length < 3; at--) {
+    const row = rows[at]
+    if (row.type !== "assistant") continue
+    const billed = billedTokens(row)
+    if (billed <= 0) continue
+    if (later) {
+      // The earlier row's own output lands in the later request; a span holding a
+      // checkpoint or a model change cannot attribute billed growth to its rows.
+      const span = rows.slice(at, later.at), growth = later.billed - billed
+      const estimate = conversationTokens(span)
+      const usable = growth > 0 && estimate >= 256 && key(row) === later.model &&
+        !span.some((entry) => entry.type === "compaction" || entry.type === "model-switched")
+      const ratio = growth / estimate
+      if (usable && ratio >= 0.5 && ratio <= 2.5) samples.push(ratio)
+    }
+    later = { at, billed, model: key(row) }
+  }
+  if (!samples.length) return 1
+  const sorted = [...samples].sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length / 2)]
+}
+
 /** Only newly generated assistant rows, not a second projection of the history. */
 function responseTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
@@ -76,13 +118,7 @@ function responseTokens(rows: readonly Row[]): number {
 /** Controller is independent of hook registration so fallback and concurrency can be tested. */
 export function createController(ctx: Plugin.Context) {
   const models = createModels(ctx)
-  const rawMask = object(ctx.options.mask) ? ctx.options.mask : {}, rawMemory = object(ctx.options.memory) ? ctx.options.memory : {}
-  const maskOptions: MaskOptions = {
-    minTokens: nonnegative(rawMask.minTokens, DEFAULT_MASK.minTokens),
-    distance: nonnegative(rawMask.distance, DEFAULT_MASK.distance),
-    batch: nonnegative(rawMask.batch, DEFAULT_MASK.batch),
-    protected: Array.isArray(rawMask.protected) && rawMask.protected.every((name) => typeof name === "string") ? rawMask.protected : DEFAULT_MASK.protected,
-  }
+  const rawMemory = object(ctx.options.memory) ? ctx.options.memory : {}
   const idle = ctx.options.idle === false ? Infinity : positive(ctx.options.idle, 25_000)
   const budgetOption = ctx.options.budget === false ? Infinity : positive(ctx.options.budget, 0), memoryBudget = positive(rawMemory.budget, DEFAULT_MEMORY_BUDGET)
   const debug = ctx.options.debug === true
@@ -91,7 +127,6 @@ export function createController(ctx: Plugin.Context) {
   const attempts = new Map<string, { key: string; time: number }>(), pending = new Map<string, Pending>()
   const cooldown = new Map<string, number>()
   const inherited = new Map<string, Promise<void>>()
-  const masksBySession = new Map<string, { checkpoint: string | null; masks: readonly Mask[] }>()
   const views = new Map<string, { checkpoint: string | null; tokens: number; after: string | null; response: number }>()
   const deferrals = new Map<string, Deferral>()
   // The queued message that triggered a deferred-marker compaction; evidence for the
@@ -127,15 +162,6 @@ export function createController(ctx: Plugin.Context) {
     inherited.set(sessionID, work)
     void work.catch(() => { if (inherited.get(sessionID) === work) inherited.delete(sessionID) })
     return work
-  }
-  const masksFor = async (sessionID: string, rows: readonly Row[]): Promise<readonly Mask[]> => {
-    await inheritSession(sessionID as SessionID, rows)
-    const checkpoint = activeCheckpoint(rows), cached = masksBySession.get(sessionID)
-    if (cached?.checkpoint === checkpoint) return cached.masks
-    const masks = await storeFor(sessionID).getMasks(checkpoint)
-    // A concurrent commit may have cached newer masks while this read was in flight.
-    if (masksBySession.get(sessionID) === cached) masksBySession.set(sessionID, { checkpoint, masks })
-    return masks
   }
   const windowSize = async (ref: unknown): Promise<{ context: number; output: number } | undefined> => {
     const model = modelRef(ref)
@@ -191,16 +217,11 @@ export function createController(ctx: Plugin.Context) {
   }
 
   const onContext = async (event: SessionContext) => {
-    const store = storeFor(event.sessionID)
-    let rows: readonly Row[], masks: readonly Mask[]
+    let rows: readonly Row[]
     try {
       rows = await ctx.session.context({ sessionID: event.sessionID })
-      masks = await masksFor(event.sessionID, rows)
     } catch (error) {
-      log("read masks", error)
-      // Keep the last committed bytes rather than sending a larger, cache-breaking view.
-      const cached = masksBySession.get(event.sessionID)
-      if (cached) try { event.messages = renderMask(event.messages as unknown as Message[], cached.masks) as unknown as typeof event.messages } catch {}
+      log("read context", error)
       return
     }
     const checkpoint = activeCheckpoint(rows)
@@ -210,19 +231,8 @@ export function createController(ctx: Plugin.Context) {
       const info = await ctx.session.get({ sessionID: event.sessionID })
       held = deferrals.get(event.sessionID) === decision && sameRound(decision, info)
     } catch (error) { log("deferral scope", error) }
-    // A granted deferral stops new shaping, not recovery: committed masks still
-    // render, their originals stay recallable, and views keep tracking growth.
+    // A granted deferral stops the budget trigger for its round; views keep tracking growth.
     try {
-      if (!held) {
-        const plan = planMask(event.messages as unknown as Message[], masks, maskOptions)
-        if (plan.commit) {
-          masks = (await store.commitMask(plan, checkpoint)).masks
-          masksBySession.set(event.sessionID, { checkpoint, masks })
-        }
-      }
-    } catch (error) { log("mask batch", error) }
-    try {
-      event.messages = renderMask(event.messages as unknown as Message[], masks) as unknown as typeof event.messages
       const messages = event.messages as unknown as ViewMessage[]
       const growth = growthAfter(messages, checkpoint)
       if (growth === undefined) { views.delete(event.sessionID); return }
@@ -230,19 +240,14 @@ export function createController(ctx: Plugin.Context) {
       const limit = budgetOption || ((await windowSize(event.model))?.context ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
       // An unknown window disables the auto budget instead of assuming a size; surface
-      // that state rather than silently never firing.
+      // that state rather than silently never firing. Estimates meeting real window
+      // sizes are calibrated against provider-reported usage when the host supplies it.
       if (budget <= 0) return log("budget trigger is disabled; the model window is unknown and options.budget is not set", undefined)
-      if (messageTokens(messages.filter((message) => message.role !== "system")) <= budget) return
-      if (!held && growth >= Math.min(idle, budget / 4)) void requestCompact(event.sessionID, checkpoint, growth)
+      if (messageTokens(messages.filter((message) => message.role !== "system")) * usageScale(rows) <= budget) return
+      // growth and idle are raw estimate units (the deferred-marker channel's units);
+      // the budget quarter is real tokens, so convert it through the same calibration.
+      if (!held && growth >= Math.min(idle, budget / 4 / usageScale(rows))) void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
-  }
-
-  const onGenerate = async (event: SessionGenerate) => {
-    try {
-      const rows = await ctx.session.context({ sessionID: event.sessionID })
-      const masks = await masksFor(event.sessionID, rows)
-      event.messages = renderMask(event.messages as unknown as Message[], masks) as unknown as typeof event.messages
-    } catch (error) { log("generate mask", error) }
   }
 
   // A saved record is authoritative; anything else with a textual summary is adopted as a native episode.
@@ -290,7 +295,7 @@ export function createController(ctx: Plugin.Context) {
         // Optional native precomputation runs before a checkpoint ID exists. Preserve what
         // is available, then leave native in control; later adoption reports the gap.
         const start = rows.findLastIndex((row) => row.type === "compaction" && row.status === "completed")
-        await store.archiveRows(rows.slice(Math.max(0, start)), activeCheckpoint(rows))
+        await store.archiveRows(rows.slice(Math.max(0, start)))
         return
       }
       const cut = planCut(rows)
@@ -435,7 +440,7 @@ export function createController(ctx: Plugin.Context) {
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
-    for (const map of [admissions, attempts, cooldown, masksBySession, views, inherited, deferrals, hints]) map.delete(sessionID)
+    for (const map of [admissions, attempts, cooldown, views, inherited, deferrals, hints]) map.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)
@@ -486,7 +491,7 @@ export function createController(ctx: Plugin.Context) {
       const target = id ? parseTarget(id) : undefined
       if (target?.kind === "error") return target.message
 
-      // Call and row originals live in the store alone: an elision-notice original must not
+      // Call and row originals live in the store alone: an elided original must not
       // hide behind an unreadable episode chain or a native checkpoint.
       const readFacts = async () => {
         const calls = await store.getCalls(), rows = await store.getRows()
@@ -566,7 +571,7 @@ export function createController(ctx: Plugin.Context) {
       return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
-  const deferredNotice = "NextDCP's automatic mid-round budget compaction and new output masking are deferred for this round only, so the raw conversation stays fully live. Committed elisions still render and stay recallable; manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
+  const deferredNotice = "NextDCP's automatic mid-round budget compaction is deferred for this round only. Manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
   const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
     const reason = input.reason.trim()
     if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
@@ -592,7 +597,7 @@ export function createController(ctx: Plugin.Context) {
     // tool definitions, and the round's own output must still fit nextdcp's estimate.
     const reserve = window.output > 0 ? window.output : 8_192
     const windowTokens = window.context
-    const estimate = conversationTokens(rows), ceiling = Math.floor((windowTokens - reserve) * DEFER_WINDOW_SHARE)
+    const estimate = Math.round(conversationTokens(rows) * usageScale(rows)), ceiling = Math.floor((windowTokens - reserve) * DEFER_WINDOW_SHARE)
     if (estimate > ceiling) return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
 
     // An unapproved record also prevents concurrent requests and retries after refusal.
@@ -608,7 +613,7 @@ export function createController(ctx: Plugin.Context) {
     decision.approved = true
     return deferredNotice
   }
-  return { onPrompt, onContext, onGenerate, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, registerModels: models.register }
+  return { onPrompt, onContext, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, registerModels: models.register }
 }
 
 /** Register the documented v2 hooks and tools. */
@@ -626,7 +631,7 @@ export async function install(ctx: Plugin.Context) {
   })
   // The deferral gate is the only consumer of the experimental permission surface.
   // Feature-detect and register it defensively: a V2.3 shape change warns once and
-  // leaves recall, masking, and archival alive instead of failing plugin setup.
+  // leaves recall and archival alive instead of failing plugin setup.
   if (typeof ctx.agent?.transform === "function" && typeof ctx.permission?.assert === "function") {
     try {
       await ctx.agent.transform((editor) => {
@@ -652,7 +657,6 @@ export async function install(ctx: Plugin.Context) {
   } else console.warn("[nextdcp] this OpenCode build lacks the permission surface; defer_compaction is unavailable")
   await ctx.session.hook("prompt", controller.onPrompt)
   await ctx.session.hook("context", controller.onContext)
-  await ctx.session.hook("generate", controller.onGenerate)
   await ctx.session.hook("compaction", controller.onCompaction)
   return controller
 }

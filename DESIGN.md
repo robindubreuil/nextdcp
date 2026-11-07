@@ -7,8 +7,7 @@ simplicity (KISS), prompt-cache friendliness, and low cost.
 ## Core idea
 
 > **Do not rebuild compaction. Make OpenCode's native compaction lossless and
-> episodic, cut growth with deterministic masking, and give the model one tool
-> to recall anything.**
+> episodic, and give the model one tool to recall anything.**
 
 OpenCode V2 already handles the hard, fragile parts: trigger thresholds, overflow
 retries, choosing the cut at a user-turn boundary, rendering the checkpoint,
@@ -22,10 +21,10 @@ auto-continue, revert, and UI events. Its weaknesses are:
 nextdcp fixes exactly these three things, using official hooks only:
 
 ```
- request = [system] [checkpoint: working state + recent tail] [messages since checkpoint, stale outputs masked]
-                          ▲                                                ▲
-              compaction hook (archive)                      context/generate hooks (masking)
- archive (ctx.storage)  ◄── raw messages saved at each compaction / mask
+ request = [system] [checkpoint: working state + recent tail] [messages since checkpoint, raw]
+                          ▲
+        compaction hook (archive first, then summarize = the only elision)
+ archive (ctx.storage)  ◄── raw rows and tool calls saved at each compaction
  recall tool  ──► archive + live history
 ```
 
@@ -50,22 +49,22 @@ rendered handoff, with a prompt target of about 1,000 or less. The estimate is
 chars/4 — with Han, kana and hangul characters counting as roughly one token
 each — not a provider-tokenizer guarantee, and does not include native retained
 tail, system instructions, tool definitions, or subsequent conversation.
-The existing soft/hard triggers and batched sticky observation masks are unchanged.
+The existing soft/hard triggers are unchanged.
 
 ## Round-scoped deferral
 
 Some tasks legitimately need many large results live at once. The `defer_compaction`
-tool lets the model propose skipping the budget trigger and new mask planning for the
-current round only. Three gates apply in order: physics (the unmasked conversation
+tool lets the model propose skipping the budget trigger for the
+current round only. Three gates apply in order: physics (the conversation
 must fit 80% of the model's window; an unknown window is refused, so no approval is
 spent on a context that would overflow anyway), user consent (the host permission
 system, action `defer_compaction`, default ask with native Always allow, shown with
 the model's reason), and idempotence within the round. A grant never disables
-recovery: committed masks still render, their originals stay recallable, and a
-compaction already in flight still runs. The grant expires when its round ends —
-success, failure or interruption — and that round writes no deferred idle marker;
-without re-affirmation, the next round's mid-turn budget trigger catches up in one
-bounded compaction. One in-memory decision per session, never inherited or persisted.
+recovery: a compaction already in flight still runs. The grant expires when its
+round ends — success, failure or interruption — and that round writes no deferred
+idle marker; without re-affirmation, the next round's mid-turn budget trigger
+catches up in one bounded compaction. One in-memory decision per session, never
+inherited or persisted.
 
 ## Commit and failure contract
 
@@ -94,36 +93,16 @@ that checkpoint, preserving its summary and independent originals/media.
 
 ## Components
 
-### Observation masking (`session.hook("context")` and `session.hook("generate")`)
+### One elision boundary (`session.hook("compaction")`)
 
-Deterministic observation masking ("garbage collection" in the SWE-agent
-literature) keeps stale tool output from consuming context without paying a
-model to summarize it.
-
-- **Candidates:** completed `tool-result` parts that are not provider-executed,
-  not from a protected tool (`skill`, `todowrite`, `task`, …), exceed
-  `mask.minTokens` (default 400), and sit more than `mask.distance` tokens
-  (default 20k) from the end of the request. Distance is measured in tokens,
-  not turns, because autonomous runs can have one user turn and hundreds of steps.
-- **Large tool-call inputs** (e.g. `write`/`edit` file contents) beyond the same
-  distance: replace string fields longer than `mask.minTokens` with the same kind
-  of stub, keeping the input a valid object with the same keys. The full input
-  stays recallable by call id.
-- **Rendering:** a short stub naming the tool, its estimated size, and how to get
-  the original back (`recall toolu_…`). Re-runnable tools (`read`,
-  `grep`, `glob`) also suggest re-running for current content. The adjacent call
-  already shows the input, so the output stub omits it; leave an output unmasked
-  if its notice would save nothing. The part, id and name are kept, so tool-call
-  pairing stays valid. Reasoning parts and `providerExecuted` parts are never
-  touched.
-- **Sticky and batched:** masks are stored under the active checkpoint id (or
-  `root`) and cached per session. The set only grows within that checkpoint; a
-  revert selects the old key. A new plan normally saves at least `mask.batch`
-  tokens (default 10k). If an individual call cannot be archived, skip it and
-  commit the other successfully archived calls, even if the remaining savings are
-  below the batch threshold. Between commits the rendered prefix is byte-identical.
-- The same pure function runs in the `generate` hook, so summary generation reuses
-  the primary request's cache prefix.
+Earlier versions elided stale tool outputs mid-request ("observation masking",
+the SWE-agent "garbage collection"). It was removed: a stub in the request is
+quiet — the model cannot tell it from content, recovery re-reads the stub
+instead of the original, and every commit rewrote the request prefix. Elision
+now happens in exactly one place: the compaction summary that replaces the
+archived cut, next to the capture-time archive that stores raw rows and tool
+calls. The conversation runs raw through the round; whatever the summary omits
+is one `recall` hop away.
 
 ### Episodic archive (`session.hook("compaction")`)
 
@@ -135,8 +114,8 @@ When a compaction fires (native trigger, or the deferred / hard-budget triggers)
    provider-format tool messages in `event.messages` do not) as compact JSON text
    in `ctx.storage`, keyed by row id. Do not rewrite older immutable history:
    cumulative archive-row writes grow linearly across compactions. Store tool
-   inputs and outputs in full and index them by call id. Masked outputs are also
-   archived when their mask batch is committed. Process items independently: log
+   inputs and outputs in full and index them by call id. Process items
+   independently: log
    failures and conflicting call ids, keep the first original, continue with the
    rest, and mark the episode with a recall gap if anything was missed.
 3. **One handoff request** produces the replacement working state and the short
@@ -229,8 +208,8 @@ needs it.
 `full` is the raw transcript. `conversation` is what was *said and asked*; `tools`
 is what the tools *returned*. That separation is the point: "why did we decide X"
 is a `conversation` question, "what was the exact error" is a `tools` question, and
-a broad probe is `full`. Rendering tool output from the `calls/` original (not the
-row, which may hold a committed stub) closes a latent fidelity gap. Tool tags in
+a broad probe is `full`. Tool output renders from the `calls/` original, the
+canonical archive record. Tool tags in
 the conversation layer render the call target as `recall call_01HZ2a3`, so any
 output is one hop away. Hidden reasoning is stored but not rendered in any layer
 yet; it joins the matrix later.
@@ -246,7 +225,7 @@ episode was about X" probe). There is no summary *layer* to reach for a single n
 
 #### Addresses and IDs
 
-Every rendered target — tool-call tags, search hits, elision notices, page labels —
+Every rendered target — tool-call tags, search hits, page labels —
 reads `recall <address>`. IDs abbreviate to their unique 12-character prefix
 (`call_01HZ2a3` for `call_01HZ2a3b4c5…`), and recall resolves any unambiguous
 prefix git-style: an exact ID wins, a unique prefix resolves, an ambiguous one
@@ -291,8 +270,8 @@ signatures, or hidden reasoning. Tool output is not clipped.
 
 The tool description is the *entire* protocol the model needs to know. There is
 nothing in the system prompt, no message-ID tags, no nudges, no reminders and no
-priority labels. Recall results are ordinary tool outputs and get masked again
-later, so the system stays bounded.
+priority labels. Recall results are ordinary tool outputs; the single compaction
+elision boundary keeps the system bounded.
 
 ### Keeping context low (two compaction triggers)
 
@@ -318,18 +297,19 @@ cost and quality (context rot), so the plugin adds two triggers of its own:
   reloads, is not inherited by forks, and does not apply to a staged revert or
   child session. Missing/corrupt storage or rejected admission must not block the
   prompt; the hard budget and native overflow remain safety nets. Growth is
-  measured from the actual masked context request rather than a duplicate
+  measured from the actual context request rather than a duplicate
   row-to-message projection, and a measurement is usable only for its checkpoint.
   Failed, interrupted and transient executions do not mark compaction due;
   measuring growth avoids loops on the retained tail. The tradeoff is resume
   latency and possibly a colder provider prompt cache; avoiding a summary for an
   abandoned conversation takes priority.
 - **Hard budget (within a turn).** In the context hook, estimate conversation
-  tokens with chars/4, excluding system instructions and tool definitions. Above
-  `budget` (default `min(50% window, 100k)`), first commit a mask batch; compact
-  only if still above the budget and growth since the checkpoint is at least
-  `min(idle, budget / 4)`. Native overflow handling still accounts for the
-  complete request.
+  tokens with chars/4, excluding system instructions and tool definitions, and
+  calibrate the estimate toward real tokens against provider-reported usage from
+  recent completed requests (native chars/4 units apply until a usable pair of
+  usage-bearing rows exists). Above `budget` (default `min(50% window, 100k)`),
+  compact when growth since the checkpoint is at least `min(idle, budget / 4)`.
+  Native overflow handling still accounts for the complete request.
 - Both triggers share one per-session admission guard. The context hook is
   fire-and-forget; concurrent prompt hooks share and await the admission promise
   so none race ahead of the compaction control. Errors are caught. The guard
@@ -342,18 +322,21 @@ cost and quality (context rot), so the plugin adds two triggers of its own:
   (including the deferred marker) and in-memory state are removed.
 - **Cost reasoning:** with caching, every step pays cache-read price × context
   size, so a smaller steady-state context is a direct saving. Rewrites happen
-  only at mask batches and at deferred or hard-budget compactions. A completed
+  only at compactions. A completed
   conversation does not pay for a speculative final summary. Byte stability
-  applies *between* committed mask batches and *between* compactions, not across
-  those rewrites; each rewrite invalidates the cache from its first change
-  onward. The mask batch threshold exists so that the tokens saved outweigh that
-  one-time cost.
+  holds *between* compactions; each compaction invalidates the cache from its
+  first change onward.
 
 ### Possible later
 
-- A mask rule for superseded `read` outputs (mask an earlier read of a file once
-  it has been re-read, edited or written later).
 - A `/memory` command (list episodes, stats) and a TUI panel through RPC.
+- A per-checkpoint memo of the token accounting: `messageTokens` runs on every
+  context event at live sizes (~1,900 rows). Fine at current sizes; cache per
+  checkpoint if sessions grow.
+- A guard in `formatRow`: it parses its raw JSON unguarded, so a corrupt stored
+  row surfaces a raw `SyntaxError` instead of the transcript path's clean
+  `[Invalid archived row]` degradation. Cosmetic — plugin-written rows are
+  valid JSON — but worth tidying.
 - None of this is needed for the core.
 
 ## Focused retrieval and deployment
@@ -396,32 +379,32 @@ compaction metadata can override the recent-context rendering.
 - **Storage** is `ctx.storage` (the plugin-scoped KV in opencode.db); writes are
   serialized per durable key across host contexts and hot reloads. **Search** is
   in-memory BM25, enough for MB-scale archives (FTS5 only if ever needed).
-  **Tokens** are chars/4 with the CJK adjustment described above.
+  **Tokens** are chars/4 with the CJK adjustment described above; estimates that
+  face model window limits are calibrated against provider-reported usage.
 - **Architecture:** a functional core with an imperative shell. Pure functions
-  `planMask`, `renderMask`, `planCut`, `resolveMemory`, `renderMemory`, `search`
+  `planCut`, `resolveMemory`, `renderMemory`, `search`, `messageTokens`
   hold all the logic; the hooks are thin adapters.
 - **Tests:** `node --test` (Node 22.18+ for native type stripping) on the pure
-  core and the hook adapters, with golden message fixtures in `test/fixtures/`.
+  core and the hook adapters.
 - **Config:** a handful of keys via plugin `options`: `idle`, `budget`,
-  `mask.{minTokens,distance,batch,protected}`, `memory.budget`, `debug`. The size
+  `memory.budget`, `debug`. The size
   of the kept tail is native config (`compaction.keep.tokens`).
 
 ```
 src/
   index.ts       Plugin.define entry
   runtime.ts     hooks, compaction, recall tool and trigger adapters
-  mask.ts        planMask / renderMask
+  tokens.ts      token estimation
   memory.ts      checkpoint chains, episodes and rendering
   working.ts     handoff schema: parsing, validation, budget
   recall.ts      transcripts, pagination and BM25
   store.ts       typed ctx.storage wrapper
-  prompts.ts     working-state prompt, tool descriptions, elision stubs
+  prompts.ts     working-state prompt and tool descriptions
   models.ts      compaction-model policy and safe-capacity checks
   model-rpc.ts   nextdcp.model RPC schema and state
   picker.ts      /compact-model TUI picker
   tui.ts         TUI bundle entry
 test/
-  fixtures/          golden message dumps
   support/history.ts test-only row-to-message projection
 ```
 
@@ -443,4 +426,4 @@ design, not from bugs:
 Deliberately dropped from that design: the agent-driven `compress` tool and range
 IDs, message-ID injection, nudges and reminders, manual mode, the notifications
 UI, auto-update, the custom-prompt override tree, and V1 support. Model-visible
-ids appear only in mask stubs, episode headers and `recall` output.
+ids appear only in episode headers and `recall` output.

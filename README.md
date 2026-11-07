@@ -1,6 +1,6 @@
 # nextdcp
 
-Bounded task-focused working memory, deterministic tool-output masking, on-demand `recall`, and
+Bounded task-focused working memory, on-demand `recall`, and
 user-approved round-scoped compaction deferral for OpenCode V2 (**v2.2.5+**). The host supplies
 `@opencode/plugin`; the declared
 peer range is `>=2.2.5 <3`. There are no additional runtime dependencies. The
@@ -72,8 +72,8 @@ policy, use OpenCode's existing configuration:
 
 Choose a model available through your own provider. A specific model uses the
 complete new cut's readable text transcript plus the previous working state.
-It does not load a directory of old episodes or run a separate merge. This includes original
-tool text, not just masked stubs, and can be larger than the normal masked
+It does not load a directory of old episodes or run a separate merge. This includes complete
+original tool text, not host-clipped ranges, and can be larger than the normal
 request. Provider metadata and hidden reasoning are not sent as conversation
 content. Separate models generally cannot reuse the main model's prompt cache.
 
@@ -103,14 +103,13 @@ retried in that round.
 The reason is visible in the tool call and in the GUI's approval card; the terminal's
 generic approval box shows the tool name, with the reason in the tool call above it.
 
-Physics gates the request before the prompt: the unmasked conversation, including
+Physics gates the request before the prompt: the conversation, including
 attachments, must fit within 80% of the model's context window after reserving its
 output limit; an unknown window is refused, so no approval is spent on a
 conversation that would overflow anyway.
 
-Approval suspends NextDCP's automatic **mid-round budget trigger** and the planning
-of **new** output elisions for that round, keeping the raw conversation fully live.
-Committed elisions still render and stay recallable; manual compaction, native
+Approval suspends NextDCP's automatic **mid-round budget trigger** for that round,
+keeping the raw conversation fully live. Manual compaction, native
 overflow handling, and already-queued or in-flight compaction are unaffected. The
 held round writes no deferred idle marker, so the next round starts from the full
 context and either re-affirms or lets the budget trigger catch up in one bounded
@@ -123,16 +122,14 @@ OpenCode's usual scope; the exemption itself is never persisted.
 All options are optional and go inside the plugin's `options` object. Token
 counts are estimates, not provider billing counts: text is estimated at four
 characters per token, except Han, kana and hangul characters, which count as
-roughly one token each.
+roughly one token each. Where estimates are compared against a model's window,
+they are calibrated toward real tokens using the provider's own reported usage
+from recent completed requests; without such usage the raw estimate applies.
 
 | Option | Default | Meaning |
 |---|---:|---|
 | `idle` | `25000` | After a successful turn with this much new conversation, compact on the **next prompt**, not while idle. Set `false` to disable. Subagent sessions are ignored. |
-| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this after masking and new growth reaches `min(idle, budget / 4)`. System instructions and tool definitions are excluded. Set `false` to disable. |
-| `mask.minTokens` | `400` | Minimum size, exclusive, of a tool result or input string to consider. |
-| `mask.distance` | `20000` | Minimum distance, exclusive, from the end of the request. |
-| `mask.batch` | `10000` | Minimum estimated tokens saved before committing new masks. |
-| `mask.protected` | `skill`, `todowrite`, `todoread`, `task`, `subagent`, `recall` | Tool names never newly masked. Supplying this list replaces the default. Retrieved evidence stays live once recalled. |
+| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. System instructions and tool definitions are excluded. Set `false` to disable. |
 | `memory.budget` | `2000` | Maximum estimated tokens for the complete rendered working state, including headings and references. Target is normally about 1000 or less. Independent of conversation age and model window. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |
 
@@ -142,11 +139,10 @@ budget still applies; a separate model must advertise enough safe input capacity
 
 ## How it works
 
-Before a mask or compaction, original data is saved in OpenCode's plugin
-storage. Old tool results and large input fields can then be replaced with
-short notices. Masks are stored per checkpoint, so a revert restores that
-checkpoint's masks. A batch normally meets `mask.batch`; if one item cannot be
-archived, other successfully archived items can still be masked.
+Compaction is the single elision boundary: the conversation runs raw through
+the round, and only the compaction summary replaces it. Original rows and tool
+calls are saved in OpenCode's plugin storage before the summary replaces them,
+so omitted details return through `recall`.
 
 During compaction, one request produces a replacement working state and a short
 searchable archive note. Only the current objective, standing constraints,
@@ -194,8 +190,8 @@ three minutes. After a failed compaction, the plugin waits three minutes before
 requesting another. Model-window lookups are cached per provider and model.
 Deleting a session removes its archived data.
 
-Forks copy their inherited checkpoint chain, original rows/tool calls, and live
-masks into independent storage. Copied checkpoint IDs are matched against the
+Forks copy their inherited checkpoint chain and original rows/tool calls
+into independent storage. Copied checkpoint IDs are matched against the
 parent's history at the fork boundary. Historical boundaries are reconstructed
 from ordered archive cuts when the parent has compacted or reverted since.
 Episode IDs stay stable; new IDs cannot
@@ -205,7 +201,7 @@ not inherit archives. A parent archive already lost before import cannot be
 reconstructed by the plugin.
 
 Writes are serialized by durable key across host contexts and hot reloads,
-including episode counters, original tool calls, masks and fork imports.
+including episode counters, original tool calls, and fork imports.
 
 Compactions archive only the new cut and its completed parent checkpoint, not
 all prior history again. Fork imports are one-time copies; archive storage still
@@ -247,5 +243,4 @@ and backups accordingly.
 
 From a source checkout, run `npm test` with Node.js 22.18+ (native TypeScript
 type stripping). It builds the shipped entry before running the TypeScript
-tests; `npm run typecheck` checks `src/` under `strict` mode. Golden message
-fixtures used by the tests live in `test/fixtures/`.
+tests; `npm run typecheck` checks `src/` under `strict` mode.

@@ -1,4 +1,4 @@
-import type { ArchivedCall } from "./mask.ts"
+import type { ArchivedCall } from "./tokens.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
 import { formatSpan } from "./time.ts"
 

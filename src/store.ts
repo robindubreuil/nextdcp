@@ -1,4 +1,4 @@
-import { renderMask, type ArchivedCall, type Mask, type MaskPlan } from "./mask.ts"
+import type { ArchivedCall } from "./tokens.ts"
 import { planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 
 // The v2 storage domain accepts JSON; storing serialized records also keeps rows as plain text.
@@ -34,37 +34,10 @@ const archivedCall = (value: unknown, id: string): ArchivedCall => {
       !object(value.result) || typeof value.result.type !== "string" || !("value" in value.result)) throw new Error("Invalid archived call")
   return value as ArchivedCall
 }
-const hasInputStub = (value: unknown): boolean => typeof value === "string"
-  ? value.startsWith("[Input elided to save context:")
-  : Array.isArray(value) ? value.some(hasInputStub) : object(value) ? Object.values(value).some(hasInputStub) : false
-const hasOutputStub = (call: ArchivedCall) => call.result.type === "text" && typeof call.result.value === "string" && call.result.value.startsWith("[Output elided to save context:")
 type Reporter = (message: string, error?: unknown) => void
 const defaultReport: Reporter = (message, error) => {
   const detail = error instanceof Error ? `: ${error.message}` : ""
   console.warn(`[nextdcp] ${message}${detail}`)
-}
-
-function validField(field: unknown): boolean {
-  return object(field) && typeof field.stub === "string" && Array.isArray(field.path) &&
-    field.path.every((part: unknown) => typeof part === "string" || typeof part === "number")
-}
-
-function validMask(mask: unknown): mask is Mask {
-  return object(mask) && typeof mask.id === "string" && typeof mask.name === "string" &&
-    (mask.output === undefined || typeof mask.output === "string") &&
-    (mask.input === undefined || (Array.isArray(mask.input) && mask.input.every(validField)))
-}
-
-function matchesCommittedView(existing: ArchivedCall, call: ArchivedCall, mask: Mask): boolean {
-  const view = renderMask([
-    { content: [{ type: "tool-call", id: existing.id, name: existing.name, input: existing.input }] },
-    { content: [{ type: "tool-result", id: existing.id, name: existing.name, result: existing.result }] },
-  ], [mask])
-  const maskedInput = (view[0].content[0] as { input: unknown }).input
-  const maskedResult = (view[1].content[0] as { result: ArchivedCall["result"] }).result
-  const same = (left: unknown, right: unknown) => encode(left) === encode(right)
-  return (same(existing.input, call.input) || same(maskedInput, call.input)) &&
-    (same(existing.result, call.result) || same(maskedResult, call.result))
 }
 
 // Host contexts wrap the same plugin namespace in different objects. Share locks
@@ -104,7 +77,6 @@ export function rowCalls(row: Row): ArchivedCall[] {
 export function createStore(storage: Storage, sessionID: string, report: Reporter = defaultReport) {
   const root = `sessions/${encodeURIComponent(sessionID)}/`
   const key = (kind: string, id: string) => `${root}${kind}/${encodeURIComponent(id)}`
-  const masksKey = (checkpoint: string | null) => key("masks", checkpoint ?? "root")
   const counterKey = `${root}episode-counter`
   const deferredKey = `${root}deferred-compaction`
   const get = async <T>(name: string) => decode<T>(await storage.get(name), name)
@@ -134,32 +106,17 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     const value = await get<unknown>(key("calls", id))
     return value === undefined ? undefined : archivedCall(value, id)
   }
-  const getMasks = async (checkpoint: string | null = null): Promise<readonly Mask[]> => {
-    const value = await get<unknown>(masksKey(checkpoint))
-    if (value === undefined) return []
-    if (!Array.isArray(value) || !value.every(validMask)) throw new Error("Invalid stored masks")
-    if (new Set(value.map((mask) => mask.id)).size !== value.length) throw new Error("Duplicate stored mask id")
-    return value as Mask[]
-  }
-  const saveCall = async (call: ArchivedCall, checkpoint: string | null = null): Promise<boolean> => {
+  const saveCall = async (call: ArchivedCall): Promise<boolean> => {
     try {
       return await exclusive(key("calls", call.id), async () => {
-        // The first complete original wins; accept only its exact committed elisions.
+        // The first complete original wins.
         const existing = await getCall(call.id)
         if (existing === undefined) {
-          if ((hasInputStub(call.input) || hasOutputStub(call)) && (await getMasks(checkpoint)).some((mask) => mask.id === call.id)) {
-            report(`Missing original for committed mask ${call.id}`)
-            return false
-          }
           archivedCall(JSON.parse(encode(call)), call.id)
           await put(key("calls", call.id), call)
           return true
         }
-        if (existing.name === call.name) {
-          if (encode(existing.input) === encode(call.input) && encode(existing.result) === encode(call.result)) return true
-          const mask = (await getMasks(checkpoint)).find((item) => item.id === call.id)
-          if (mask && matchesCommittedView(existing, call, mask)) return true
-        }
+        if (existing.name === call.name && encode(existing.input) === encode(call.input) && encode(existing.result) === encode(call.result)) return true
         report(`Conflicting archived tool call id ${call.id}; keeping the first original`)
         return false
       })
@@ -168,30 +125,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
       return false
     }
   }
-  const commitMask = (plan: MaskPlan, checkpoint: string | null = null): Promise<{ committed: boolean; masks: readonly Mask[] }> => {
-    if (!plan.commit) return Promise.resolve({ committed: false, masks: plan.base })
-    const name = masksKey(checkpoint)
-    return exclusive(name, async () => {
-      // Another hook may have committed since planning. Re-plan instead of losing masks or
-      // committing a now-subthreshold batch; existing stub bytes must never be rewritten.
-      const current = await getMasks(checkpoint)
-      if (encode(current) !== encode(plan.base)) return { committed: false, masks: current }
-      const accepted = new Set<string>()
-      for (const call of plan.calls) if (await saveCall(call, checkpoint)) accepted.add(call.id)
-      if (!accepted.size) return { committed: false, masks: current }
-      const proposed = new Set(plan.calls.map((call) => call.id))
-      const previous = new Map(plan.base.map((mask) => [mask.id, mask]))
-      // Keep the old mask for a failed call, and commit every successfully archived item.
-      const masks = plan.masks.flatMap((mask) => {
-        if (!proposed.has(mask.id) || accepted.has(mask.id)) return [mask]
-        const old = previous.get(mask.id)
-        return old ? [old] : []
-      })
-      await put(name, masks)
-      return { committed: true, masks }
-    })
-  }
-  const archiveRows = async (rows: readonly Row[], checkpoint: string | null = null): Promise<boolean> => {
+  const archiveRows = async (rows: readonly Row[]): Promise<boolean> => {
     const seen = new Set<string>()
     let complete = true
     for (const row of rows) {
@@ -206,7 +140,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
         complete = false
       }
       try {
-        for (const call of rowCalls(row)) if (!await saveCall(call, checkpoint)) complete = false
+        for (const call of rowCalls(row)) if (!await saveCall(call)) complete = false
       } catch (error) {
         report(`Unable to index calls in row ${row.id}`, error)
         complete = false
@@ -222,7 +156,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     // Historical rows are immutable. Re-save only this cut and its completed parent
     // (which was still running when the preceding cut was archived).
     const needed = new Set([...cut.rowIDs, ...(cut.parent ? [cut.parent] : [])])
-    const complete = await archiveRows(rows.filter((row) => needed.has(row.id)), cut.parent)
+    const complete = await archiveRows(rows.filter((row) => needed.has(row.id)))
     if (!complete) return pending
     const archived = { ...pending, archived: true }
     await put(key("pending", pending.id), archived)
@@ -362,12 +296,6 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
       const call = await source.getCall(id)
       if (call && !await saveCall(call)) throw new Error(`Unable to inherit tool call ${id}`)
     }
-    for (const checkpoint of [null, ...checkpoints]) {
-      const masks = (await source.getMasks(checkpoint)).filter((mask) => calls.has(mask.id))
-      for (const mask of masks) if (!await getCall(mask.id)) throw new Error(`Missing inherited original ${mask.id}`)
-      const target = checkpoint === null ? null : aliases.get(checkpoint) ?? checkpoint
-      if (await storage.get(masksKey(target)) === undefined) await put(masksKey(target), masks)
-    }
     // Reserve above inherited IDs, including episodes hidden by merges/reverts.
     await exclusive(counterKey, async () => {
       const own = await get<number>(counterKey) ?? 0
@@ -403,5 +331,5 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     } while (after !== undefined)
     for (const key of keys) await storage.remove(key)
   }
-  return { getRow, getRows, getCall, getCalls, saveCall, getMasks, commitMask, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, clear }
+  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, clear }
 }

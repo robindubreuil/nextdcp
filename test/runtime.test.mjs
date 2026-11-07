@@ -1025,14 +1025,15 @@ test("deferral defaults to native ask without overriding configured permission r
   } finally { cleanup() }
 })
 
-test("a granted deferral stops new masks and the budget trigger, then catches up after the round", async () => {
-  const h = harness({ idle: false, budget: 6_000, mask: { minTokens: 1, distance: 0, batch: 1 } })
+test("a granted deferral stops the budget trigger, then catches up after the round", async () => {
+  const h = harness({ idle: false, budget: 6_000 })
   const tool = (id) => ({ id: `row-${id}`, type: "assistant", content: [{
     type: "tool", id, name: "read", state: { status: "completed", input: { path: id }, content: [{ type: "text", text: `original ${id} `.repeat(1_000) }] },
   }] })
   h.state.rows = [tool("cold"), user("tail", "y".repeat(8_000))]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
-  assert.equal((await h.store.getMasks()).length, 1, "the cold read is elided before the grant")
+  await setImmediate()
+  assert.equal(h.state.compact, 0, "the first request is still under the budget")
   h.state.rows = [tool("cold"), user("tail", "y".repeat(8_000)), tool("hot"), user("tail2", "z".repeat(24_000))]
   assert.match(await defer(h), /deferred for this round only/)
   assert.equal(h.state.permissions.length, 1)
@@ -1040,17 +1041,12 @@ test("a granted deferral stops new masks and the budget trigger, then catches up
   await h.controller.onContext(request)
   await setImmediate()
   assert.equal(h.state.compact, 0, "the budget trigger is deferred")
-  assert.equal((await h.store.getMasks()).length, 1, "no new elisions while held")
-  assert.equal(await h.store.getCall("hot"), undefined)
-  const cold = request.messages.flatMap((message) => message.content ?? []).find((part) => part.type === "tool-result" && part.id === "cold")
-  assert.match(cold.result.value, /Output elided/, "a committed mask still renders while held")
   assert.match(await defer(h), /deferred for this round only/, "the held round's approval is idempotent")
   assert.equal(h.state.permissions.length, 1)
   await h.controller.onIdle("s")
   await h.controller.onContext(request)
   await setImmediate()
   assert.equal(h.state.compact, 1, "the round ended; the next context pays the trigger")
-  assert.equal((await h.store.getMasks()).length, 2, "new elisions resume after the round")
 })
 
 test("budget: false disables the mid-round trigger, matching idle: false and the deferral notice", async () => {
@@ -1094,6 +1090,69 @@ test("the deferral estimate counts hidden reasoning the same way the response si
   ] }]
   assert.match(await defer(visible), /deferred for this round only/, "the same conversation without hidden reasoning fits")
   assert.equal(visible.state.permissions.length, 1)
+})
+
+test("provider-reported usage calibrates estimates that face model window limits", async () => {
+  const billed = (id, input, cache = { read: 0, write: 0 }) => ({ id, type: "assistant", model,
+    tokens: { input, output: 1, reasoning: 0, cache }, content: [{ type: "text", text: "x".repeat(1_200) }] })
+  // Billed growth of 360 against 300 estimated tokens of the rows in between: scale 1.2.
+  const pair = (cache = { read: 0, write: 0 }) => [billed("a1", 640, cache), { ...billed("a2", 1_000, cache), content: [{ type: "text", text: "" }] }]
+  const h = harness({ idle: false, budget: 600 })
+  h.state.rows = [...pair(), user("u1", "z".repeat(928))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "532 estimated tokens bill like 638 and pass the 600-token budget")
+  const denied = harness({ idle: false, budget: 100 })
+  denied.state.rows = [...pair(), user("u1", "x".repeat(360_000))]
+  assert.match(await defer(denied), /about 108360 estimated tokens, above the grant ceiling of 73446 of the 100000-token window/)
+  assert.equal(denied.state.permissions.length, 0)
+  const flat = harness({ idle: false, budget: 100 })
+  flat.state.rows = [...pair({ read: 260 }), user("u1", "x".repeat(360_000))]
+  assert.match(await defer(flat), /about 108360 estimated tokens/, "cache fields count toward billed growth whether nested or flat")
+  const median = harness({ idle: false, budget: 100 })
+  median.state.rows = [billed("a1", 640), billed("a2", 1_000),
+    { ...billed("a3", 1_420), content: [{ type: "text", text: "" }] }, user("u1", "x".repeat(360_000))]
+  assert.match(await defer(median), /about 126840 estimated tokens/, "two pairs of 1.2 and 1.4 calibrate to the upper median of 1.4")
+})
+
+test("the growth gate converts the budget quarter into the estimator's own units", async () => {
+  const billed = (id, input) => ({ id, type: "assistant", model,
+    tokens: { input, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, content: [{ type: "text", text: "x".repeat(8_000) }] })
+  // Billed growth of 4,000 against 2,000 estimated tokens of the row in between: scale 2.
+  const calibration = [billed("a1", 640), { ...billed("a2", 4_640), content: [{ type: "text", text: "" }] }]
+  const fire = harness({ idle: false, budget: 4_000 })
+  fire.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(2_408))]
+  await fire.controller.onContext({ ...event(), messages: projectHistory(fire.state.rows).messages })
+  await setImmediate()
+  assert.equal(fire.state.compact, 1, "602 estimated tokens bill like 1,204 and reach the gate at 1,000 real tokens of growth")
+  const quiet = harness({ idle: false, budget: 4_000 })
+  quiet.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(1_600))]
+  await quiet.controller.onContext({ ...event(), messages: projectHistory(quiet.state.rows).messages })
+  await setImmediate()
+  assert.equal(quiet.state.compact, 0, "400 estimated tokens bill like 800, under the gate although both cases already pass the budget line")
+})
+
+test("unusable usage data falls back to native chars/4 estimate units", async () => {
+  const usage = { input: 640, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }
+  const billed = (id, tokens) => ({ id, type: "assistant", model, tokens, content: [{ type: "text", text: "x".repeat(1_200) }] })
+  const tail = { id: "a2", type: "assistant", model, tokens: { ...usage, input: 1_000 }, content: [{ type: "text", text: "" }] }
+  const variants = [
+    ["a billed ratio outside the clamp", [billed("a1", usage), { ...tail, tokens: { ...usage, input: 1_540 } }]],
+    ["a model change across the pair", [billed("a1", usage), { ...tail, model: { providerID: "provider", id: "other" } }]],
+    ["a checkpoint across the pair", [billed("a1", usage), native("c1"), tail]],
+    ["rows without provider usage", [user("a1", "x".repeat(1_200)), tail]],
+  ]
+  for (const [name, rows] of variants) {
+    const h = harness({ idle: false, budget: 100 })
+    h.state.rows = [...rows, user("u1", "x".repeat(360_000))]
+    assert.match(await defer(h), /about 90300 estimated tokens, above the grant ceiling of 73446/, name)
+    assert.equal(h.state.permissions.length, 0, name)
+    const trigger = harness({ idle: false, budget: 600 })
+    trigger.state.rows = [...rows, user("u1", "z".repeat(928))]
+    await trigger.controller.onContext({ ...event(), messages: projectHistory(trigger.state.rows).messages })
+    await setImmediate()
+    assert.equal(trigger.state.compact, 0, name)
+  }
 })
 
 test("an unknown window announces its disabled budget trigger instead of failing silently", async (t) => {
@@ -1306,99 +1365,6 @@ test("model window lookups are cached by provider and model, and missing models 
   assert.equal(lookups, 5)
 })
 
-test("one unarchivable call does not prevent other masks from being committed", async (t) => {
-  const warnings = []
-  t.mock.method(console, "warn", (message) => warnings.push(message))
-  const h = harness({ idle: false, budget: 1_000_000, mask: { minTokens: 1, distance: 0, batch: 1 } })
-  const tool = (id) => ({
-    id: `row-${id}`, type: "assistant", content: [{
-      type: "tool", id, name: "read", state: { status: "completed", input: { path: id }, content: [{ type: "text", text: `original ${id} `.repeat(1_000) }] },
-    }],
-  })
-  h.state.rows = [tool("good"), tool("bad"), user("tail", "next")]
-  h.storage.fail = (key) => key.endsWith("/calls/bad")
-  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
-  await h.controller.onContext(request)
-  const results = request.messages.flatMap((message) => message.content).filter((part) => part.type === "tool-result")
-  assert.match(results.find((part) => part.id === "good").result.value, /Output elided/)
-  assert.match(results.find((part) => part.id === "bad").result.value, /^original bad /)
-  assert.deepEqual((await h.store.getMasks()).map((mask) => mask.id), ["good"])
-  assert.ok(await h.store.getCall("good"))
-  assert.equal(await h.store.getCall("bad"), undefined)
-  assert.ok(warnings.some((message) => message.includes("bad")))
-})
-
-test("mask cache follows checkpoints and restores earlier masks after revert", async () => {
-  const h = harness({ idle: false, budget: 1_000_000, mask: { minTokens: 1, distance: 0, batch: 1 } })
-  const tool = (id) => ({
-    id: `row-${id}`, type: "assistant", content: [{
-      type: "tool", id, name: "read", state: { status: "completed", input: { path: id }, content: [{ type: "text", text: `content ${id} `.repeat(1_000) }] },
-    }],
-  })
-  h.state.rows = [tool("root-call"), user("root-tail", "next")]
-  const rootRaw = projectHistory(h.state.rows).messages
-  const rootRequest = { ...event(), messages: structuredClone(rootRaw) }
-  await h.controller.onContext(rootRequest)
-  const rootView = JSON.stringify(rootRequest.messages)
-  assert.match(rootView, /Output elided/)
-  const rootReads = h.storage.reads.filter((key) => key.endsWith("/masks/root")).length
-  for (let i = 0; i < 2; i++) {
-    const generate = { ...event(), messages: structuredClone(rootRaw) }
-    await h.controller.onGenerate(generate)
-    assert.equal(JSON.stringify(generate.messages), rootView)
-  }
-  assert.equal(h.storage.reads.filter((key) => key.endsWith("/masks/root")).length, rootReads)
-
-  h.state.rows = [native("c1"), tool("checkpoint-call"), user("checkpoint-tail", "next")]
-  const checkpointRaw = projectHistory(h.state.rows).messages
-  const checkpointRequest = { ...event(), messages: structuredClone(checkpointRaw) }
-  await h.controller.onContext(checkpointRequest)
-  const checkpointView = JSON.stringify(checkpointRequest.messages)
-  assert.match(checkpointView, /Output elided/)
-  assert.deepEqual((await h.store.getMasks("c1")).map((mask) => mask.id), ["checkpoint-call"])
-  assert.deepEqual((await h.store.getMasks()).map((mask) => mask.id), ["root-call"])
-
-  h.state.rows = [native("c2")]
-  const after = { ...event(), messages: structuredClone(checkpointRaw) }
-  await h.controller.onGenerate(after)
-  assert.equal(JSON.stringify(after.messages), JSON.stringify(checkpointRaw))
-  h.state.rows = [native("c1"), tool("checkpoint-call"), user("checkpoint-tail", "next")]
-  const reverted = { ...event(), messages: structuredClone(checkpointRaw) }
-  await h.controller.onGenerate(reverted)
-  assert.equal(JSON.stringify(reverted.messages), checkpointView)
-  h.state.rows = [tool("root-call"), user("root-tail", "next")]
-  const rootRevert = { ...event(), messages: structuredClone(rootRaw) }
-  await h.controller.onGenerate(rootRevert)
-  assert.equal(JSON.stringify(rootRevert.messages), rootView)
-})
-
-test("context archives and commits masks before rendering; generate reuses the same bytes", async () => {
-  const h = harness({ budget: 1, mask: { minTokens: 10, distance: 0, batch: 1 } })
-  const output = "hiddenoutputneedle " + "output ".repeat(4_000)
-  const input = { path: "visiblepath", content: "hiddeninputneedle " + "input ".repeat(4_000) }
-  h.state.rows = [{ id: "a1", type: "assistant", content: [
-    { type: "reasoning", text: "reasoning stays" },
-    { type: "tool", id: "call-1", name: "write", state: { status: "completed", input, content: [{ type: "text", text: output }] } },
-  ] }, user("u1", "a later message")]
-  const raw = projectHistory(h.state.rows).messages, context = { ...event(), messages: raw }
-  await h.controller.onContext(context)
-  await setImmediate()
-  assert.equal(h.state.compact, 1)
-  assert.match(JSON.stringify(context.messages), /Input elided to save context/)
-  assert.match(JSON.stringify(context.messages), /Output elided to save context/)
-  assert.deepEqual((await h.store.getCall("call-1")).input, input)
-  assert.equal((await h.store.getCall("call-1")).result.value, output)
-  assert.ok(h.storage.writes.findIndex(({ key }) => key.endsWith("/calls/call-1")) < h.storage.writes.findIndex(({ key }) => key.endsWith("/masks/root")))
-  const count = h.storage.writes.length, generation = { ...event(), messages: raw }
-  await h.controller.onGenerate(generation)
-  assert.equal(JSON.stringify(generation.messages), JSON.stringify(context.messages))
-  assert.equal(h.storage.writes.length, count)
-  const hit = await h.controller.recall("s", { query: "hiddenoutputneedle", layer: "tools" })
-  assert.match(hit, /recall call-1 page \d+/)
-  assert.match(await h.controller.recall("s", { id: "call-1" }), /hiddeninputneedle/)
-  assert.match(await h.controller.recall("s", { query: "later" }), /No matching/)
-})
-
 test("native precompute and encrypted fallback leave native in control", async () => {
   const h = harness()
   h.state.rows = [user("u1", "precomputed archive"), { id: "a1", type: "assistant", content: [
@@ -1425,7 +1391,7 @@ test("a host without the permission surface keeps recall and core hooks alive", 
   const h = harness()
   h.ctx.permission = undefined
   await install(h.ctx)
-  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "generate", "compaction"], "core hooks register regardless of the experimental surface")
+  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction"], "core hooks register regardless of the experimental surface")
   assert.ok(h.state.tools.has("recall"))
   assert.ok(!h.state.tools.has("defer_compaction"), "the deferral gate is omitted instead of half-registered")
   assert.ok(warnings.some((text) => text.includes("lacks the permission surface")), "the omission is announced")
@@ -1433,7 +1399,7 @@ test("a host without the permission surface keeps recall and core hooks alive", 
   const broken = harness()
   broken.ctx.agent.transform = async () => { throw new Error("experimental surface changed") }
   await install(broken.ctx)
-  assert.deepEqual([...broken.state.hooks.keys()], ["prompt", "context", "generate", "compaction"])
+  assert.deepEqual([...broken.state.hooks.keys()], ["prompt", "context", "compaction"])
   assert.ok(broken.state.tools.has("recall"))
   assert.ok(!broken.state.tools.has("defer_compaction"))
   assert.ok(warnings.some((text) => text.includes("defer_compaction registration failed")), "a broken experimental registration cannot take the core down")
@@ -1457,7 +1423,7 @@ test("setup registers success-only idle events and clears the subscription", asy
   }
   const cleanup = await setup(h.ctx)
   await setImmediate()
-  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "generate", "compaction"])
+  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction"])
   assert.deepEqual(subscribed, ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"])
   assert.equal(h.state.tool.name, "recall")
   assert.equal(h.state.tool.description, RECALL_DESCRIPTION)

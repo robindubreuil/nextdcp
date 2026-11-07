@@ -61,7 +61,7 @@ export function resolveMemory(current: string | null, records: ReadonlyMap<strin
   return { episodes, catalog, working: latest?.working, through: latest?.episode.id }
 }
 
-/** Only the latest working state is visible; without one, adopted native summaries render as the episode chain. */
+/** Only the latest working state is visible; without one, adopted native summaries render as the bounded episode chain. */
 export function renderHandoff(memory: ReturnType<typeof resolveMemory>): string {
   const gap = [...memory.catalog.values()].some((episode) => episode.gap)
   const title = memory.through ? episodeNote(memory.catalog.get(memory.through)?.summary ?? "").title : undefined
@@ -80,11 +80,14 @@ export function archiveAnchor(episodes: readonly Episode[]): Anchor | undefined 
   return { count: episodes.length, first: name(episodes[0]), last: name(episodes[episodes.length - 1]), ...(span ? { span } : {}) }
 }
 
+/** Without a working state the episode chain stands in for it, bounded the same way:
+ *  older episodes keep only their headings and titles, and the latest note stays whole,
+ *  so accumulating native summaries cannot blow past the memory budget. */
 export function renderMemory(episodes: readonly Episode[]): string {
-  return episodes.map((episode) => {
+  return episodes.map((episode, index) => {
     const { title, body } = episodeNote(episode.summary)
     const heading = `## Episode ${episode.id}${title ? ` — ${title}` : ""}${episode.native ? " (native)" : ""}${episode.gap ? " (recall gap: some raw history was not archived)" : ""}`
-    return body ? `${heading}\n${body}` : heading
+    return body && index === episodes.length - 1 ? `${heading}\n${body}` : heading
   }).join("\n\n")
 }
 
