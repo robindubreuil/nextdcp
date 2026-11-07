@@ -220,10 +220,13 @@ and backups accordingly.
 - Individual archive failures are logged and skipped; other items are saved
   and the episode is marked with a recall gap. Conflicting tool-call IDs keep
   the first archived original. Failure to save essential checkpoint metadata
-  or generate a valid bounded handoff falls back to native compaction.
-- The memory budget is checked against the entire rendered state. Invalid or
-  oversized responses get at most one repair attempt; constraints are never
-  truncated to make the budget pass. A native fallback is a reported exception
+  or produce a valid handoff falls back to native compaction.
+- The memory budget is checked against the entire rendered state, and every
+  failed attempt gets at most one repair that carries the exact validation
+  failure. Constraints are never truncated to make the budget pass. A valid
+  but over-budget handoff commits as the shortest valid artifact, disclosed
+  by a warning, rather than falling back to native; native compaction takes
+  over only when no valid handoff was produced, and is a reported exception
   to the plugin's memory budget, not a secretly successful bounded checkpoint.
 - Standing constraints survive accidental model omission. Removing one requires
   a cited new user row and a verbatim quote from it. Task-local requirements
