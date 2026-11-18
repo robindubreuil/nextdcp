@@ -132,7 +132,14 @@ When a compaction fires (native trigger, or the deferred / hard-budget triggers)
    cold archive note together, covering all messages after the previous checkpoint
    row — including the tail native compaction will keep. The boundaries are then
    unambiguous ("everything after the checkpoint"), so no message has to be quoted
-   to mark them. The tail appears both in this episode and verbatim in the new
+   to mark them. When the prior working state is structured, this same request runs
+   in **patch mode**: the model returns only changed fields of `working` (present
+   fields replace entirely; omitted fields carry forward unchanged), and the patch
+   is validated as the merged whole — same schema, reference, and budget checks as
+   a full regeneration — so output tokens scale with what changed, not with state
+   size. An invalid or over-budget patch falls back to exactly one fresh full
+   regeneration, never a blind retry. The tail appears both in this episode and
+   verbatim in the new
    checkpoint's recent context; the next episode starts after the new checkpoint
    row, so episodes never overlap and never leave gaps. Episode notes are fixed and
    dense: a `Title:` line, task and outcome, exact paths/symbols/error strings and
@@ -284,6 +291,19 @@ transcripts and originals are cached in memory (bounded LRU), and the assembled
 corpus is cached per checkpoint: a warm query rescans nothing, and the next
 compaction — the only mutation that can change it — rebuilds it fresh.
 
+**Graduated notes** (v0.10) extend the corpus past the session's death. Deleting a
+session first graduates its committed episode notes into `project/episodes/P<n>`
+— notes only, deduplicated by exact text so fork copies never land twice, numbered
+above the highest existing `P<n>`, capped at the 200 most recent. Raw transcripts
+and calls die with the session; the note becomes the fetchable original, returned
+whole with a provenance header (source session, age). Graduated notes join only
+unfiltered `full` search — they have no layer home — and carry a linear 30-day
+recency boost that re-ranks equal term matches (fresh experience over stale
+advice) but cannot rescue a zero match: BM25 stays the gatekeeper. The session
+catalog is unchanged: `P` entries never appear in it. Subagent sessions never
+graduate (their findings return via the delegation summary); corrupt records are
+skipped individually; a graduation failure reports and never blocks the deletion.
+
 #### Content and privacy
 
 Media stays native: return text plus file content parts on the page containing each
@@ -344,7 +364,8 @@ one model-requested:
   tokens with chars/4, excluding system instructions and tool definitions, and
   calibrate the estimate toward real tokens against provider-reported usage from
   recent completed requests (native chars/4 units apply until a usable pair of
-  usage-bearing rows exists). Above `budget` (default `min(50% window, 100k)`),
+  usage-bearing rows exists). Above `budget` (default adaptive, see the
+  thermostat below; initial value `min(50% window, 100k)`),
   compact when growth since the checkpoint is at least `min(idle, budget / 4)`.
   A live-round crossing first opens the **budget gate**: compaction pauses one
   evaluation step while an automated notice — numbers only; options continue
@@ -362,6 +383,18 @@ one model-requested:
   round, and refused politely while a compaction runs or a revert is staged.
   Its optional `keep` line rides the same hint channel as a queued prompt:
   relevance evidence for the working state, never instructions.
+- **Budget thermostat (v0.10).** The auto `budget` is learned per **main model**
+  from recall pressure. Recall executions are counted per **cycle** (one committed
+  handoff to the next) and folded into an EMA (α = 0.5) persisted at
+  `project/thermostat` under `provider/id`, shared by every session of the project
+  instance. At each committed cut, with at least four completed cycles of
+  evidence, EMA ≥ 2.0 raises the budget ×1.2 and EMA ≤ 0.5 lowers it ×0.9 — at
+  most one step per cycle, clamped to `[30k, window × 0.5]`, starting from
+  `min(window × 0.5, 100k)`. A model that keeps recalling after cuts earns a
+  larger live budget; a model that never recalls pays for less context. An
+  explicit `options.budget` wins absolutely (evidence still accumulates);
+  subagent sessions and unknown windows never feed the loop; every thermostat
+  failure reports and falls back to the static default.
 - Both triggers share one per-session admission guard. The context hook is
   fire-and-forget; concurrent prompt hooks share and await the admission promise
   so none race ahead of the compaction control. Errors are caught. The guard
@@ -373,7 +406,8 @@ one model-requested:
   cached by provider and model. Gate, deferral and checkpoint outcomes are
   counted per session in a `gate-stats` storage key — telemetry only, never a
   trigger input; a failed count is reported and swallowed. On
-  `session.deleted`, the session's storage keys
+  `session.deleted`, the session's episode notes graduate into the project
+  archive (see above), then the session's storage keys
   (including the deferred marker) and in-memory state are removed.
 - **Cost reasoning:** with caching, every step pays cache-read price × context
   size, so a smaller steady-state context is a direct saving. Rewrites happen
@@ -384,6 +418,13 @@ one model-requested:
 
 ### Possible later
 
+- The thermostat hears only recall pressure. A model starved by too small a
+  budget can instead **redo** elided tool calls (re-reads, re-runs) — silent to
+  the loop and even rewarded with further ×0.9 steps. The honest signal would be
+  a re-execution ratio — the same tool and input reappearing in post-cut growth
+  when an identical archived call exists pre-cut — folded into the same EMA as
+  upward pressure. Ambiguous for reads (re-reading a changed file is correct),
+  so it would need per-tool weighting; deliberately not in v0.10.
 - A `/memory` command (list episodes, stats) and a TUI panel through RPC.
 - A per-checkpoint memo of the token accounting: `messageTokens` runs on every
   context event at live sizes (~1,900 rows). Fine at current sizes; cache per

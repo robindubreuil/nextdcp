@@ -1,7 +1,8 @@
 # nextdcp
 
 Bounded task-focused working memory, on-demand `recall`, a budget gate with
-`checkpoint_now`, and user-approved round-scoped compaction deferral for
+`checkpoint_now`, an adaptive compaction budget, project-lifetime graduated
+notes, and user-approved round-scoped compaction deferral for
 OpenCode V2 (**v2.2.5+**). The host supplies
 `@opencode/plugin`; the declared
 peer range is `>=2.2.5 <3`. There are no additional runtime dependencies. The
@@ -117,6 +118,39 @@ compacts silently, as before. A round that ends before its next build repays
 the consumed crossing immediately. Gate, deferral, and checkpoint outcomes are
 counted per session in plugin storage; deleting the session removes them.
 
+## Adaptive budget
+
+The `budget` threshold is learned per **main model** from how hard the model
+leans on `recall` after cuts. Recall executions are counted per cycle (one
+committed checkpoint to the next) and folded into an exponential moving
+average, persisted per model in plugin storage and shared by every session of
+the project. Once at least four cycles of evidence exist:
+
+- EMA ≥ 2 recalls per cycle raises the budget 20% — a model that keeps
+  fetching back what cuts removed earns a larger live budget.
+- EMA ≤ 0.5 lowers it 10% — a model that never recalls pays for less context.
+
+At most one step per cycle, always clamped to `[30k, window × 0.5]`, starting
+from `min(window × 0.5, 100k)`. An explicit `budget` option wins absolutely
+(evidence still accumulates); subagent sessions and unknown model windows
+never feed the loop; every thermostat failure reports and falls back to the
+static default. The signal is deliberately conservative: only recall pressure
+is measured, and a model that silently redoes elided tool calls instead of
+recalling is invisible to it.
+
+## Graduated notes
+
+Deleting a session first graduates its committed episode notes into a
+project-lifetime archive (`project/episodes/P<n>`): notes only, deduplicated
+by exact text so fork copies never land twice, capped at the 200 most recent.
+Raw transcripts and tool calls die with the session — the note becomes the
+fetchable original. A fresh session finds them through `recall` two ways:
+`recall P12` returns the whole note with its provenance (source session,
+age), and full-layer queries search them alongside live archive evidence,
+with a 30-day recency boost so fresh experience outranks stale advice on
+equal term matches. Graduated notes never appear in the episode catalog, and
+subagent sessions never graduate.
+
 ## Defer compaction for one round
 
 For work that genuinely needs unusually large simultaneous context, the model can
@@ -156,7 +190,7 @@ from recent completed requests; without such usage the raw estimate applies.
 | Option | Default | Meaning |
 |---|---:|---|
 | `idle` | `25000` | After a successful turn with this much new conversation, compact on the **next prompt**, not while idle. Set `false` to disable. Subagent sessions are ignored. |
-| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. A live-round crossing first opens the budget gate. System instructions and tool definitions are excluded. Set `false` to disable. |
+| `budget` | adaptive per model (initial `min(50% of model window, 100000)`) | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. The default is learned per main model from recall pressure — see [Adaptive budget](#adaptive-budget); bounds `[30000, 50% of model window]`. A live-round crossing first opens the budget gate. System instructions and tool definitions are excluded. Set `false` to disable. |
 | `notice` | `tail` | Placement of the budget-gate notice: `tail` appends it as the final conversation message (no cached-prefix churn); `system` uses a system part for providers that drop trailing messages. |
 | `memory.budget` | `2000` | Maximum estimated tokens for the complete rendered working state, including headings and references. Target is normally about 1000 or less. Independent of conversation age and model window. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |
@@ -173,7 +207,11 @@ calls are saved in OpenCode's plugin storage before the summary replaces them,
 so omitted details return through `recall`.
 
 During compaction, one request produces a replacement working state and a short
-searchable archive note. Only the current objective, standing constraints,
+searchable archive note. When the prior working state is structured, that request
+runs in **patch mode** — the model returns only changed fields, validated as the
+merged whole under the same schema and budget checks — so generation cost scales
+with what changed, not with state size; an invalid patch falls back to one fresh
+full regeneration. Only the current objective, standing constraints,
 relevant verified state, unfinished work, and at most three evidence references
 are kept visible. Completed work is archived, not appended to the handoff.
 No topic classifier, observer model, embedding service, or merge request runs.
@@ -217,7 +255,9 @@ per-session compaction guard clears on completion, failure, rejected
 admission, a later successful execution with no compaction running, or after
 three minutes. After a failed compaction, the plugin waits three minutes before
 requesting another. Model-window lookups are cached per provider and model.
-Deleting a session removes its archived data and gate counters.
+Deleting a session graduates its episode notes into the project archive (see
+[Graduated notes](#graduated-notes)) and removes its archived data and gate
+counters.
 
 Forks copy their inherited checkpoint chain and original rows/tool calls
 into independent storage. Copied checkpoint IDs are matched against the
