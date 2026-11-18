@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { adoptNative, resolveMemory } from "../src/memory.ts"
-import { createStore } from "../src/store.ts"
+import { createProjectStore, createStore } from "../src/store.ts"
 
 class MemoryStorage {
   values = new Map()
@@ -285,4 +285,67 @@ test("clear removes the whole session root, including keys written outside the s
   kv.values.set("sessions/other/rows/r9", "{}")
   await store.clear()
   assert.deepEqual([...kv.values.keys()], ["sessions/other/rows/r9"], "the session root is gone; other sessions survive")
+})
+
+// Graduation: episode notes outlive their session at project/episodes/P<n>.
+
+test("graduatedNotes drops corrupt records and reads what graduate wrote", async () => {
+  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  assert.deepEqual(await project.graduatedNotes(), [])
+  assert.equal(await project.graduate([{ note: "Title: Auth fix\nWork: rotated the client secret", end: 1_000 }, { note: "", end: 2_000 }], "ses_aaa"), 1, "empty notes never graduate")
+  kv.values.set("project/episodes/P9", "not json{")
+  kv.values.set("project/episodes/P10", JSON.stringify({ id: "P10", note: "valid note", session: "ses_bbb", end: 3_000 }))
+  kv.values.set("project/episodes/P11", JSON.stringify({ id: "P11", note: "no session", end: 3_000 }))
+  const notes = await project.graduatedNotes()
+  assert.deepEqual(notes.map(({ id }) => id).sort(), ["P1", "P10"], "corrupt records are skipped, valid ones kept")
+})
+
+test("graduate dedups exact text across sessions and sequences P<n> above the highest existing", async () => {
+  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  assert.equal(await project.graduate([{ note: "note one", end: 10 }, { note: "note one", end: 20 }], "ses_a"), 1, "an exact duplicate within one batch graduates once")
+  assert.equal(await project.graduate([{ note: "note one", end: 30 }], "ses_b"), 0, "fork copies across sessions never graduate twice")
+  assert.equal(await project.graduate([{ note: "note two", end: 40 }, { note: "note three", end: 50 }], "ses_b"), 2)
+  const notes = await project.graduatedNotes()
+  assert.deepEqual(notes.map(({ id, note, session }) => [id, note, session]).sort(([a], [b]) => a < b ? -1 : 1), [
+    ["P1", "note one", "ses_a"],
+    ["P2", "note two", "ses_b"],
+    ["P3", "note three", "ses_b"],
+  ])
+  kv.values.set("project/episodes/P40", JSON.stringify({ id: "P40", note: "planted high", session: "ses_z", end: 60 }))
+  assert.equal(await project.graduate([{ note: "note four", end: 70 }], "ses_c"), 1)
+  assert.ok(kv.values.has("project/episodes/P41"), "numbering continues above the highest existing P<n>")
+})
+
+test("graduate keeps the 200 most recent notes and removes overflow oldest first", async () => {
+  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  const batch = Array.from({ length: 205 }, (_, index) => ({ note: `note ${index}`, end: index }))
+  assert.equal(await project.graduate(batch, "ses_a"), 205)
+  const notes = await project.graduatedNotes()
+  assert.equal(notes.length, 200, "the cap holds")
+  assert.deepEqual(notes.map(({ end }) => end).sort((a, b) => a - b), Array.from({ length: 200 }, (_, index) => index + 5), "the five oldest were removed")
+})
+
+test("graduation storage failures report and never throw", async () => {
+  const kv = new MemoryStorage(), reported = []
+  const project = createProjectStore(kv, (message) => reported.push(message))
+  kv.fail = (key) => key.startsWith("project/episodes/")
+  assert.equal(await project.graduate([{ note: "note", end: 1 }], "ses_a"), 0)
+  assert.equal(reported.length, 1)
+  assert.ok(String(reported[0]).includes("graduate session notes"))
+  kv.fail = () => false
+  assert.equal(await project.graduate([{ note: "note", end: 1 }], "ses_a"), 1, "the next graduation self-heals")
+})
+
+test("episodeNotes returns every committed episode's note with an end-time fallback", async () => {
+  const kv = new MemoryStorage(), store = createStore(kv, "session/s")
+  const checkpoint = (id, summary) => ({ id, parent: null, rowIDs: [], episode: { id, summary, rowIDs: [] } })
+  await store.saveCheckpoint(checkpoint("e1", "Title: First\nWork: one"))
+  await store.saveCheckpoint(checkpoint("e2", "Title: Second\nWork: two"))
+  await store.saveCheckpoint({ ...checkpoint("e3", "Title: Third\nWork: three"), episode: { id: "e3", summary: "Title: Third\nWork: three", rowIDs: [], end: 4_500 } })
+  await kv.set("sessions/s/checkpoints/broken", "{not json")
+  const before = Date.now()
+  const notes = await store.episodeNotes()
+  assert.deepEqual(notes.map(({ note }) => note).sort(), ["First\nWork: one", "Second\nWork: two", "Third\nWork: three"], "the Title: prefix is consumed, as in every other note surface")
+  assert.equal(notes.find(({ note }) => note.includes("Third")).end, 4_500)
+  assert.ok(notes.every(({ end }) => end === 4_500 || end >= before), "a missing end falls back to now")
 })

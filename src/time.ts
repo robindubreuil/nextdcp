@@ -40,6 +40,13 @@ export function formatDuration(ms: number): string {
   return months > 0 ? `${years}y ${months}mo` : `${years}y`
 }
 
+/** Graduated notes decay in ranking over about a month: fresh experience outranks
+ *  stale advice at equal term scores, without touching BM25 itself. */
+export const RECENCY_SPAN_MS = 30 * DAY
+export function recencyBoost(end: number, now = Date.now()): number {
+  return Math.min(1, Math.max(0, 1 - (now - end) / RECENCY_SPAN_MS))
+}
+
 const pad = (value: number, width: number) => String(value).padStart(width, "0")
 
 type Fields = { readonly year: string; readonly month: string; readonly day: string; readonly hour: string; readonly minute: string }

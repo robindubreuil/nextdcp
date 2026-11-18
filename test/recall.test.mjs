@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, TAG_INPUT_CHARS, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
-import { formatSpan } from "../src/time.ts"
+import { address, formatCall, formatCatalog, formatCatalogEntry, formatGraduated, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, TAG_INPUT_CHARS, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
+import { formatSpan, recencyBoost } from "../src/time.ts"
 
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
   const documents = [
@@ -531,4 +531,30 @@ test("formatCall marks a recall original's output as an echo, never its input", 
   const plain = []
   formatCall({ id: "call-1", name: "read", input: {}, result: { type: "text", value: output } }, [], plain)
   assert.deepEqual(plain, [], "only recall outputs are echoes")
+})
+
+test("a document's boost re-ranks equal matches but never rescues a zero match, and graduated carries onto hits", () => {
+  const documents = [
+    { id: "E1", text: "needle alpha", graduated: { session: "ses_old", end: 1_000 } },
+    { id: "E2", text: "needle beta", boost: 2 },
+  ]
+  const hits = search("needle", documents)
+  assert.deepEqual(hits.map((hit) => hit.id), ["E2", "E1"], "the boosted twin outranks the equal match")
+  assert.equal(hits[1].score * 2, hits[0].score)
+  assert.deepEqual(hits[1].graduated, { session: "ses_old", end: 1_000 }, "graduated provenance rides the hit")
+  assert.deepEqual(search("absent", [{ id: "E3", text: "needle", boost: 100 }]), [], "boost cannot create a match")
+})
+
+test("recencyBoost decays linearly to zero over thirty days", () => {
+  const now = Date.now(), day = 24 * 60 * 60 * 1_000
+  assert.equal(recencyBoost(now, now), 1)
+  assert.equal(recencyBoost(now - 15 * day, now), 0.5)
+  assert.equal(recencyBoost(now - 30 * day, now), 0)
+  assert.equal(recencyBoost(now - 40 * day, now), 0, "stale notes never go negative")
+  assert.equal(recencyBoost(now + day, now), 1, "a future end clamps to one")
+})
+
+test("formatGraduated renders the provenance header and the whole note text", () => {
+  const rendered = formatGraduated({ id: "P7", note: "First\nWork: rotated the secret", session: "ses_0123456789abcdef", end: 1_000 }, 61_000)
+  assert.equal(rendered, "Graduated session note P7 (from session ses_01234567, 1m ago)\nFirst\nWork: rotated the secret")
 })

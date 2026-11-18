@@ -1,6 +1,6 @@
 import type { ArchivedCall } from "./tokens.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
-import { formatSpan } from "./time.ts"
+import { formatDuration, formatSpan } from "./time.ts"
 import { object } from "./guards.ts"
 
 /** The depth within a chapter (episode) to read or search. `conversation` is the default everywhere. */
@@ -13,10 +13,15 @@ export type SearchDocument = {
   readonly layer?: "conversation" | "tools"
   /** An archive-note doc (a label, not content): a pointer hit surfaced only in unfiltered search. */
   readonly note?: boolean
+  /** A multiplicative score prior (default 1), applied after BM25 — e.g. the recency
+   *  decay of graduated notes. It re-ranks; it cannot rescue a zero match. */
+  readonly boost?: number
+  /** A graduated project note's provenance: carried onto the hit for its label. */
+  readonly graduated?: { readonly session: string; readonly end: number }
   readonly echoes?: readonly (readonly [number, number])[]
 }
 type Location = { readonly id: string; readonly page: number }
-export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly also?: readonly Location[] }
+export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly graduated?: { readonly session: string; readonly end: number }; readonly also?: readonly Location[] }
 export const RECALL_PAGE_CHARS = 6_000
 /** Whole-original recall returns up to five pages in one call; only larger originals page. */
 export const RECALL_ALL_CHARS = 5 * RECALL_PAGE_CHARS
@@ -65,7 +70,7 @@ export function search(query: string, documents: readonly SearchDocument[], limi
   const corpus = homes.flatMap((document) => {
     const bounds = pageBounds(document.text, RECALL_PAGE_CHARS)
     const pages = bounds.slice(1).map((_, index) => ({ id: document.id, page: index + 1, text: document.text,
-      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note }))
+      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note, boost: document.boost ?? 1, graduated: document.graduated }))
     let page = 0
     const echoes = document.echoes ?? []
     let echo = 0
@@ -87,7 +92,7 @@ export function search(query: string, documents: readonly SearchDocument[], limi
   }))
   const k = 1.2, b = 0.75
   type Draft = { readonly hit: SearchHit; readonly core: string; readonly size: number }
-  const drafts = corpus.flatMap(({ id, page, text, parsed, counts, note }): Draft[] => {
+  const drafts = corpus.flatMap(({ id, page, text, parsed, counts, note, boost, graduated }): Draft[] => {
     let score = 0
     for (const term of terms) {
       const count = counts.get(term) ?? 0
@@ -122,7 +127,7 @@ export function search(query: string, documents: readonly SearchDocument[], limi
     }
     // The matched core is what identifies the evidence; its surroundings differ per transcript.
     const core = words(text.slice(index, end)).map((word) => word.text)
-    return [{ hit: { id, page, score, snippet: snippet(text, index), ...(note ? { note: true } : {}) }, core: core.join(" "), size: core.length }]
+    return [{ hit: { id, page, score: score * boost, snippet: snippet(text, index), ...(note ? { note: true } : {}), ...(graduated ? { graduated } : {}) }, core: core.join(" "), size: core.length }]
   })
   drafts.sort((a, b) => b.hit.score - a.hit.score || (a.hit.id < b.hit.id ? -1 : a.hit.id > b.hit.id ? 1 : a.hit.page - b.hit.page))
   // Repeated reads of one region come back as near-identical excerpts across episodes. Collapse
@@ -356,6 +361,12 @@ export function formatRow(raw: string, resolve?: Resolve): string {
   } catch {
     return "[Invalid archived row; recall gap]"
   }
+}
+
+/** Render one graduated project note as its own fetchable original: the note is all
+ *  that outlived the session, with its provenance as the header. */
+export function formatGraduated(note: { readonly id: string; readonly note: string; readonly session: string; readonly end: number }, now = Date.now()): string {
+  return `Graduated session note ${note.id} (from session ${shortId(note.session)}, ${formatDuration(Math.max(0, now - note.end))} ago)\n${note.note}`
 }
 
 export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }

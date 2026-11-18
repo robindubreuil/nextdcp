@@ -5,9 +5,10 @@ import { messageTokens, type ArchivedCall, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { budgetGateNotice, CHECKPOINT_NOW_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { budgetFailure, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, measureWorking, parseHandoff, parsePatchHandoff, type Handoff } from "./working.ts"
-import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
-import { createStore, createProjectStore, exclusive, type GateStats } from "./store.ts"
+import { address, formatCall, formatCatalog, formatCatalogEntry, formatGraduated, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
+import { createStore, createProjectStore, exclusive, type GraduatedNote, type GateStats } from "./store.ts"
 import { budgetBounds, effectiveBudget, type ThermostatEntry } from "./thermostat.ts"
+import { formatDuration, recencyBoost } from "./time.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 import { object, positive, modelRef } from "./guards.ts"
@@ -46,6 +47,9 @@ type SessionState = {
   model?: ModelRef
   /** Recall executions since the last committed handoff: one thermostat cycle's evidence. */
   recalls?: number
+  /** Stamped at the first session read: subagent sessions never feed the thermostat
+   *  or graduate notes; their findings return via the delegation summary. */
+  subagent?: boolean
 }
 const sameRound = (round: Round | undefined, info: { time?: { busy?: number; idle?: number } }): boolean =>
   round !== undefined && round.busy === info.time?.busy && round.idle === info.time?.idle
@@ -94,6 +98,10 @@ export function createController(ctx: Plugin.Context) {
   }
   const storeFor = (id: string) => createStore(ctx.storage, id, warn)
   const project = createProjectStore(ctx.storage, warn)
+  // Graduated notes change only when a session is deleted, so they are read once per
+  // controller lifetime and invalidated at graduation: warm queries rescan nothing.
+  let graduatedCache: GraduatedNote[] | undefined
+  const readGraduated = async (): Promise<GraduatedNote[]> => graduatedCache ??= await project.graduatedNotes()
   // Learned entries are read once per model per controller lifetime and refreshed
   // when a cycle closes; the clamp against the live window runs on every use.
   const thermostatEntries = new Map<string, ThermostatEntry>()
@@ -137,6 +145,7 @@ export function createController(ctx: Plugin.Context) {
     const work = (async () => {
       if (await storeFor(sessionID).hasInherited()) return
       const info = await ctx.session.get({ sessionID })
+      state(sessionID).subagent = !!info.parentID && !info.fork
       if (!info.fork) return // parentID alone denotes a subagent, not a fork.
       const source = await ctx.session.context({ sessionID: info.fork.sessionID })
       const snapshot = await storeFor(info.fork.sessionID).forkSnapshot(info.fork.boundary, source)
@@ -561,12 +570,22 @@ export function createController(ctx: Plugin.Context) {
   }
   const onDeleted = async (sessionID: string) => {
     clearGuard(sessionID)
+    // Graduate before the state and archive go: the episode notes outlive the session.
+    // A subagent never graduates (it would flood; findings return via the summary).
+    const subagent = sessions.get(sessionID)?.subagent ?? await (async () => {
+      try { const info = await ctx.session.get({ sessionID }); return !!info.parentID && !info.fork }
+      catch { return false }
+    })()
     sessions.delete(sessionID)
     indexes.delete(sessionID)
     for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
       transcriptChars -= transcripts.get(key)!.size
       transcripts.delete(key)
     }
+    if (!subagent) try {
+      await project.graduate(await storeFor(sessionID).episodeNotes(), sessionID)
+      graduatedCache = undefined // a graduation changed the project archive; re-read lazily.
+    } catch (error) { warn("graduate session notes; deletion proceeds", error) }
     try { await storeFor(sessionID).clear() } catch (error) { log("delete session data", error) }
   }
 
@@ -616,19 +635,27 @@ export function createController(ctx: Plugin.Context) {
       const store = storeFor(sessionID)
       const target = id ? parseTarget(id) : undefined
       if (target?.kind === "error") return target.message
+      // The project's graduated notes join both surfaces: opaque P<n> fetches and,
+      // at the full layer, the query corpus. They outlive their sessions.
+      const graduated = await readGraduated()
 
       // Call and row originals live in the store alone: an elided original must not
       // hide behind an unreadable episode chain or a native checkpoint.
       const readFacts = async () => {
         const calls = await store.getCalls(), rows = await store.getRows()
-        return { byID: new Map(calls.map((call) => [call.id, call])), calls, rows, ids: [...calls.map((call) => call.id), ...rows.map((row) => row.id)] }
+        return { byID: new Map(calls.map((call) => [call.id, call])), calls, rows,
+          graduated: new Map(graduated.map((note) => [note.id, note])),
+          ids: [...calls.map((call) => call.id), ...rows.map((row) => row.id), ...graduated.map((note) => note.id)] }
       }
       const renderOpaque = (handle: string, wanted: number | undefined, facts: Awaited<ReturnType<typeof readFacts>>): { content: RecallContent } | { error: string } => {
         const resolved = resolveHandle(handle, facts.ids)
         if ("error" in resolved) return resolved
         const files: RecallFile[] = []
         const call = facts.byID.get(resolved.id)
-        const text = call ? formatCall(call, files) : formatRow(facts.rows.find((row) => row.id === resolved.id)!.text, (callID) => facts.byID.get(callID))
+        const note = facts.graduated.get(resolved.id)
+        const text = call ? formatCall(call, files)
+          : note ? formatGraduated(note)
+          : formatRow(facts.rows.find((row) => row.id === resolved.id)!.text, (callID) => facts.byID.get(callID))
         return { content: recallPage(shortId(resolved.id), text, wanted, files) }
       }
       if (target?.kind === "opaque") {
@@ -707,13 +734,21 @@ export function createController(ctx: Plugin.Context) {
         }
         indexes.set(sessionID, { checkpoint, documents })
       }
-      if (!documents.length) return "Nothing is archived to search yet."
-      const hits = search(query, documents, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
+      // Graduated notes join only unfiltered queries: they have no layer home, and at
+      // the full layer the note itself is the fetchable original. The cached documents
+      // array is never mutated — the corpus is per-call.
+      const corpus: readonly SearchDocument[] = graduated.length ? [...documents, ...graduated.map((note): SearchDocument =>
+        ({ id: note.id, text: note.note, boost: recencyBoost(note.end), graduated: { session: note.session, end: note.end } }))] : documents
+      if (!corpus.length) return "Nothing is archived to search yet."
+      const hits = search(query, corpus, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
       if (start >= hits.length) return at === 1 ? "No matching snippets. Try broader keywords or exact identifiers." : "No more search results."
       const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => {
         const target = `recall ${hit.note ? hit.id.split("#")[0] : address(hit.id, hit.page)}`
         const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? location.id.split("#")[0] : address(location.id, location.page))).join(", ")})` : ""
-        return `- ${target}${also}${hit.note ? " (archive note, not original evidence)" : ""}: ${hit.snippet}`
+        const label = hit.note ? " (archive note, not original evidence)"
+          : hit.graduated ? ` (graduated session note, ${shortId(hit.graduated.session)}, ${formatDuration(Math.max(0, Date.now() - hit.graduated.end))} ago)`
+          : ""
+        return `- ${target}${also}${label}: ${hit.snippet}`
       })
       return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }

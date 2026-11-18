@@ -25,17 +25,18 @@ id — fetch a target by its address. An address is exactly what the system rend
   recall E57 layer tools page 2  that episode's tool output, page 2
   recall call_01HZ2a3            one exact tool call
   recall msg_01HZ2a3b            one archived row (shell output, skill/attachment text)
+  recall P12                     one graduated session note (kept when a session was deleted)
   recall catalog                 the episode catalog, newest first (one line per episode)
   recall catalog all             every episode's archive note
   recall catalog E7              one episode's archive note
-An address is a handle (E57, call_…, msg_…) plus optional layer <conversation|tools|full> and page <n> pairs; catalog takes [all | E<n>] instead of layer. Any unambiguous id prefix resolves. A fetch returns the whole original in one call up to 30,000 characters; larger ones show where paging continues. Catalog listings (catalog and catalog all) return one page per call; page <n> continues.
+An address is a handle (E57, call_…, msg_…, P12) plus optional layer <conversation|tools|full> and page <n> pairs; catalog takes [all | E<n>] instead of layer. Any unambiguous id prefix resolves. A fetch returns the whole original in one call up to 30,000 characters; larger ones show where paging continues. Catalog listings (catalog and catalog all) return one page per call; page <n> continues.
 
-query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original.
+query — search the archive by keywords, exact identifiers or task descriptions. Returns focused evidence passages with runnable targets, often enough without opening the whole original. Queries at layer full also search this project's graduated notes — episode notes that outlived their deleted sessions (the raw transcripts are gone; the note is the fetchable original).
 
 layer (default conversation everywhere) is the depth to read or search:
   conversation  what was said and asked — dialogue plus tags for tool/shell commands, activated skills and attached text (name + head; heavy content and every output stay one recall hop away)
   tools         what was returned or injected — full tool calls, shell output, and skill/attachment text in their row-original homes
-  full          everything interleaved, plus archive notes
+  full          everything interleaved, plus archive and graduated notes
 Raise the depth only when the question needs it. layer and page also work as direct parameters: for a query they set the search depth and result page; for an id they fill in any depth or page the address omits.
 
 Everything recall returns stays live for the rest of the episode.

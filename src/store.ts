@@ -1,6 +1,7 @@
 import type { ArchivedCall } from "./tokens.ts"
 import { planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { object } from "./guards.ts"
+import { episodeNote } from "./working.ts"
 import { closeCycle, effectiveBudget, thermostatModels, type BudgetBounds, type ThermostatEntry, type ThermostatModels } from "./thermostat.ts"
 
 // The v2 storage domain accepts JSON; storing serialized records also keeps rows as plain text.
@@ -19,6 +20,12 @@ export type DeferredCompaction = {
   readonly after: string
   readonly tokens: number
 }
+
+/** A graduated episode note at `project/episodes/P<n>`: the searchable pointer that
+ *  outlives its session. Notes only — raw transcripts and calls die with the session. */
+export type GraduatedNote = { readonly id: string; readonly note: string; readonly session: string; readonly end: number }
+/** The project archive keeps at most this many graduated notes, most recent first. */
+export const GRADUATE_CAP = 200
 
 /** Per-session counts of budget-gate outcomes. Telemetry only: never a trigger input. */
 export type GateStats = {
@@ -94,6 +101,8 @@ export function rowCalls(row: Row): ArchivedCall[] {
  *  advisory and must never let them block a trigger or a cut. */
 export function createProjectStore(storage: Storage, report: Reporter = defaultReport) {
   const thermostatKey = "project/thermostat"
+  const episodesPrefix = "project/episodes/"
+  const graduatedKey = (id: string) => `${episodesPrefix}${id}`
   const get = async <T>(name: string) => decode<T>(await storage.get(name), name)
   const put = async (name: string, value: unknown) => storage.set(name, encode(value))
   // A record that cannot even be decoded is treated as absent: the next write
@@ -101,6 +110,29 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
   const readModels = async (): Promise<ThermostatModels> => {
     try { return thermostatModels(await get<unknown>(thermostatKey)) }
     catch (error) { report("Unable to read the budget thermostat; using defaults", error); return {} }
+  }
+  const graduatedRecord = (value: unknown, id: string): GraduatedNote | undefined =>
+    object(value) && value.id === id && typeof value.note === "string" && value.note &&
+    typeof value.session === "string" && value.session && typeof value.end === "number" && Number.isFinite(value.end) && value.end >= 0
+      ? { id, note: value.note, session: value.session, end: value.end } : undefined
+  const scanGraduated = async (): Promise<GraduatedNote[]> => {
+    const found: GraduatedNote[] = []
+    let after: string | undefined
+    do {
+      const page = await storage.scan({ prefix: episodesPrefix, after, limit: 500 })
+      for (const entry of page.entries) {
+        if (!entry.key.startsWith(episodesPrefix)) throw new Error("Invalid storage scan entry")
+        const id = decodeURIComponent(entry.key.slice(episodesPrefix.length))
+        // One undecodable record is skipped, not fatal: the rest of the archive stays readable.
+        try {
+          const record = graduatedRecord(decode<unknown>(entry.value, entry.key), id)
+          if (record) found.push(record)
+        } catch { /* unreadable note */ }
+      }
+      if (page.next !== undefined && page.next === after) throw new Error("Storage scan did not advance")
+      after = page.next
+    } while (after !== undefined)
+    return found
   }
   return {
     /** The learned thermostat state per model, dropping corrupt entries. */
@@ -118,6 +150,40 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
       } catch (error) {
         report(`Unable to record a thermostat cycle for ${model}`, error)
         return undefined
+      }
+    },
+    /** The project's graduated notes, dropping corrupt records. */
+    graduatedNotes: async (): Promise<GraduatedNote[]> => {
+      try { return await scanGraduated() }
+      catch (error) { report("Unable to read graduated notes", error); return [] }
+    },
+    /** Graduate episode notes into the project archive: notes only, deduplicated by
+     *  exact text (fork copies), numbered above the highest existing P<n>, kept to
+     *  the 200 most recent. Returns how many notes were added; failures are
+     *  reported, never thrown. */
+    graduate: async (notes: readonly { readonly note: string; readonly end: number }[], session: string): Promise<number> => {
+      try {
+        return await exclusive(episodesPrefix, async () => {
+          const existing = await scanGraduated()
+          const texts = new Set(existing.map((one) => one.note))
+          let next = existing.reduce((highest, one) => Math.max(highest, Number(/^P(\d+)$/.exec(one.id)?.[1] ?? 0)), 0) + 1
+          const kept = [...existing]
+          let added = 0
+          for (const item of notes) {
+            if (!item.note || texts.has(item.note)) continue
+            texts.add(item.note)
+            const record: GraduatedNote = { id: `P${next++}`, note: item.note, session, end: item.end }
+            kept.push(record)
+            await put(graduatedKey(record.id), record)
+            added++
+          }
+          // The cap keeps the most recent notes; overflow is removed, oldest first.
+          for (const old of kept.sort((a, b) => b.end - a.end).slice(GRADUATE_CAP)) await storage.remove(graduatedKey(old.id))
+          return added
+        })
+      } catch (error) {
+        report("Unable to graduate session notes", error)
+        return 0
       }
     },
   }
@@ -237,6 +303,19 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   }
   const getCheckpoint = (id: string) => get<Checkpoint>(key("checkpoints", id))
   const saveCheckpoint = (checkpoint: Checkpoint) => put(key("checkpoints", checkpoint.id), checkpoint)
+  /** Every committed episode's note text and end time, unreadable records skipped:
+   *  the graduation input when this session is deleted. */
+  const episodeNotes = async (): Promise<{ readonly note: string; readonly end: number }[]> => (await all("checkpoints")).flatMap(({ id, value }) => {
+    try {
+      const record = decode<Checkpoint>(value, key("checkpoints", id))
+      if (!record || record.id !== id || !object(record.episode) || typeof record.episode.summary !== "string") return []
+      const { title, body } = episodeNote(record.episode.summary)
+      const note = [title, body].filter(Boolean).join("\n")
+      if (!note) return []
+      const end = record.episode.end
+      return [{ note, end: typeof end === "number" && Number.isFinite(end) && end >= 0 ? end : Date.now() }]
+    } catch { return [] }
+  })
   const chain = async (id: string | null): Promise<Map<string, Checkpoint>> => {
     const result = new Map<string, Checkpoint>()
     while (id !== null) {
@@ -404,5 +483,5 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     } while (after !== undefined)
     for (const key of keys) await storage.remove(key)
   }
-  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
+  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, episodeNotes, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
 }

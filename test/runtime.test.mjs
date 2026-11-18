@@ -48,8 +48,7 @@ const event = (sessionID = "s") => ({ sessionID, model, system: [], tools: {}, m
 const completed = (id, result) => ({ id, type: "compaction", status: "completed", summary: result.summary, metadata: result.metadata })
 const native = (id, summary = "Native fallback summary") => ({ id, type: "compaction", status: "completed", summary })
 
-function harness(options = {}) {
-  const storage = new MemoryStorage()
+function harness(options = {}, storage = new MemoryStorage()) {
   const state = {
     rows: [], prompts: [], stateless: [], compact: 0, info: { model, time: { busy: 1 } }, failAdmission: false,
     failGenerate: false, failStateless: false, hooks: new Map(),
@@ -291,6 +290,68 @@ test("the search corpus is cached per checkpoint: warm queries rescan nothing, a
   h.state.rows = [completed("c1", first), user("u2", "secondcacheneedle wording"), completed("c2", second)]
   assert.match(await h.controller.recall("s", { query: "secondcacheneedle" }), /recall E2 page 1/, "the rebuilt corpus sees the new episode")
   assert.ok(scans > cold, "a new checkpoint invalidates the cache and rebuilds the corpus")
+})
+
+test("deleted sessions graduate their episode notes into the project archive; a fresh session searches and fetches them", async () => {
+  const h = harness()
+  await compactRows(h, [user("u1", "needle wording"), running("c1")])
+  await h.controller.onDeleted("s")
+  const graduatedKeys = [...h.storage.values.keys()].filter((key) => key.startsWith("project/episodes/"))
+  assert.deepEqual(graduatedKeys, ["project/episodes/P1"], "the episode note graduated exactly once")
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")), "the session archive is still cleared")
+  assert.deepEqual(JSON.parse(h.storage.values.get("project/episodes/P1")), { id: "P1", note: "Continue work\nWork: preserve the exact request.", session: "s", end: JSON.parse(h.storage.values.get("project/episodes/P1")).end })
+
+  const fresh = harness({}, h.storage)
+  assert.match(await fresh.controller.recall("s", { query: "preserve the exact request", layer: "full" }),
+    /- recall P1 page 1 \(graduated session note, s, 0s ago\): /, "the full layer surfaces the graduated note as a fetchable hit")
+  assert.match(await fresh.controller.recall("s", { query: "preserve the exact request" }),
+    /No matching snippets/, "layer-scoped queries never see graduated notes: they have no home")
+  const fetched = await fresh.controller.recall("s", { id: "P1" })
+  assert.match(fetched, /Graduated session note P1 \(from session s, 0s ago\)/, "an opaque fetch returns the note with its provenance header")
+  assert.match(fetched, /preserve the exact request/, "the whole note text is the original")
+  assert.match(await fresh.controller.recall("s", { id: "catalog" }), /Nothing is archived yet/, "the catalog still lists episodes only, never P entries")
+})
+
+test("graduation ranks a recent note above an equally matching stale one", async () => {
+  const day = 86_400_000, stale = Date.now() - 40 * day, recent = Date.now()
+  const h = harness()
+  h.state.queue = [
+    { archive: "Title: Gauge\nWork: gauge needle one", working: h.state.handoff.working, retiredConstraints: [] },
+    { archive: "Title: Gauge\nWork: gauge needle two", working: h.state.handoff.working, retiredConstraints: [] },
+  ]
+  const first = await compactRows(h, [{ id: "u1", type: "user", text: "task", time: { created: stale } }, running("c1")])
+  await compactRows(h, [completed("c1", first), { id: "u2", type: "user", text: "task", time: { created: recent } }, running("c2")])
+  await h.controller.onDeleted("s")
+  const fresh = harness({}, h.storage)
+  const hits = await fresh.controller.recall("s", { query: "gauge needle", layer: "full" })
+  assert.match(hits, /- recall P2 page 1 \(graduated session note, s, 0s ago\)/, "the recent note outranks the equal term match")
+  assert.match(hits, /- recall P1 page 1 \(graduated session note, s, /, "the stale note still matches, just below")
+  assert.ok(hits.indexOf("recall P2") < hits.indexOf("recall P1"), "recency ordering is strict")
+})
+
+test("subagent sessions never graduate their notes into the project archive", async () => {
+  const sub = harness()
+  sub.state.info = { model, time: { busy: 1 }, parentID: "parent-session" }
+  await compactRows(sub, [user("u1", "needle wording"), running("c1")])
+  // The session is gone at deletion time: only the stashed flag can identify the subagent.
+  sub.ctx.session.get = async () => { throw new Error("session deleted") }
+  await sub.controller.onDeleted("s")
+  assert.ok(![...sub.storage.values.keys()].some((key) => key.startsWith("project/episodes/")), "a subagent's episodes never graduate")
+  const parent = harness()
+  await compactRows(parent, [user("u1", "needle wording"), running("c1")])
+  parent.ctx.session.get = async () => { throw new Error("session deleted") }
+  await parent.controller.onDeleted("s")
+  assert.ok(parent.storage.values.has("project/episodes/P1"), "a main session with no stash still graduates via the fallback read")
+})
+
+test("graduation storage failures never block the deletion", async (t) => {
+  const warnings = t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.storage.fail = (key) => key.startsWith("project/episodes/")
+  await compactRows(h, [user("u1", "needle wording"), running("c1")])
+  await h.controller.onDeleted("s")
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")), "the session archive is cleared regardless")
+  assert.ok(warnings.mock.calls.some((call) => String(call.arguments[0]).includes("graduate session notes")), "the failure is reported")
 })
 
 test("forks retain episode IDs and originals, branch independently, and survive parent deletion/reload", async () => {
