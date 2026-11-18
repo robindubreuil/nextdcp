@@ -56,7 +56,8 @@ The existing soft/hard triggers are unchanged.
 
 Some tasks legitimately need many large results live at once. The `defer_compaction`
 tool lets the model propose skipping the budget trigger for the
-current round only. Three gates apply in order: physics (the conversation
+current round only; it is callable only while a budget-gate notice is open, and
+refuses without prompting anywhere else. Three gates apply in order: physics (the conversation
 must fit 80% of the model's window; an unknown window is refused, so no approval is
 spent on a context that would overflow anyway), user consent (the host permission
 system, action `defer_compaction`, default ask with native Always allow, shown with
@@ -178,7 +179,7 @@ under native control rather than replacing it with an empty episode. Episode
 resolution and archive search may then be unavailable on that chain; an already
 archived tool call can still be retrieved directly by id.
 
-### `recall` tool (the only tool and the only prompt surface)
+### `recall` tool (the standing prompt surface)
 
 ```
 recall({ query?: string, id?: string, layer?: string, page?: number })
@@ -293,19 +294,27 @@ rendering and its search index show readable user, assistant, tool, shell, synth
 and checkpoint text — never row ids, timestamps, costs, provider metadata,
 signatures, or hidden reasoning. Tool output is not clipped.
 
-The tool description is the *entire* protocol the model needs to know. There is
+The `recall` tool description is the *entire* protocol the model needs to know;
+since v0.9 it also carries the standing context model — budget, gate, continue,
+`checkpoint_now`, `defer_compaction`, delegation — so a gate notice only has to
+trigger, not teach. There is
 nothing in the system prompt, no message-ID tags, no nudges, no reminders and no
-priority labels — with one exception: the budget-gate notice, a single system part
-sent only when the raw conversation crosses the compaction budget mid-round,
-because it must reach the model before its next step, not after it asks. Recall
+priority labels — with one exception: the budget-gate notice, one automated
+message appended at the **conversation tail** (a system part only under
+`notice: "system"`, for providers that drop trailing messages), sent only when
+the raw conversation crosses the compaction budget mid-round, because it must
+reach the model before its next step, not after it asks. The tail position is
+deliberate: a request-scoped message touches no cached prefix, unlike a system
+part prepended before the whole history. Recall
 results are ordinary tool outputs; the single compaction elision boundary keeps the
 system bounded.
 
-### Keeping context low (two compaction triggers)
+### Keeping context low (three compaction triggers, one gate)
 
 The aim is a context that stays small all the time, without asking the model to
 manage it. Native compaction triggers at window − 15%, which is far too late for
-cost and quality (context rot), so the plugin adds two triggers of its own:
+cost and quality (context rot), so the plugin adds two automatic triggers and
+one model-requested:
 
 - **Deferred soft trigger (the main one; option `idle`).** The end of a successful
   turn is a natural "topic finished" boundary, but not proof that the conversation
@@ -337,7 +346,22 @@ cost and quality (context rot), so the plugin adds two triggers of its own:
   recent completed requests (native chars/4 units apply until a usable pair of
   usage-bearing rows exists). Above `budget` (default `min(50% window, 100k)`),
   compact when growth since the checkpoint is at least `min(idle, budget / 4)`.
-  Native overflow handling still accounts for the complete request.
+  A live-round crossing first opens the **budget gate**: compaction pauses one
+  evaluation step while an automated notice — numbers only; options continue
+  (default), `checkpoint_now`, `defer_compaction`, delegate — rides the
+  conversation tail (option `notice: "system"` restores the legacy system
+  part). The next build of the same round and checkpoint closes the gate and
+  compacts; a gate still open when its round ends or fails is repaid
+  immediately, unless a deferral grant held it. Without a live-round stamp —
+  unreadable round, staged revert, guard or cooldown active — the crossing
+  compacts silently, as before. Native overflow handling still accounts for the
+  complete request.
+- **Model-requested (`checkpoint_now`).** The model can move the cut earlier
+  than any trigger, at a natural pause before a context-heavy phase.
+  Approval-free by design — it releases context, never holds it — once per
+  round, and refused politely while a compaction runs or a revert is staged.
+  Its optional `keep` line rides the same hint channel as a queued prompt:
+  relevance evidence for the working state, never instructions.
 - Both triggers share one per-session admission guard. The context hook is
   fire-and-forget; concurrent prompt hooks share and await the admission promise
   so none race ahead of the compaction control. Errors are caught. The guard
@@ -346,7 +370,10 @@ cost and quality (context rot), so the plugin adds two triggers of its own:
   three minutes. After `session.compaction.failed`, new requests are blocked for
   three minutes so a persistent failure cannot cause a retry on every step. The
   event subscriber retries if its stream ends unexpectedly; model windows are
-  cached by provider and model. On `session.deleted`, the session's storage keys
+  cached by provider and model. Gate, deferral and checkpoint outcomes are
+  counted per session in a `gate-stats` storage key — telemetry only, never a
+  trigger input; a failed count is reported and swallowed. On
+  `session.deleted`, the session's storage keys
   (including the deferred marker) and in-memory state are removed.
 - **Cost reasoning:** with caching, every step pays cache-read price × context
   size, so a smaller steady-state context is a direct saving. Rewrites happen

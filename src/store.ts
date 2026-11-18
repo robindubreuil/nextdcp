@@ -19,6 +19,21 @@ export type DeferredCompaction = {
   readonly tokens: number
 }
 
+/** Per-session counts of budget-gate outcomes. Telemetry only: never a trigger input. */
+export type GateStats = {
+  gates: number; silent: number; continued: number; repaid: number
+  deferPrompted: number; deferGranted: number; deferUserRefused: number; deferPhysicsRefused: number
+  checkpoints: number
+}
+
+const ZERO_STATS: GateStats = {
+  gates: 0, silent: 0, continued: 0, repaid: 0,
+  deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0,
+  checkpoints: 0,
+}
+const statsShape = (value: unknown): value is GateStats =>
+  object(value) && Object.keys(ZERO_STATS).every((key) => typeof value[key] === "number" && Number.isFinite(value[key]) && (value[key] as number) >= 0)
+
 const encode = (value: unknown): string => {
   const text = JSON.stringify(value)
   if (text === undefined) throw new Error("Record is not JSON serializable")
@@ -79,6 +94,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   const key = (kind: string, id: string) => `${root}${kind}/${encodeURIComponent(id)}`
   const counterKey = `${root}episode-counter`
   const deferredKey = `${root}deferred-compaction`
+  const statsKey = `${root}gate-stats`
   const get = async <T>(name: string) => decode<T>(await storage.get(name), name)
   const put = async (name: string, value: unknown) => storage.set(name, encode(value))
   const getDeferredCompaction = async (): Promise<DeferredCompaction | undefined> => {
@@ -91,6 +107,28 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     return value as DeferredCompaction
   }
   const saveDeferredCompaction = (value: DeferredCompaction) => put(deferredKey, value)
+  /** Count one gate event and return the new totals. Failures are reported, never thrown:
+   *  telemetry must not break a trigger. */
+  const countGate = async (field: keyof GateStats): Promise<GateStats | undefined> => {
+    try {
+      return await exclusive(statsKey, async () => {
+        const stored = await get<unknown>(statsKey)
+        if (stored !== undefined && !statsShape(stored)) throw new Error(`Invalid gate stats record: ${statsKey}`)
+        const stats: GateStats = stored === undefined ? { ...ZERO_STATS } : stored
+        const next = { ...stats, [field]: stats[field] + 1 }
+        await put(statsKey, next)
+        return next
+      })
+    } catch (error) {
+      report(`Unable to count gate event "${field}"`, error)
+      return undefined
+    }
+  }
+  const getGateStats = async (): Promise<GateStats> => {
+    const stored = await get<unknown>(statsKey)
+    if (stored !== undefined && !statsShape(stored)) throw new Error(`Invalid gate stats record: ${statsKey}`)
+    return stored === undefined ? { ...ZERO_STATS } : stored as GateStats
+  }
   const hasInherited = async () => {
     const source = await get<unknown>(`${root}fork`)
     if (source !== undefined && typeof source !== "string") throw new Error("Invalid fork archive marker")
@@ -331,5 +369,5 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     } while (after !== undefined)
     for (const key of keys) await storage.remove(key)
   }
-  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, clear }
+  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
 }

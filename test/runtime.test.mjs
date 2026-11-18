@@ -3,7 +3,7 @@ import { registerHooks } from "node:module"
 import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
-import { WORKING_PROMPT, RECALL_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION } from "../src/prompts.ts"
+import { WORKING_PROMPT, RECALL_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, CHECKPOINT_NOW_DESCRIPTION, budgetGateNotice } from "../src/prompts.ts"
 import { tokens } from "../src/tokens.ts"
 import { createController, install } from "../src/runtime.ts"
 import { createStore } from "../src/store.ts"
@@ -132,8 +132,11 @@ const armGate = async (h, run = (request) => h.controller.onContext(request)) =>
   await run(request)
   await setImmediate()
   assert.equal(h.state.compact, before, "the crossing arms the gate instead of compacting")
-  assert.match(request.system.at(-1)?.text ?? "", /NextDCP budget gate/)
-  assert.match(request.system.at(-1)?.text ?? "", /next reply is the compactor's primary input/, "the gate tells the model its reply steers the checkpoint")
+  assert.equal(request.system.length, 0, "the notice rides the conversation tail, not the system block")
+  const notice = request.messages.at(-1)
+  assert.equal(notice?.role, "user", "the notice is a trailing user-role message")
+  assert.match(notice?.content?.[0]?.text ?? "", /Compaction budget gate/, "attributed as an automated notice")
+  assert.match(notice?.content?.[0]?.text ?? "", /Decide in THIS reply when the compaction cut lands/, "the options share one axis: when the cut lands")
 }
 
 test("compaction archives every original before generation and recall retrieves episode and call", async () => {
@@ -1182,7 +1185,7 @@ test("deferral defaults to native ask without overriding configured permission r
     }])
     await tool.execute(deferralInput, toolContext)
     assert.equal(h.state.permissions.length, 1, "an already-approved round needs no second permission request")
-    assert.equal(h.storage.writes.length, 0, "exemptions are not persisted")
+    assert.ok(h.storage.writes.every((write) => write.key.endsWith("gate-stats")), "exemptions are not persisted")
   } finally { cleanup() }
 })
 
@@ -1219,6 +1222,115 @@ test("the budget gate arms at the crossing and pays it at the next build", async
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 1, "the next build closes the gate and compacts")
+})
+
+test("notice: system restores the legacy system-part placement without a tail message", async () => {
+  const legacy = harness({ idle: false, budget: 40, notice: "system" })
+  legacy.state.rows = [user("u", "x".repeat(800))]
+  const request = { ...event(), messages: projectHistory(legacy.state.rows).messages }
+  await legacy.controller.onContext(request)
+  await setImmediate()
+  assert.equal(legacy.state.compact, 0, "the crossing still arms instead of compacting")
+  assert.equal(request.messages.length, projectHistory(legacy.state.rows).messages.length, "the fallback appends no message")
+  assert.match(request.system.at(-1)?.text ?? "", /Compaction budget gate/)
+})
+
+test("gate outcomes are counted per session, and telemetry failures never gate a trigger", async () => {
+  const zeros = { gates: 0, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0 }
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u", "x".repeat(800))]
+  await armGate(h)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.deepEqual(await h.store.getGateStats(), { ...zeros, gates: 1, continued: 1 })
+  // A failed round repays its consumed crossing.
+  const repaid = harness({ idle: false, budget: 40 })
+  repaid.state.rows = [user("u", "x".repeat(800))]
+  await armGate(repaid)
+  repaid.controller.onRoundEnded("s")
+  await setImmediate()
+  assert.deepEqual(await repaid.store.getGateStats(), { ...zeros, gates: 1, repaid: 1 })
+  // Without a round stamp the crossing cannot arm and compacts silently.
+  const silent = harness({ idle: false, budget: 40 })
+  silent.state.rows = [user("u", "x".repeat(800))]
+  silent.state.info = { model }
+  await silent.controller.onContext({ ...event(), messages: projectHistory(silent.state.rows).messages })
+  await setImmediate()
+  assert.equal(silent.state.compact, 1)
+  assert.deepEqual(await silent.store.getGateStats(), { ...zeros, silent: 1 })
+  // A broken stats write is reported and swallowed; the silent trigger still fires.
+  const broken = harness({ idle: false, budget: 40 })
+  broken.state.rows = [user("u", "x".repeat(800))]
+  broken.state.info = { model }
+  broken.storage.fail = (key) => key.includes("gate-stats")
+  await broken.controller.onContext({ ...event(), messages: projectHistory(broken.state.rows).messages })
+  await setImmediate()
+  assert.equal(broken.state.compact, 1, "the silent trigger fires despite the stats failure")
+})
+
+test("deferral outcomes are counted: prompted, granted, physics-refused, user-refused", async () => {
+  // Gate telemetry is fire-and-forget; let it flush before reading.
+  const stats = async (h) => { await setImmediate(); return h.store.getGateStats() }
+  const granted = harness({ idle: false, budget: 40 })
+  granted.state.rows = [user("u", "x".repeat(800))]
+  await armGate(granted)
+  assert.match(await defer(granted), /deferred for this round only/)
+  assert.deepEqual(await stats(granted), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 1, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0 })
+  const physics = harness({ idle: false, budget: 100 })
+  physics.state.rows = [user("u1", "x".repeat(360_000))]
+  await armGate(physics)
+  assert.match(await defer(physics), /grant ceiling/)
+  assert.deepEqual(await stats(physics), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 1, checkpoints: 0 })
+  assert.equal(physics.state.permissions.length, 0, "physics refuses before spending the user's attention")
+  const refused = harness({ idle: false, budget: 40 })
+  refused.state.rows = [user("u", "x".repeat(800))]
+  await armGate(refused)
+  refused.ctx.permission.assert = async () => { throw new Error("denied") }
+  await assert.rejects(defer(refused))
+  assert.deepEqual(await stats(refused), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 0, deferUserRefused: 1, deferPhysicsRefused: 0, checkpoints: 0 })
+})
+
+test("checkpoint_now compacts on request, carries the keep note, and runs once per round", async () => {
+  const h = harness({ idle: false, budget: 100_000 })
+  h.state.rows = [user("u1", "work so far")]
+  assert.match(await h.controller.checkpointNow({ keep: "  Keep the failing test name.  " }, toolContext), /Checkpointing now \(keep note attached\)/)
+  assert.equal(h.state.compact, 1)
+  h.state.rows = [user("u1", "work so far"), running("c1")]
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.ok(item.result, "the requested checkpoint produces a handoff")
+  assert.match(h.state.prompts.at(-1), /checkpoint_now keep: Keep the failing test name\./, "the keep note rides the hint channel to the working state")
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", item.result), user("u1", "work so far")]
+  assert.match(await h.controller.checkpointNow({}, toolContext), /already checkpointed/)
+  assert.equal(h.state.compact, 1, "once per round")
+  h.state.info = { model, time: { busy: 2 } }
+  h.state.rows = [completed("c1", item.result), user("u2", "more work"), running("c2")]
+  assert.match(await h.controller.checkpointNow({}, toolContext), /already running/)
+  assert.equal(h.state.compact, 1)
+  h.state.rows = [completed("c1", item.result), user("u2", "more work")]
+  assert.match(await h.controller.checkpointNow({}, toolContext), /Checkpointing now/)
+  assert.equal(h.state.compact, 2, "a new round may checkpoint again")
+  await setImmediate()
+  assert.equal((await h.store.getGateStats()).checkpoints, 2)
+})
+
+test("checkpoint_now registers approval-free beside recall, and model-facing copy names no product", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  const cleanup = await setup(h.ctx)
+  try {
+    const tool = h.state.tools.get("checkpoint_now")
+    assert.equal(tool.description, CHECKPOINT_NOW_DESCRIPTION)
+    assert.deepEqual(tool.options, { codemode: false })
+    assert.equal(tool.input.required, undefined)
+    assert.equal(tool.input.additionalProperties, false)
+    assert.equal(h.state.permissions.length, 0, "registration prompts no permission")
+    for (const text of [CHECKPOINT_NOW_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, budgetGateNotice(12_345, 60_000, 200_000), budgetGateNotice(12_345, 60_000)])
+      assert.ok(!text.includes("NextDCP"), "model-facing copy names no product")
+    assert.match(RECALL_DESCRIPTION, /Context model:/, "the standing contract rides the recall description")
+    assert.match(budgetGateNotice(12_345, 60_000, 200_000), /~6% of the 200000-token window/)
+    assert.ok(!/-token window/.test(budgetGateNotice(12_345, 60_000)), "the window clause is omitted when unknown")
+  } finally { cleanup() }
 })
 
 test("deferral outside an open gate never prompts, even when the budget trigger is off", async () => {
@@ -1258,7 +1370,8 @@ test("a consumed crossing never re-arms while guarded or cooling down", async ()
     await h.controller.onContext(request)
     await setImmediate()
     assert.equal(h.state.compact, 1, note)
-    assert.ok(!request.system.some((part) => /NextDCP budget gate/.test(part.text ?? "")), note)
+    const text = [...request.system.map((part) => part.text ?? ""), ...request.messages.flatMap((message) => (message.content ?? []).map((part) => part.text ?? ""))].join("\n")
+    assert.ok(!/Compaction budget gate/.test(text), note)
   }
   await build("the next build pays the consumed crossing")
   await build("the admission guard blocks a re-arm")

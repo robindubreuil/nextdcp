@@ -1,12 +1,12 @@
 import type { Plugin } from "@opencode/plugin"
 import type { SessionCompaction, SessionContext, SessionPrompt } from "@opencode/plugin/promise/session"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { messageTokens, type ArchivedCall } from "./tokens.ts"
+import { messageTokens, type ArchivedCall, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
-import { budgetGateNotice, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
+import { budgetGateNotice, CHECKPOINT_NOW_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { budgetFailure, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, measureWorking, parseHandoff, type Handoff } from "./working.ts"
 import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
-import { createStore, exclusive } from "./store.ts"
+import { createStore, exclusive, type GateStats } from "./store.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 import { object, positive, modelRef } from "./guards.ts"
@@ -33,6 +33,8 @@ type SessionState = {
   deferral?: Deferral
   /** The open budget gate: one evaluation window per budget crossing, stamped with the round and checkpoint it belongs to. */
   gate?: Gate
+  /** The round that already ran a model-requested checkpoint_now; once per round. */
+  checkpointed?: Round
   /** The queued message that triggered a deferred-marker compaction; evidence for the
    *  working state, consumed only by whichever generation commits its handoff. Failed
    *  generations keep the signal for their retry; the round's end clears what never ran. */
@@ -54,6 +56,9 @@ export function createController(ctx: Plugin.Context) {
   const idle = ctx.options.idle === false ? Infinity : positive(ctx.options.idle, 25_000)
   const budgetOption = ctx.options.budget === false ? Infinity : positive(ctx.options.budget, 0), memoryBudget = positive(rawMemory.budget, DEFAULT_MEMORY_BUDGET)
   const debug = ctx.options.debug === true
+  // Provider-compatibility fallback for the gate notice: the conversation tail
+  // (default) or the legacy system part.
+  const noticeInSystem = ctx.options.notice === "system"
   const sessions = new Map<string, SessionState>()
   const state = (sessionID: string): SessionState => {
     let entry = sessions.get(sessionID)
@@ -75,6 +80,12 @@ export function createController(ctx: Plugin.Context) {
   }
   const log = (where: string, error: unknown) => {
     if (debug) warn(where, error)
+  }
+  // Fire-and-forget gate telemetry: counted, logged when debugging, never load-bearing.
+  const gateStat = (sessionID: string, field: keyof GateStats) => {
+    void storeFor(sessionID).countGate(field).then((stats) => {
+      if (debug) console.info(`[nextdcp] gate ${field}${stats ? ` ${JSON.stringify(stats)}` : " not counted"}`)
+    })
   }
   const storeFor = (id: string) => createStore(ctx.storage, id, warn)
   const inheritSession = (sessionID: SessionID, rows: readonly Row[], seen = new Set<string>()): Promise<void> => {
@@ -182,7 +193,8 @@ export function createController(ctx: Plugin.Context) {
       const entry = state(event.sessionID)
       if (growth === undefined) { entry.view = undefined; return }
       entry.view = { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) }
-      const limit = budgetOption || ((await windowSize(event.model))?.context ?? 0) * 0.5
+      const window = (await windowSize(event.model))?.context
+      const limit = budgetOption || (window ?? 0) * 0.5
       const budget = budgetOption || Math.min(limit, 100_000)
       // An unknown window disables the auto budget instead of assuming a size; surface
       // that state rather than silently never firing. Estimates meeting real window
@@ -204,15 +216,23 @@ export function createController(ctx: Plugin.Context) {
         // Build N+1 closes the gate it opened; a gate from another round or boundary is
         // stale and falls through to a fresh crossing. A held gate stays open so the
         // grant's idempotent re-affirmation keeps its round.
-        if (info && sameRound(gate, info) && gate.checkpoint === checkpoint) return void requestCompact(event.sessionID, checkpoint, growth)
+        if (info && sameRound(gate, info) && gate.checkpoint === checkpoint) {
+          gateStat(event.sessionID, "continued")
+          return void requestCompact(event.sessionID, checkpoint, growth)
+        }
       }
-      // Arm the gate together with its notice; without a showable notice the crossing
-      // stays silent and compacts as before.
+      // Arm the gate together with its notice. The notice rides the conversation tail
+      // — the most salient and the cheapest position: a request-scoped message touches
+      // no cached prefix, unlike a system part before the whole history.
       if (info?.time?.busy !== undefined && current.guard === undefined && (current.cooldownUntil ?? 0) <= Date.now() && !sameRound(current.deferral, info)) {
         current.gate = { busy: info.time.busy, idle: info.time.idle, checkpoint, growth }
-        event.system.push({ type: "text", text: budgetGateNotice(estimate, budget) })
+        const text = budgetGateNotice(estimate, budget, window)
+        if (noticeInSystem) event.system.push({ type: "text", text })
+        else messages.push({ role: "user", content: [{ type: "text", text } as Part] })
+        gateStat(event.sessionID, "gates")
         return
       }
+      gateStat(event.sessionID, "silent")
       void requestCompact(event.sessionID, checkpoint, growth)
     } catch (error) { log("context", error) }
   }
@@ -381,10 +401,13 @@ export function createController(ctx: Plugin.Context) {
     const entry = sessions.get(sessionID)
     if (entry === undefined) return
     const { gate, deferral } = entry
-    entry.gate = entry.deferral = entry.hint = undefined
+    entry.gate = entry.deferral = entry.hint = entry.checkpointed = undefined
     // A failed or interrupted round has no later build to close its gate; the crossing it
     // consumed is repaid here unless a grant held the round.
-    if (gate && !deferral?.approved) void requestCompact(sessionID, gate.checkpoint, gate.growth)
+    if (gate && !deferral?.approved) {
+      gateStat(sessionID, "repaid")
+      void requestCompact(sessionID, gate.checkpoint, gate.growth)
+    }
   }
   const onIdle = async (sessionID: SessionID) => {
     try {
@@ -398,14 +421,17 @@ export function createController(ctx: Plugin.Context) {
       // catches up in one bounded compaction. busy alone identifies the round, because
       // hosts stamp the new idle time when the round ends, before this event fires.
       const held = decision !== undefined && decision.approved && decision.busy === info.time?.busy
-      if (entry) entry.deferral = entry.hint = undefined // Round-scoped evidence dies with its round, as onRoundEnded clears it.
+      if (entry) entry.deferral = entry.hint = entry.checkpointed = undefined // Round-scoped evidence dies with its round, as onRoundEnded clears it.
       if (entry?.guard !== undefined && !running(rows)) clearGuard(sessionID)
       // The round ended with an open gate: its evaluation window is over, so the crossing
       // it consumed is repaid unless a grant held the round or the boundary already moved.
       const gate = entry?.gate
       if (gate) {
         if (entry) entry.gate = undefined
-        if (!held && gate.checkpoint === activeCheckpoint(rows)) void requestCompact(sessionID, gate.checkpoint, gate.growth)
+        if (!held && gate.checkpoint === activeCheckpoint(rows)) {
+          gateStat(sessionID, "repaid")
+          void requestCompact(sessionID, gate.checkpoint, gate.growth)
+        }
       }
       if (info.parentID || idle === Infinity) return
       // Add output produced after the last request, including an updated retry row.
@@ -611,7 +637,7 @@ export function createController(ctx: Plugin.Context) {
       return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
-  const deferredNotice = "NextDCP's automatic mid-round budget compaction is deferred for this round only. Manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
+  const deferredNotice = "Compaction is deferred for this round only. Manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
   const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
     const { sessionID } = context
     // Gate first: outside the open budget gate's evaluation window there is nothing to
@@ -625,7 +651,7 @@ export function createController(ctx: Plugin.Context) {
     }
     const gate = sessions.get(sessionID)?.gate
     if (!gate || !sameRound(gate, info) || gate.checkpoint !== activeCheckpoint(rows))
-      return "Compaction deferral is only available at an open NextDCP budget gate; this request is outside one. Normal compaction and recall remain enabled."
+      return "Compaction deferral is only available at an open budget gate; this request is outside one. Normal compaction and recall remain enabled."
     const reason = input.reason.trim()
     if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
     if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
@@ -643,28 +669,69 @@ export function createController(ctx: Plugin.Context) {
       log("deferral physics", error)
       return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
     }
-    if (window === undefined) return `Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed.${budgetOption === 0 ? " The automatic mid-round budget trigger is likewise disabled while the window is unknown; set options.budget to an explicit token count to enable it." : ""} Recall selectively instead.`
+    if (window === undefined) {
+      gateStat(sessionID, "deferPhysicsRefused")
+      return `Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed.${budgetOption === 0 ? " The automatic mid-round budget trigger is likewise disabled while the window is unknown; set options.budget to an explicit token count to enable it." : ""} Recall selectively instead.`
+    }
     // The output limit and a 20% share of the rest stay unspent: system instructions,
     // tool definitions, and the round's own output must still fit nextdcp's estimate.
     const reserve = window.output > 0 ? window.output : 8_192
     const windowTokens = window.context
     const estimate = Math.round(conversationTokens(rows) * usageScale(rows)), ceiling = Math.floor((windowTokens - reserve) * DEFER_WINDOW_SHARE)
-    if (estimate > ceiling) return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
+    if (estimate > ceiling) {
+      gateStat(sessionID, "deferPhysicsRefused")
+      return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
+    }
 
     // An unapproved record also prevents concurrent requests and retries after refusal.
     const decision: Deferral = { busy: info.time.busy, idle: info.time.idle, approved: false }
     entry.deferral = decision
     // Preserve native rejection/interruption errors; returning them would change host control flow.
-    await ctx.permission.assert({
-      sessionID, agent: context.agent, action: "defer_compaction", resources: [reason], save: ["*"],
-      source: { type: "tool", messageID: context.messageID, id: context.id },
-    })
+    gateStat(sessionID, "deferPrompted")
+    try {
+      await ctx.permission.assert({
+        sessionID, agent: context.agent, action: "defer_compaction", resources: [reason], save: ["*"],
+        source: { type: "tool", messageID: context.messageID, id: context.id },
+      })
+    } catch (error) {
+      gateStat(sessionID, "deferUserRefused")
+      throw error
+    }
     const current = await ctx.session.get({ sessionID })
     if (sessions.get(sessionID)?.deferral !== decision || !sameRound(decision, current)) return "That round ended before deferral could take effect; normal compaction remains enabled."
     decision.approved = true
+    gateStat(sessionID, "deferGranted")
     return deferredNotice
   }
-  return { onPrompt, onContext, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, registerModels: models.register }
+  // The model-facing early checkpoint: the same compaction the trigger would run,
+  // just earlier and model-steered. Approval-free by design — it releases context,
+  // never holds it — and once per round.
+  const checkpointNow = async (input: { readonly keep?: string }, context: ToolContext) => {
+    const { sessionID } = context
+    let info: SessionInfo, rows: readonly Row[]
+    try {
+      [info, rows] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.context({ sessionID })])
+    } catch (error) {
+      log("checkpoint now", error)
+      return "Checkpointing is unavailable right now: the conversation could not be read. Nothing changed."
+    }
+    if (running(rows)) return "A compaction is already running; let it finish before checkpointing again. Nothing changed."
+    if (info.revert || info.time.busy === undefined) return "Checkpointing is available during an active round without a staged revert. Nothing changed."
+    const entry = state(sessionID)
+    if (entry.checkpointed && sameRound(entry.checkpointed, info)) return "This round already checkpointed at your request; continue the work. Nothing changed."
+    const keep = typeof input.keep === "string" ? input.keep.trim().slice(0, 500) : ""
+    const checkpoint = activeCheckpoint(rows)
+    const index = checkpoint === null ? -1 : rows.findIndex((row) => row.id === checkpoint)
+    const growth = conversationTokens(index < 0 ? rows : rows.slice(index + 1))
+    entry.checkpointed = { busy: info.time.busy, idle: info.time.idle }
+    // The keep note rides the hint channel as round-scoped relevance evidence for the
+    // working state, exactly like the queued message of a deferred-marker compaction.
+    if (keep) entry.hint = `checkpoint_now keep: ${keep}`
+    await requestCompact(sessionID, checkpoint, growth)
+    gateStat(sessionID, "checkpoints")
+    return `Checkpointing now${keep ? " (keep note attached)" : ""}: the conversation is archived and you continue from the small working state. Everything returns with recall.`
+  }
+  return { onPrompt, onContext, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, checkpointNow, registerModels: models.register }
 }
 
 /** Register the documented v2 hooks and tools. */
@@ -678,6 +745,13 @@ export async function install(ctx: Plugin.Context) {
       input: { type: "object", properties: { id: { type: "string" }, query: { type: "string" }, layer: { type: "string", enum: [...LAYERS] }, page: { type: "integer", minimum: 1 } }, additionalProperties: false },
       options: { codemode: false },
       execute: async (input, context) => ({ content: await controller.recall(context.sessionID, input as RecallInput) }),
+    })
+    editor.add({
+      name: "checkpoint_now",
+      description: CHECKPOINT_NOW_DESCRIPTION,
+      input: { type: "object", properties: { keep: { type: "string", minLength: 1, maxLength: 500, description: "One line of what must survive into the working state." } }, additionalProperties: false },
+      options: { codemode: false },
+      execute: async (input, context) => ({ content: await controller.checkpointNow(input as { keep?: string }, context) }),
     })
   })
   // The deferral gate is the only consumer of the experimental permission surface.

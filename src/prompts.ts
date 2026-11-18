@@ -38,16 +38,23 @@ layer (default conversation everywhere) is the depth to read or search:
   full          everything interleaved, plus archive notes
 Raise the depth only when the question needs it. layer and page also work as direct parameters: for a query they set the search depth and result page; for an id they fill in any depth or page the address omits.
 
-Everything recall returns stays live for the rest of the episode.`
+Everything recall returns stays live for the rest of the episode.
 
-/** Injected at the budget gate: one evaluation step before compaction proceeds. */
-export const budgetGateNotice = (tokens: number, budget: number) =>
-  `NextDCP budget gate — raw conversation is over the compaction budget (~${Math.round(tokens)} tokens, budget ${Math.round(budget)}). Compaction proceeds after your next step unless you request a deferral first. Compaction is the designed default: the cut is archived and originals come back with recall.
-Your next reply is the compactor's primary input: state in-flight files, decisions and the exact next action plainly, so the checkpoint keeps them.
-1. Continue — compaction happens; recall what you still need.
-2. defer_compaction(reason) — only if the rest of this round genuinely needs simultaneous raw access (cross-file comparison, large diffs) and recall would materially impair the work. Every call prompts the user and is usually refused; prefer 3.
-3. Delegate — if the bulky work doesn't need this conversation's raw history, hand it to a general subagent with its own window and let it return a bounded result.`
+Context model: this session keeps raw history under a compaction budget. At the budget crossing you get one gate notice — an automated trailing message, never a user message — and decide in that reply: continue (default; archived material returns via recall), checkpoint_now(keep) before a context-heavy phase, defer_compaction(reason) when the round truly needs simultaneous raw context, or delegate bulky independent work to a subagent.`
 
-export const DEFER_COMPACTION_DESCRIPTION = `Request user approval to defer NextDCP's automatic mid-round budget compaction for the current round only. Callable only while a NextDCP budget gate notice is active; anywhere else it refuses without prompting. Every call prompts the user for approval, so prefer delegating bulky work to a general subagent with its own window. Each use requires user approval through this tool; never assume consent. Use only for a concrete task already in progress that needs unusually large simultaneous context. Explain what must remain together and why checkpointing plus recall would materially impair the work. Do not request speculative headroom or ask again after refusal. The whole conversation must fit the model's window (about 80% of it is the grant ceiling; an unknown window is refused). Approval leaves manual compaction and native overflow handling enabled; the next round starts from the full context and re-evaluates on its own.`
+/** Injected at the budget gate: one evaluation step before compaction proceeds.
+ *  The window clause is omitted when the model window is unknown. */
+export const budgetGateNotice = (tokens: number, budget: number, window?: number) =>
+  `[Compaction budget gate — automated notice, not a user message]
+Raw conversation ~${Math.round(tokens)} est. tokens (budget ${Math.round(budget)}${typeof window === "number" && window > 0 ? `, ~${Math.round((tokens / window) * 100)}% of the ${Math.round(window)}-token window` : ""}). Decide in THIS reply when the compaction cut lands; everything cut is archived losslessly, one recall away.
+• Continue (default) — after your next step, which still runs with full raw context. Name in-flight files, decisions and the exact next action in that reply: it anchors the working state.
+• checkpoint_now(keep) — immediately, before a context-heavy phase (large reads, refactor, verbose build), so that phase starts from the small base. keep: what must survive.
+• defer_compaction(reason) — not this round: it needs many large items live at once (cross-file comparison, large-diff correlation) and recall would materially impair it. User approval required.
+• Delegate bulky independent work to a subagent with its own window.
+Any other tool call or plain text = continue.`
+
+export const DEFER_COMPACTION_DESCRIPTION = `Defer this session's automatic mid-round compaction for the current round: call at the budget gate when the rest of the round needs many large items live at once (cross-file comparison, large-diff correlation) and recall would materially impair the work. State what must remain together and why. Callable only while the gate notice is active; anywhere else it refuses without prompting. Each call asks the user to approve; a grant must fit the model window (about 80% of it is the ceiling; an unknown window is refused). Do not ask again after refusal. A grant lasts one round: manual compaction and native overflow handling stay enabled, and the next round re-evaluates from the full context.`
+
+export const CHECKPOINT_NOW_DESCRIPTION = `Checkpoint now: compact this conversation immediately and continue from the small working state. Call at a natural pause before a context-heavy phase (large reads, refactors, long builds) instead of waiting for the gate mid-phase; everything archived returns with recall. Optional keep: one line of what must survive.`
 
 

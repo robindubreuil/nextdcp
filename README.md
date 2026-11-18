@@ -1,7 +1,8 @@
 # nextdcp
 
-Bounded task-focused working memory, on-demand `recall`, and
-user-approved round-scoped compaction deferral for OpenCode V2 (**v2.2.5+**). The host supplies
+Bounded task-focused working memory, on-demand `recall`, a budget gate with
+`checkpoint_now`, and user-approved round-scoped compaction deferral for
+OpenCode V2 (**v2.2.5+**). The host supplies
 `@opencode/plugin`; the declared
 peer range is `>=2.2.5 <3`. There are no additional runtime dependencies. The
 published package contains separate, self-contained ESM server and TUI bundles;
@@ -91,11 +92,37 @@ Summaries are still lossy. Neither quality-neutral substitution nor lower total
 cost is guaranteed; compare representative workloads before choosing a cheaper
 default. Original archived data remains available through `recall`.
 
+## The budget gate
+
+When the raw conversation crosses the `budget` threshold mid-round, compaction
+pauses for one evaluation step. The model receives one automated notice —
+appended as the final conversation message, labeled as automated, never a user
+message — with the estimated tokens, the budget, and the share of the model
+window, and decides in that reply:
+
+- **Continue (default):** the next step still runs with full raw context; the
+  cut lands right after it. Any other tool call or plain text means continue.
+- **`checkpoint_now(keep)`:** cut **now** — before a context-heavy phase
+  (large reads, refactor, verbose build) — so that phase starts from the small
+  working state. The optional one-line `keep` rides to the working-state model
+  as relevance evidence. Approval-free and once per round.
+- **`defer_compaction(reason)`:** hold the raw context for one round — see the
+  next section.
+- Delegating the bulky independent part to a subagent with its own window.
+
+The whole regime — gate, recall, checkpoint — is stated once in the `recall`
+tool description, so the notice itself stays a short trigger. A crossing with
+no live round, a staged revert, or compaction already running or cooling down
+compacts silently, as before. A round that ends before its next build repays
+the consumed crossing immediately. Gate, deferral, and checkpoint outcomes are
+counted per session in plugin storage; deleting the session removes them.
+
 ## Defer compaction for one round
 
 For work that genuinely needs unusually large simultaneous context, the model can
 call `defer_compaction` with a concrete reason why checkpointing plus recall would
-impair the current task. The tool uses OpenCode's native approval prompt (permission
+impair the current task. The tool is callable only while the budget-gate notice is
+open; anywhere else it refuses without prompting. The tool uses OpenCode's native approval prompt (permission
 `defer_compaction`, default `ask`), including **Always allow**. Configured permission
 rules are respected. Each round still needs its own tool call; a refusal cannot be
 retried in that round.
@@ -129,7 +156,8 @@ from recent completed requests; without such usage the raw estimate applies.
 | Option | Default | Meaning |
 |---|---:|---|
 | `idle` | `25000` | After a successful turn with this much new conversation, compact on the **next prompt**, not while idle. Set `false` to disable. Subagent sessions are ignored. |
-| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. System instructions and tool definitions are excluded. Set `false` to disable. |
+| `budget` | `min(50% of model window, 100000)` | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. A live-round crossing first opens the budget gate. System instructions and tool definitions are excluded. Set `false` to disable. |
+| `notice` | `tail` | Placement of the budget-gate notice: `tail` appends it as the final conversation message (no cached-prefix churn); `system` uses a system part for providers that drop trailing messages. |
 | `memory.budget` | `2000` | Maximum estimated tokens for the complete rendered working state, including headings and references. Target is normally about 1000 or less. Independent of conversation age and model window. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |
 
@@ -182,13 +210,14 @@ the eventual summary is not guaranteed to have the same cache discount as one
 generated immediately.
 
 The hard-budget trigger still runs immediately during long turns and counts
-conversation only; OpenCode's native overflow handling still applies to system
+conversation only; a live-round crossing opens the budget gate instead of
+compacting at once. OpenCode's native overflow handling still applies to system
 instructions and tool definitions. A
 per-session compaction guard clears on completion, failure, rejected
 admission, a later successful execution with no compaction running, or after
 three minutes. After a failed compaction, the plugin waits three minutes before
 requesting another. Model-window lookups are cached per provider and model.
-Deleting a session removes its archived data.
+Deleting a session removes its archived data and gate counters.
 
 Forks copy their inherited checkpoint chain and original rows/tool calls
 into independent storage. Copied checkpoint IDs are matched against the
