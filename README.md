@@ -103,20 +103,31 @@ window, and decides in that reply:
 
 - **Continue (default):** the next step still runs with full raw context; the
   cut lands right after it. Any other tool call or plain text means continue.
-- **`checkpoint_now(keep)`:** cut **now** — before a context-heavy phase
-  (large reads, refactor, verbose build) — so that phase starts from the small
-  working state. The optional one-line `keep` rides to the working-state model
-  as relevance evidence. Approval-free and once per round.
 - **`defer_compaction(reason)`:** hold the raw context for one round — see the
   next section.
 - Delegating the bulky independent part to a subagent with its own window.
+
+The evaluation window doubles as the generation window: while the model reads
+the notice, the would-be episode is archived and its handoff is generated
+statelessly in the background. When the gate closes on continue — the common
+case — the cut commits that precomputed handoff with no additional model
+request, so the gate adds no latency at the cut. A granted deferral, an
+explicit `checkpoint_now` keep note, or any boundary that moved past what the
+window covered discards it, and that cut generates inline exactly as before.
+Calling `checkpoint_now` while a gate is open is an alias for continue — the
+cut lands one step later anyway — with the optional `keep` still riding to the
+working-state model as relevance evidence; outside a gate it cuts immediately,
+approval-free and once per round, at a natural pause before a context-heavy
+phase (large reads, refactor, verbose build) so that phase starts from the
+small working state.
 
 The whole regime — gate, recall, checkpoint — is stated once in the `recall`
 tool description, so the notice itself stays a short trigger. A crossing with
 no live round, a staged revert, or compaction already running or cooling down
 compacts silently, as before. A round that ends before its next build repays
-the consumed crossing immediately. Gate, deferral, and checkpoint outcomes are
-counted per session in plugin storage; deleting the session removes them.
+the consumed crossing immediately. Gate, deferral, checkpoint, and precompute
+outcomes are counted per session in plugin storage; deleting the session
+removes them.
 
 ## Adaptive budget
 

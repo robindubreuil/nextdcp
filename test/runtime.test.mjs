@@ -1391,7 +1391,8 @@ test("deferral defaults to native ask without overriding configured permission r
     }])
     await tool.execute(deferralInput, toolContext)
     assert.equal(h.state.permissions.length, 1, "an already-approved round needs no second permission request")
-    assert.ok(h.storage.writes.every((write) => write.key.endsWith("gate-stats")), "exemptions are not persisted")
+    assert.ok(h.storage.writes.every((write) => write.key.endsWith("gate-stats") || write.key.includes("/rows/")),
+      "exemptions are not persisted; the only new writes are the gate window's row archive and telemetry")
   } finally { cleanup() }
 })
 
@@ -1430,6 +1431,110 @@ test("the budget gate arms at the crossing and pays it at the next build", async
   assert.equal(h.state.compact, 1, "the next build closes the gate and compacts")
 })
 
+test("a gate-window precompute commits at close without another generation", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  // Seed one cut so the gate window has a structured prior working state to patch.
+  const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
+  assert.equal(h.state.prompts.length, 1, "the seed generated inline")
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
+  await armGate(h)
+  assert.equal(h.state.stateless.length, 1, "the evaluation window runs its patch generation")
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "the next build closes the gate")
+  h.state.rows = [...h.state.rows, running("c2")]
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.ok(item.result, "the close commits the precomputed handoff")
+  assert.equal(h.state.prompts.length, 1, "the commit added no inline generation")
+  assert.equal(h.state.stateless.length, 1, "the commit added no stateless generation")
+  const episode = (await h.store.getCheckpoint("c2")).episode
+  assert.equal(episode.id, "E2", "the precomputed episode id is reused, not skipped")
+  assert.deepEqual(episode.rowIDs, ["u"], "the episode carries the window's rows")
+  await setImmediate()
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 1, precomputeHits: 1, gateAliases: 0 })
+})
+
+test("a granted deferral discards the precompute; an unexpected cut generates inline", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
+  await armGate(h)
+  assert.equal(h.state.stateless.length, 1, "the granted window ran its precompute")
+  assert.match(await defer(h), /deferred for this round only/)
+  // The held round accumulates rows the precomputed handoff never saw; a cut during
+  // that round (user /compact, another plugin) must not commit the stale handoff.
+  h.state.rows = [...h.state.rows, user("held", "work that needed simultaneous context"), running("c2")]
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.ok(item.result, "the cut still produces a handoff")
+  assert.equal(h.state.prompts.length, 2, "the discarded precompute forces inline generation")
+  assert.equal(h.state.stateless.length, 1, "no second stateless request")
+  assert.deepEqual((await h.store.getCheckpoint("c2")).episode.rowIDs, ["u", "held"], "the held round's rows reach the episode")
+  await setImmediate()
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 1, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
+})
+
+test("a failed gate-window generation falls back to the inline cut", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
+  h.state.failStateless = true
+  await armGate(h)
+  h.state.failStateless = false
+  assert.equal(h.state.stateless.length, 1, "the window attempted its generation")
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1)
+  h.state.rows = [...h.state.rows, running("c2")]
+  const item = event()
+  await h.controller.onCompaction(item)
+  assert.ok(item.result, "the close still produces a handoff")
+  assert.equal(h.state.prompts.length, 2, "the close generates inline instead")
+  await setImmediate()
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
+})
+
+test("checkpoint_now at an open gate aliases to continue; a keep note discards the precompute", async () => {
+  const h = harness({ idle: false, budget: 40 })
+  const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
+  await armGate(h)
+  // Without keep: the alias changes nothing; the window's own close commits its precompute.
+  assert.match(await h.controller.checkpointNow({}, toolContext), /The budget gate is already open: the cut lands right after this step, so continue the work\./)
+  assert.equal(h.state.compact, 0, "the alias triggers no compaction of its own")
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "the open gate's own close still lands the cut")
+  h.state.rows = [...h.state.rows, running("c2")]
+  const plain = event()
+  await h.controller.onCompaction(plain)
+  assert.ok(plain.result)
+  assert.equal(h.state.stateless.length, 1, "the window's precompute commits without another generation")
+  assert.equal(h.state.prompts.length, 1, "only the seed generated inline")
+  // With keep at a second gate: the note rides the hint; the precompute is discarded.
+  h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c2", plain.result), user("u2", "z".repeat(800))]
+  await armGate(h)
+  assert.equal(h.state.stateless.length, 2, "the second window precomputed too")
+  assert.match(await h.controller.checkpointNow({ keep: "Preserve the failing test name." }, toolContext), /gate is already open: the cut lands right after this step, so continue the work \(keep note attached\)/)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 2)
+  h.state.rows = [...h.state.rows, running("c3")]
+  const kept = event()
+  await h.controller.onCompaction(kept)
+  assert.ok(kept.result)
+  assert.equal(h.state.prompts.length, 2, "the keep note forced inline generation")
+  assert.match(h.state.prompts.at(-1), /checkpoint_now keep: Preserve the failing test name\./, "the keep note rides the hint channel to the working state")
+  await setImmediate()
+  assert.deepEqual(await h.store.getGateStats(), { gates: 2, silent: 0, continued: 2, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 2, precomputeHits: 1, gateAliases: 2 })
+})
+
 test("notice: system restores the legacy system-part placement without a tail message", async () => {
   const legacy = harness({ idle: false, budget: 40, notice: "system" })
   legacy.state.rows = [user("u", "x".repeat(800))]
@@ -1442,20 +1547,20 @@ test("notice: system restores the legacy system-part placement without a tail me
 })
 
 test("gate outcomes are counted per session, and telemetry failures never gate a trigger", async () => {
-  const zeros = { gates: 0, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0 }
+  const zeros = { gates: 0, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 0, precomputeHits: 0, gateAliases: 0 }
   const h = harness({ idle: false, budget: 40 })
   h.state.rows = [user("u", "x".repeat(800))]
   await armGate(h)
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
-  assert.deepEqual(await h.store.getGateStats(), { ...zeros, gates: 1, continued: 1 })
+  assert.deepEqual(await h.store.getGateStats(), { ...zeros, gates: 1, continued: 1, precomputes: 1 })
   // A failed round repays its consumed crossing.
   const repaid = harness({ idle: false, budget: 40 })
   repaid.state.rows = [user("u", "x".repeat(800))]
   await armGate(repaid)
   repaid.controller.onRoundEnded("s")
   await setImmediate()
-  assert.deepEqual(await repaid.store.getGateStats(), { ...zeros, gates: 1, repaid: 1 })
+  assert.deepEqual(await repaid.store.getGateStats(), { ...zeros, gates: 1, repaid: 1, precomputes: 1 })
   // Without a round stamp the crossing cannot arm and compacts silently.
   const silent = harness({ idle: false, budget: 40 })
   silent.state.rows = [user("u", "x".repeat(800))]
@@ -1481,19 +1586,19 @@ test("deferral outcomes are counted: prompted, granted, physics-refused, user-re
   granted.state.rows = [user("u", "x".repeat(800))]
   await armGate(granted)
   assert.match(await defer(granted), /deferred for this round only/)
-  assert.deepEqual(await stats(granted), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 1, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0 })
+  assert.deepEqual(await stats(granted), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 1, deferUserRefused: 0, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
   const physics = harness({ idle: false, budget: 100 })
   physics.state.rows = [user("u1", "x".repeat(360_000))]
   await armGate(physics)
   assert.match(await defer(physics), /grant ceiling/)
-  assert.deepEqual(await stats(physics), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 1, checkpoints: 0 })
+  assert.deepEqual(await stats(physics), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 1, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
   assert.equal(physics.state.permissions.length, 0, "physics refuses before spending the user's attention")
   const refused = harness({ idle: false, budget: 40 })
   refused.state.rows = [user("u", "x".repeat(800))]
   await armGate(refused)
   refused.ctx.permission.assert = async () => { throw new Error("denied") }
   await assert.rejects(defer(refused))
-  assert.deepEqual(await stats(refused), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 0, deferUserRefused: 1, deferPhysicsRefused: 0, checkpoints: 0 })
+  assert.deepEqual(await stats(refused), { gates: 1, silent: 0, continued: 0, repaid: 0, deferPrompted: 1, deferGranted: 0, deferUserRefused: 1, deferPhysicsRefused: 0, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
 })
 
 test("checkpoint_now compacts on request, carries the keep note, and runs once per round", async () => {

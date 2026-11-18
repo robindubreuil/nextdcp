@@ -316,7 +316,7 @@ signatures, or hidden reasoning. Tool output is not clipped.
 
 The `recall` tool description is the *entire* protocol the model needs to know;
 since v0.9 it also carries the standing context model — budget, gate, continue,
-`checkpoint_now`, `defer_compaction`, delegation — so a gate notice only has to
+`defer_compaction`, delegation — so a gate notice only has to
 trigger, not teach. There is
 nothing in the system prompt, no message-ID tags, no nudges, no reminders and no
 priority labels — with one exception: the budget-gate notice, one automated
@@ -369,9 +369,16 @@ one model-requested:
   compact when growth since the checkpoint is at least `min(idle, budget / 4)`.
   A live-round crossing first opens the **budget gate**: compaction pauses one
   evaluation step while an automated notice — numbers only; options continue
-  (default), `checkpoint_now`, `defer_compaction`, delegate — rides the
+  (default), `defer_compaction`, delegate — rides the
   conversation tail (option `notice: "system"` restores the legacy system
-  part). The next build of the same round and checkpoint closes the gate and
+  part). The evaluation window doubles as the generation window (v0.11): the
+  would-be episode is archived and its handoff generated statelessly while the
+  model reads the notice, so a gate that closes on continue commits that
+  precomputed handoff with no additional model request — the gate adds no
+  latency at the cut. The precompute is discarded — that cut generates inline
+  exactly as before — when a deferral is granted, when `checkpoint_now` leaves
+  an explicit keep note, or when the cut's boundary no longer matches what the
+  window covered (same parent, window rows a prefix of the cut's). The next build of the same round and checkpoint closes the gate and
   compacts; a gate still open when its round ends or fails is repaid
   immediately, unless a deferral grant held it. Without a live-round stamp —
   unreadable round, staged revert, guard or cooldown active — the crossing
@@ -381,8 +388,11 @@ one model-requested:
   than any trigger, at a natural pause before a context-heavy phase.
   Approval-free by design — it releases context, never holds it — once per
   round, and refused politely while a compaction runs or a revert is staged.
-  Its optional `keep` line rides the same hint channel as a queued prompt:
-  relevance evidence for the working state, never instructions.
+  At an open gate it is an alias for continue (v0.11): the crossing already
+  holds the cut one step away, so exactly one compaction path lands there; its
+  optional `keep` line still rides the same hint channel as a queued prompt —
+  relevance evidence for the working state, never instructions — and discards
+  the window's precompute, since that handoff cannot carry the note.
 - **Budget thermostat (v0.10).** The auto `budget` is learned per **main model**
   from recall pressure. Recall executions are counted per **cycle** (one committed
   handoff to the next) and folded into an EMA (α = 0.5) persisted at
@@ -403,7 +413,8 @@ one model-requested:
   three minutes. After `session.compaction.failed`, new requests are blocked for
   three minutes so a persistent failure cannot cause a retry on every step. The
   event subscriber retries if its stream ends unexpectedly; model windows are
-  cached by provider and model. Gate, deferral and checkpoint outcomes are
+  cached by provider and model. Gate, deferral, checkpoint and precompute
+  outcomes are
   counted per session in a `gate-stats` storage key — telemetry only, never a
   trigger input; a failed count is reported and swallowed. On
   `session.deleted`, the session's episode notes graduate into the project

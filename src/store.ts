@@ -32,12 +32,14 @@ export type GateStats = {
   gates: number; silent: number; continued: number; repaid: number
   deferPrompted: number; deferGranted: number; deferUserRefused: number; deferPhysicsRefused: number
   checkpoints: number
+  precomputes: number; precomputeHits: number; gateAliases: number
 }
 
 const ZERO_STATS: GateStats = {
   gates: 0, silent: 0, continued: 0, repaid: 0,
   deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0,
   checkpoints: 0,
+  precomputes: 0, precomputeHits: 0, gateAliases: 0,
 }
 const statsShape = (value: unknown): value is GateStats =>
   object(value) && Object.keys(ZERO_STATS).every((key) => typeof value[key] === "number" && Number.isFinite(value[key]) && (value[key] as number) >= 0)
