@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { budgetFailure, episodeNote, measureWorking, parseHandoff, renderWorking, validWorking } from "../src/working.ts"
+import { budgetFailure, episodeNote, measureWorking, parseHandoff, parsePatchHandoff, renderWorking, validWorking } from "../src/working.ts"
 import { renderHandoff, resolveMemory } from "../src/memory.ts"
 
 const working = (extra = {}) => ({ objective: "Implement bounded working memory", constraints: ["Do not disturb the active plugin."],
@@ -76,6 +76,38 @@ test("malformed or incomplete responses and invented references fail closed with
   }
   for (const invalid of [null, [], { ...working(), unknown: "x" }, working({ state: [""] }), working({ constraints: "not a list" })]) {
     assert.equal(validWorking(invalid), false)
+  }
+})
+
+test("a patch carries omitted fields forward and replaces present ones entirely", () => {
+  const prior = working({ references: [{ id: "E1", why: "Earlier design decision" }] })
+  const patch = (extra = {}) => JSON.stringify({ archive: "Title: Patched\nSecond episode work.", working: {}, retiredConstraints: [], ...extra })
+  assert.deepEqual(parsePatchHandoff(patch(), prior, [], ids).working, prior, "an empty patch changes nothing but the note")
+  const parsed = parsePatchHandoff(patch({ working: { next: ["Ship it."], state: [] } }), prior, [], ids)
+  assert.deepEqual(parsed.working, { ...prior, next: ["Ship it."], state: [] })
+})
+
+test("a patch retires constraints under the same exact-quote proof", () => {
+  const prior = working()
+  const retirement = { constraint: prior.constraints[0], messageID: "u9", quote: "You may now replace the active plugin." }
+  const users = [{ id: "u9", type: "user", text: `Finished testing. ${retirement.quote}` }]
+  const patch = (extra = {}) => JSON.stringify({ archive: "Title: Patched\nRetired a constraint.", working: {}, retiredConstraints: [], ...extra })
+  const parsed = parsePatchHandoff(patch({ retiredConstraints: [retirement] }), prior, users, ids)
+  assert.deepEqual(parsed.working.constraints, [])
+  assert.deepEqual(parsed.retiredConstraints, [retirement])
+  for (const invalid of [[], [{ ...users[0], id: "old" }], [{ ...users[0], text: "not a matching quote" }]]) {
+    assert.throws(() => parsePatchHandoff(patch({ retiredConstraints: [retirement] }), prior, invalid, ids), /verbatim quote/)
+  }
+})
+
+test("an invalid patch fails closed: unknown fields, bad types, invented references", () => {
+  const patch = (extra = {}) => JSON.stringify({ archive: "Title: Patched\nBody.", working: {}, retiredConstraints: [], ...extra })
+  for (const bad of ["not JSON", patch({ archive: "no title line" }), patch({ working: { unknown: "x" } }), patch({ working: { objective: "" } }),
+    patch({ working: { state: "not a list" } }), patch({ working: { constraints: [""] } }),
+    patch({ working: { references: [{ id: "E999", why: "invented" }] } }),
+    patch({ working: { references: Array.from({ length: 4 }, () => ({ id: "E1", why: "directory" })) } }),
+  ]) {
+    assert.throws(() => parsePatchHandoff(bad, working(), [], ids), /patch schema|valid JSON|Title|unavailable archive|handoff schema/)
   }
 })
 

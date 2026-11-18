@@ -1,6 +1,7 @@
 import type { ArchivedCall } from "./tokens.ts"
 import { planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { object } from "./guards.ts"
+import { closeCycle, effectiveBudget, thermostatModels, type BudgetBounds, type ThermostatEntry, type ThermostatModels } from "./thermostat.ts"
 
 // The v2 storage domain accepts JSON; storing serialized records also keeps rows as plain text.
 export type Storage = {
@@ -86,6 +87,40 @@ export function rowCalls(row: Row): ArchivedCall[] {
     }
   }
   return calls
+}
+
+/** A project-scoped, JSON-only wrapper: records shared by every session of this
+ *  project instance. Failure-tolerant by contract — the callers treat these as
+ *  advisory and must never let them block a trigger or a cut. */
+export function createProjectStore(storage: Storage, report: Reporter = defaultReport) {
+  const thermostatKey = "project/thermostat"
+  const get = async <T>(name: string) => decode<T>(await storage.get(name), name)
+  const put = async (name: string, value: unknown) => storage.set(name, encode(value))
+  // A record that cannot even be decoded is treated as absent: the next write
+  // self-heals over it rather than permanently blocking the loop.
+  const readModels = async (): Promise<ThermostatModels> => {
+    try { return thermostatModels(await get<unknown>(thermostatKey)) }
+    catch (error) { report("Unable to read the budget thermostat; using defaults", error); return {} }
+  }
+  return {
+    /** The learned thermostat state per model, dropping corrupt entries. */
+    readThermostat: () => readModels(),
+    /** Fold one completed cycle into a model's entry and persist it. Returns the
+     *  new entry, or undefined when storage failed (reported, never thrown). */
+    closeCycle: async (model: string, recalls: number, bounds: BudgetBounds): Promise<ThermostatEntry | undefined> => {
+      try {
+        return await exclusive(thermostatKey, async () => {
+          const models = await readModels()
+          const entry = closeCycle(models[model], recalls, bounds)
+          await put(thermostatKey, { ...models, [model]: entry })
+          return entry
+        })
+      } catch (error) {
+        report(`Unable to record a thermostat cycle for ${model}`, error)
+        return undefined
+      }
+    },
+  }
 }
 
 /** A session-scoped, JSON-only wrapper over the verified v2 plugin storage API. */

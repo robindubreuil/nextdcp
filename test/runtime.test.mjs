@@ -841,10 +841,155 @@ test("unrepairable state or constraint overflow commits the shortest valid artif
     assert.ok(second.result?.summary.includes(material), "the whole state/constraint commits, never sliced to fit")
     assert.ok((await h.store.getCheckpoint("c2")).working[field].includes(material), "the durable record keeps it whole")
     assert.match(await h.store.getRow("u2"), /original never discarded/)
-    assert.equal(h.state.prompts.length, 3)
+    // First cut + patch attempt (over-budget merge, falls back) + full generation + repair.
+    assert.equal(h.state.prompts.length, 4)
     assert.match(h.state.warnings.at(-1).data.message, /accepted the shortest valid handoff/)
     assert.equal((await h.store.getCheckpoint("c1")).working.constraints[0], "Preserve the exact request.")
   }
+})
+
+test("a structured prior invites a minimal patch; omitted fields carry forward and present fields replace", async () => {
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "first task"), running("c1")])
+  assert.ok(!h.state.prompts[0].includes("Patch mode"), "the first cut has no structured prior")
+  h.state.queue = [{ archive: "Title: Patched episode\nSecond task completed.", working: { next: ["Run the release."] }, retiredConstraints: [] }]
+  h.state.rows = [completed("c1", first), user("u2", "second task"), running("c2")]
+  const second = event()
+  await h.controller.onCompaction(second)
+  assert.match(h.state.prompts.at(-1), /Patch mode/, "the second cut asks for a patch")
+  assert.equal(h.state.prompts.length, 2, "a valid patch commits in one generation")
+  const record = await h.store.getCheckpoint("c2")
+  assert.deepEqual(record.working, { objective: "Continue current work", constraints: ["Preserve the exact request."], state: [], next: ["Run the release."], references: [] })
+  assert.match(second.result.summary, /Run the release\./)
+  assert.doesNotMatch(second.result.summary, /Patch mode/)
+})
+
+test("an invalid patch falls back to one fresh full regeneration, not a repair", async () => {
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "first"), running("c1")])
+  h.state.queue = [{ archive: "Title: Bad patch\nNo.", working: { objective: "" }, retiredConstraints: [] }]
+  h.state.rows = [completed("c1", first), user("u2", "second"), running("c2")]
+  const second = event()
+  await h.controller.onCompaction(second)
+  assert.equal(h.state.prompts.length, 3, "first cut, failed patch, full regeneration")
+  assert.ok(!h.state.prompts.at(-1).includes("Patch mode") && !h.state.prompts.at(-1).includes("The previous attempt"), "the fallback is a fresh full prompt")
+  assert.equal((await h.store.getCheckpoint("c2")).working.objective, "Continue current work")
+})
+
+test("an over-budget patch merge falls back to full regeneration, which prunes it", async () => {
+  const h = harness({ memory: { budget: 256 } })
+  const first = await compactRows(h, [user("u1", "first"), running("c1")])
+  h.state.queue = [{ archive: "Title: Swollen patch\nGrew the state.", working: { state: ["swollen ".repeat(200)] }, retiredConstraints: [] }]
+  h.state.rows = [completed("c1", first), user("u2", "second"), running("c2")]
+  const second = event()
+  await h.controller.onCompaction(second)
+  assert.equal(h.state.prompts.length, 3, "the patch is not a candidate; full regeneration commits instead")
+  assert.deepEqual((await h.store.getCheckpoint("c2")).working.state, [])
+  assert.ok(Math.ceil(second.result.summary.length / 4) <= 256)
+})
+
+// The fire-and-forget thermostat write lands after onCompaction returns; wait for it.
+const awaitThermostat = async (h, cycles) => {
+  for (let tick = 0; tick < 50; tick++) {
+    const raw = h.storage.values.get("project/thermostat")
+    if (raw && Object.values(JSON.parse(raw)).some((entry) => entry.cycles >= cycles)) return JSON.parse(raw)
+    await setImmediate()
+  }
+  return h.storage.values.has("project/thermostat") ? JSON.parse(h.storage.values.get("project/thermostat")) : undefined
+}
+
+test("the thermostat adapts the auto budget per model from committed-cut recall pressure", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  t.mock.method(console, "info", () => {})
+  const h = harness()
+  h.state.rows = [user("u0", "small warmup")]
+  await h.controller.onContext(event()) // stamps the session's main model
+  let previous
+  for (let cut = 1; cut <= 5; cut++) {
+    previous = await compactRows(h, cut === 1
+      ? [user(`u${cut}`, "task"), running(`c${cut}`)]
+      : [completed(`c${cut - 1}`, previous), user(`u${cut}`, "task"), running(`c${cut}`)])
+  }
+  assert.deepEqual(await awaitThermostat(h, 5), { "provider/model": { ema: 0, cycles: 5, budget: 40_500 } },
+    "five zero-recall cycles: three hold, then two lower steps inside bounds")
+  h.state.rows = [completed("c5", previous), user("big", "y".repeat(260_000))]
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.equal(h.state.compact, 0, "the crossing arms the gate instead of compacting")
+  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /budget 40500/, "the notice prints the adapted budget")
+})
+
+test("an explicit options.budget wins absolutely over the learned budget", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness({ idle: false, budget: 40 })
+  h.state.rows = [user("u0", "small warmup")]
+  await h.controller.onContext(event())
+  const first = await compactRows(h, [user("u1", "task"), running("c1")])
+  await h.controller.recall("s", { id: "catalog" })
+  await compactRows(h, [completed("c1", first), user("u2", "task"), running("c2")])
+  assert.deepEqual(await awaitThermostat(h, 2), { "provider/model": { ema: 0.5, cycles: 2, budget: 50_000 } },
+    "evidence still accumulates, one recall between two cuts")
+  h.state.rows = [user("u", "x".repeat(800))]
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /budget 40[^0]/, "the explicit budget triggers, never the learned one")
+})
+
+test("recall executions feed only the current cycle, and subagent sessions never feed the loop", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.state.rows = [user("u0", "small warmup")]
+  await h.controller.onContext(event())
+  const first = await compactRows(h, [user("u1", "task"), running("c1")])
+  await h.controller.recall("s", { id: "catalog" })
+  const second = await compactRows(h, [completed("c1", first), user("u2", "task"), running("c2")])
+  await h.controller.recall("s", { id: "catalog" })
+  await h.controller.recall("s", { id: "catalog" })
+  await compactRows(h, [completed("c2", second), user("u3", "task"), running("c3")])
+  assert.deepEqual(await awaitThermostat(h, 3), { "provider/model": { ema: 1.25, cycles: 3, budget: 50_000 } },
+    "the counter resets at each committed cut: cycles carried 1 then 2 recalls into the EMA")
+  const sub = harness()
+  sub.state.info = { model, time: { busy: 1 }, parentID: "parent-session" }
+  sub.state.rows = [user("u0", "small warmup")]
+  await sub.controller.onContext(event())
+  await sub.controller.recall("s", { id: "E1" })
+  await compactRows(sub, [user("u1", "task"), running("c1")])
+  await setImmediate()
+  assert.equal(sub.storage.values.get("project/thermostat"), undefined, "a subagent's cycles are never folded")
+})
+
+test("an unknown window disables the thermostat alongside the auto budget", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.state.models = [{ ...model, enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [], limit: {} }]
+  h.state.rows = [user("u0", "small warmup")]
+  await h.controller.onContext(event())
+  await h.controller.recall("s", { id: "E1" })
+  const result = await compactRows(h, [user("u1", "task"), running("c1")])
+  assert.ok(result, "the cut itself is unaffected")
+  await setImmediate()
+  assert.equal(h.storage.values.get("project/thermostat"), undefined, "nothing is learned without physics to clamp against")
+})
+
+test("thermostat storage failures never block a cut or the default budget", async (t) => {
+  const warnings = t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.storage.fail = (key) => key === "project/thermostat"
+  h.state.rows = [user("u0", "small warmup")]
+  await h.controller.onContext(event())
+  await h.controller.recall("s", { id: "E1" })
+  const result = await compactRows(h, [user("u1", "task"), running("c1")])
+  assert.ok(result, "the handoff commits regardless")
+  assert.ok((await h.store.getCheckpoint("c1")).working, "the checkpoint persists")
+  await setImmediate()
+  assert.ok(warnings.mock.calls.some((call) => String(call.arguments[0]).includes("thermostat cycle for provider/model")), "the failure is reported")
+  h.state.rows = [user("u", "x".repeat(260_000))]
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  await setImmediate()
+  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /budget 50000/, "the gate falls back to the static default")
 })
 
 test("deferred admission is guarded, ignores children, does not loop after compaction, and retries rejection", async () => {

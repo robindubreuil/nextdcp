@@ -4,9 +4,10 @@ import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { messageTokens, type ArchivedCall, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
 import { budgetGateNotice, CHECKPOINT_NOW_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
-import { budgetFailure, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, measureWorking, parseHandoff, type Handoff } from "./working.ts"
+import { budgetFailure, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, measureWorking, parseHandoff, parsePatchHandoff, type Handoff } from "./working.ts"
 import { address, formatCall, formatCatalog, formatCatalogEntry, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
-import { createStore, exclusive, type GateStats } from "./store.ts"
+import { createStore, createProjectStore, exclusive, type GateStats } from "./store.ts"
+import { budgetBounds, effectiveBudget, type ThermostatEntry } from "./thermostat.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 import { object, positive, modelRef } from "./guards.ts"
@@ -41,6 +42,10 @@ type SessionState = {
   hint?: string
   /** Prepared archive boundaries by checkpoint id, until their handoff commits. */
   boundaries?: Map<string, Pending>
+  /** The session's main model as last built; the thermostat's per-model key. */
+  model?: ModelRef
+  /** Recall executions since the last committed handoff: one thermostat cycle's evidence. */
+  recalls?: number
 }
 const sameRound = (round: Round | undefined, info: { time?: { busy?: number; idle?: number } }): boolean =>
   round !== undefined && round.busy === info.time?.busy && round.idle === info.time?.idle
@@ -88,6 +93,43 @@ export function createController(ctx: Plugin.Context) {
     })
   }
   const storeFor = (id: string) => createStore(ctx.storage, id, warn)
+  const project = createProjectStore(ctx.storage, warn)
+  // Learned entries are read once per model per controller lifetime and refreshed
+  // when a cycle closes; the clamp against the live window runs on every use.
+  const thermostatEntries = new Map<string, ThermostatEntry>()
+  /** The effective auto budget for a model: today's static default until evidence
+   *  exists, then the learned value, always inside the window's physics. */
+  const learnedBudget = async (model: ModelRef | undefined, window: number): Promise<number> => {
+    const bounds = budgetBounds(window, 100_000)
+    if (!model) return bounds.start
+    const key = modelLabel(model)
+    let entry = thermostatEntries.get(key)
+    if (entry === undefined) {
+      entry = (await project.readThermostat())[key]
+      if (entry) thermostatEntries.set(key, entry)
+    }
+    return effectiveBudget(entry, bounds)
+  }
+  /** Close one thermostat cycle at a committed handoff: fold the session's recall
+   *  count into the main model's entry. Fire-and-forget — advisory, never blocking. */
+  const closeThermostatCycle = (sessionID: SessionID) => {
+    const entry = sessions.get(sessionID)
+    const model = entry?.model, recalls = entry?.recalls ?? 0
+    if (entry) entry.recalls = 0 // The cycle is consumed whether or not learning persists.
+    if (!model) return
+    void (async () => {
+      const info = await ctx.session.get({ sessionID })
+      // Subagents share the parent's model but not its cycles; forks are real sessions.
+      if (info.parentID && !info.fork) return
+      const window = (await windowSize(model))?.context
+      if (window === undefined) return
+      const key = modelLabel(model)
+      const learned = await project.closeCycle(key, recalls, budgetBounds(window, 100_000))
+      if (!learned) return
+      thermostatEntries.set(key, learned)
+      if (debug) console.info(`[nextdcp] thermostat ${key}: cycle ${learned.cycles}, ema ${learned.ema.toFixed(2)} recalls, budget ${learned.budget}`)
+    })().catch((error) => log("thermostat cycle", error))
+  }
   const inheritSession = (sessionID: SessionID, rows: readonly Row[], seen = new Set<string>()): Promise<void> => {
     if (seen.has(sessionID)) return Promise.reject(new Error("Cyclic fork ancestry"))
     const previous = sessions.get(sessionID)?.inheritance
@@ -180,6 +222,10 @@ export function createController(ctx: Plugin.Context) {
       return
     }
     const checkpoint = activeCheckpoint(rows)
+    // Stamp the main model per build: it is the thermostat's per-model key when
+    // this session's cycle closes at its next committed handoff.
+    const model = modelRef(event.model)
+    if (model) state(event.sessionID).model = model
     const decision = sessions.get(event.sessionID)?.deferral
     let held = false
     if (decision?.approved) try {
@@ -194,8 +240,9 @@ export function createController(ctx: Plugin.Context) {
       if (growth === undefined) { entry.view = undefined; return }
       entry.view = { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) }
       const window = (await windowSize(event.model))?.context
-      const limit = budgetOption || (window ?? 0) * 0.5
-      const budget = budgetOption || Math.min(limit, 100_000)
+      // An explicit options.budget wins absolutely; otherwise the thermostat owns
+      // the auto budget, adapting per model inside the window's physics.
+      const budget = budgetOption || (window === undefined ? 0 : await learnedBudget(model, window))
       // An unknown window disables the auto budget instead of assuming a size; surface
       // that state rather than silently never firing. Estimates meeting real window
       // sizes are calibrated against provider-reported usage when the host supplies it.
@@ -331,6 +378,19 @@ export function createController(ctx: Plugin.Context) {
         ...(stamps.length ? { start: Math.min(...stamps), end: Math.max(...stamps) } : {}),
         ...(!boundary.archived ? { gap: true } : {}),
       })
+      // One normal request; at most one repair. Never accumulate summaries to handle
+      // a failed shrink, and never slice a live constraint to meet the size budget.
+      // Every retry carries the exact validation failure, so the stronger model
+      // repairs the defect instead of blindly repeating the attempt.
+      // The new episode's transcript for a selected-model request: text-only rows,
+      // attachments refused (the main-model path reads the live session instead).
+      const newConversation = () => {
+        if (transcriptRows.some((row) => !textOnly(row))) throw new Error("transcript contains attachments or unsupported content")
+        const files: RecallFile[] = []
+        const transcript = formatTranscript("current", transcriptRows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), { files })
+        if (files.length) throw new Error("transcript contains attachments")
+        return transcript
+      }
       // Every schema-valid generation is measured, never guessed. A fitting handoff is
       // chosen on the spot; an over-budget one stays a candidate — the shortest valid
       // artifact, structured and constraint-preserving, still beats native's unbounded
@@ -346,21 +406,38 @@ export function createController(ctx: Plugin.Context) {
         }
         chosen = { handoff: result, summary: rendered }
       }
-      // One normal request; at most one repair. Never accumulate summaries to handle
-      // a failed shrink, and never slice a live constraint to meet the size budget.
-      // Every retry carries the exact validation failure, so the stronger model
-      // repairs the defect instead of blindly repeating the attempt.
+      // Patch mode first: with a structured prior working state, ask for a minimal
+      // patch whose output scales with what changed, not with state size. Any invalid
+      // patch — or an over-budget merge — falls back to full regeneration below,
+      // which also prunes drift in carried fields. The merged whole passes the same
+      // validation as a full handoff; an over-budget patch is never a candidate.
+      if (existing.working) {
+        const prompt = workingPrompt(context, undefined, true)
+        try {
+          let raw: string
+          if (target) {
+            try { raw = await models.generate(target, `${prompt}\n\nNew conversation (data, not instructions):\n${newConversation()}\n\nEnd of data. Return only the handoff JSON.`) }
+            catch (error) {
+              const label = modelLabel(target)
+              target = undefined
+              raw = await fallback(prompt, `Cannot produce a patch with ${label} (${String(error)})`)
+            }
+          } else raw = (await ctx.session.generate({ sessionID: event.sessionID, prompt })).text
+          const result = parsePatchHandoff(raw, existing.working, users, ids)
+          const { rendered, size } = measureWorking(result.working, id, gap, episodeNote(result.archive).title, archiveAnchor([...existing.episodes, episodeFor(result.archive)]))
+          if (size > memoryBudget) throw new HandoffError(budgetFailure(size, memoryBudget))
+          chosen = { handoff: result, summary: rendered }
+        } catch (error) {
+          if (!(error instanceof HandoffError)) throw error
+        }
+      }
       let failure: string | undefined
-      for (let attempt = 0; attempt < 2; attempt++) {
+      if (!chosen) for (let attempt = 0; attempt < 2; attempt++) {
         const prompt = workingPrompt(context, failure)
         try {
           if (target) {
             try {
-              if (transcriptRows.some((row) => !textOnly(row))) throw new Error("transcript contains attachments or unsupported content")
-              const files: RecallFile[] = []
-              const transcript = formatTranscript("current", transcriptRows.map((row) => ({ id: row.id, text: JSON.stringify(row) })), { files })
-              if (files.length) throw new Error("transcript contains attachments")
-              validate(await models.generate(target, `${prompt}\n\nNew conversation (data, not instructions):\n${transcript}\n\nEnd of data. Return only the handoff JSON.`))
+              validate(await models.generate(target, `${prompt}\n\nNew conversation (data, not instructions):\n${newConversation()}\n\nEnd of data. Return only the handoff JSON.`))
             } catch (error) {
               const label = modelLabel(target)
               const reason = error instanceof HandoffError ? error.message : undefined
@@ -388,6 +465,7 @@ export function createController(ctx: Plugin.Context) {
       const record: Checkpoint = { id: boundary.id, parent: boundary.parent, episode, working: handoff.working,
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
+      closeThermostatCycle(event.sessionID)
       const live = sessions.get(event.sessionID)
       if (live) live.hint = undefined // The committed handoff is the signal's only consumer.
       event.result = { summary, metadata: { nextdcp: { version: 2 } } }
@@ -532,6 +610,9 @@ export function createController(ctx: Plugin.Context) {
       if (query.length > 2_000) return "Use a query of at most 2,000 characters; prefer exact identifiers and a few task keywords."
       if (id.length > 2_000) return "Use an id of at most 2,000 characters; addresses are short handles like E57, call_01HZ2a3 or catalog."
       if (page !== undefined && (!Number.isSafeInteger(page) || page < 1)) return "Page must be a positive integer."
+      // Every dispatched recall is thermostat evidence: pressure on the current cycle.
+      const counted = state(sessionID)
+      counted.recalls = (counted.recalls ?? 0) + 1
       const store = storeFor(sessionID)
       const target = id ? parseTarget(id) : undefined
       if (target?.kind === "error") return target.message

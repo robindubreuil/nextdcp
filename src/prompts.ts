@@ -11,8 +11,8 @@ Use constraints for standing user instructions, not a growing list of past task 
 
 Keep at most three references, using only supplied archive IDs. References are optional: do not build a directory of old episodes. Aim below the target size supplied below; the entire rendered working state must fit its ceiling. Preserve essential constraints rather than silently cutting them to fit. Return only the JSON object.`
 
-export const workingPrompt = (context: { through: string; budget: number; previous: unknown; archives: readonly string[]; users: readonly { id: string; start: string }[] }, repair?: string) =>
-  `${WORKING_PROMPT}\n\n${repair ? `The previous attempt failed: ${repair}. Produce a complete valid replacement, not a patch. Be shorter; never silently drop constraints.\n` : ""}` +
+export const workingPrompt = (context: { through: string; budget: number; previous: unknown; archives: readonly string[]; users: readonly { id: string; start: string }[] }, repair?: string, patch = false) =>
+  `${WORKING_PROMPT}\n\n${repair ? `The previous attempt failed: ${repair}. Produce a complete valid replacement, not a patch. Be shorter; never silently drop constraints.\n` : patch ? `Patch mode: the data's previous working state is current, so working carries ONLY changed fields; each present field replaces the previous one entirely (a list replaces the whole list). An omitted field is carried forward unchanged, never dropped. archive and retiredConstraints are as specified above.\n` : ""}` +
   `Target: ${Math.min(1_000, Math.floor(context.budget * 0.6))} estimated tokens; ceiling: ${context.budget} estimated tokens (including headings/references).\n` +
   `Compaction context (data):\n${JSON.stringify(context)}`
 
