@@ -294,7 +294,7 @@ export function createController(ctx: Plugin.Context) {
       // Arm the gate together with its notice. The notice rides the conversation tail
       // — the most salient and the cheapest position: a request-scoped message touches
       // no cached prefix, unlike a system part before the whole history.
-      if (info?.time?.busy !== undefined && current.guard === undefined && (current.cooldownUntil ?? 0) <= Date.now() && !sameRound(current.deferral, info)) {
+      if (info?.time?.busy !== undefined && current.guard === undefined && (current.cooldownUntil ?? 0) <= Date.now() && !sameRound(current.deferral, info) && !recentToolFailure(rows)) {
         current.gate = { busy: info.time.busy, idle: info.time.idle, checkpoint, growth }
         const text = budgetGateNotice(estimate, budget, window)
         if (noticeInSystem) event.system.push({ type: "text", text })
@@ -331,9 +331,12 @@ export function createController(ctx: Plugin.Context) {
     }
     const parent = boundary?.parent
     if (parent) await ensureCheckpoint(sessionID, parent, rows?.find((item) => item.id === parent), rows, seen)
-    // Adoption adds an episode to the searchable chain.
+    // Adoption adds an episode to the searchable chain. The parent's working state and
+    // a failed cycle's reserved episode id both carry over: patch mode resumes after a
+    // native fallback and the catalog shows no hole.
     indexes.delete(sessionID)
-    await store.saveCheckpoint(adoptNative(row, await store.nextEpisode(), boundary))
+    const inherited = parent ? await store.getCheckpoint(parent) : undefined
+    await store.saveCheckpoint(adoptNative(row, boundary?.episode ?? await store.nextEpisode(), boundary, inherited))
     const live = sessions.get(sessionID)
     if (live?.boundaries) live.boundaries.delete(id)
   }
@@ -367,7 +370,7 @@ export function createController(ctx: Plugin.Context) {
       try { target = await models.select(sessionID) } catch { target = undefined }
       const model = target ?? mainModel
       if (!model) return undefined
-      const id = await store.nextEpisode()
+      const id = await store.reservedEpisode(checkpoint)
       const users = episodeRows.flatMap((row) => row.type === "user" && typeof (row as Row & { text?: unknown }).text === "string"
         ? [{ id: row.id, type: "user" as const, text: (row as Row & { text: string }).text }] : [])
       const ids = new Set([...existing.catalog.keys(), id])
@@ -425,7 +428,11 @@ export function createController(ctx: Plugin.Context) {
       prepared.rowIDs.every((rowID, at) => boundary.rowIDs[at] === rowID) ? prepared : undefined
     try {
       const existing = await memoryAt(event.sessionID, rows, boundary.parent)
-      const id = preparedHit?.episode ?? await store.nextEpisode(), included = new Set(boundary.rowIDs)
+      const id = preparedHit?.episode ?? await store.reservedEpisode(boundary.parent)
+      // The reservation rides the pending record: if this cycle fails into native,
+      // the fallback's adoption reuses the id instead of burning another number.
+      await store.pendingEpisode(boundary.id, id)
+      const included = new Set(boundary.rowIDs)
       const transcriptRows = rows.filter((row) => included.has(row.id))
       const stamps = transcriptRows.flatMap((row) => typeof row.time?.created === "number" ? [row.time.created] : [])
       const ids = new Set([...existing.catalog.keys(), id])
@@ -838,7 +845,7 @@ export function createController(ctx: Plugin.Context) {
     if (!gate || !sameRound(gate, info) || gate.checkpoint !== activeCheckpoint(rows))
       return "Compaction deferral is only available at an open budget gate; this request is outside one. Normal compaction and recall remain enabled."
     const reason = input.reason.trim()
-    if (!reason || reason.length > 500) return "Provide a concrete current need of 1 to 500 characters and explain why checkpointing plus recall would materially impair the task."
+    if (!reason || reason.length > 2_000) return "Provide a concrete current need of 1 to 2,000 characters and explain why checkpointing plus recall would materially impair the task."
     if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
     const entry = state(sessionID)
     const previous = entry.deferral
@@ -910,7 +917,7 @@ export function createController(ctx: Plugin.Context) {
     // channel — so exactly one compaction path lands at the crossing.
     const gate = sessions.get(sessionID)?.gate
     if (gate && sameRound(gate, info) && gate.checkpoint === activeCheckpoint(rows)) {
-      const keep = typeof input.keep === "string" ? input.keep.trim().slice(0, 500) : ""
+      const keep = typeof input.keep === "string" ? input.keep.trim().slice(0, 2_000) : ""
       if (keep) {
         const live = state(sessionID)
         live.hint = `checkpoint_now keep: ${keep}`
@@ -923,7 +930,7 @@ export function createController(ctx: Plugin.Context) {
     }
     const entry = state(sessionID)
     if (entry.checkpointed && sameRound(entry.checkpointed, info)) return "This round already checkpointed at your request; continue the work. Nothing changed."
-    const keep = typeof input.keep === "string" ? input.keep.trim().slice(0, 500) : ""
+    const keep = typeof input.keep === "string" ? input.keep.trim().slice(0, 2_000) : ""
     const checkpoint = activeCheckpoint(rows)
     const index = checkpoint === null ? -1 : rows.findIndex((row) => row.id === checkpoint)
     const growth = conversationTokens(index < 0 ? rows : rows.slice(index + 1))
@@ -953,7 +960,7 @@ export async function install(ctx: Plugin.Context) {
     editor.add({
       name: "checkpoint_now",
       description: CHECKPOINT_NOW_DESCRIPTION,
-      input: { type: "object", properties: { keep: { type: "string", minLength: 1, maxLength: 500, description: "One line of what must survive into the working state." } }, additionalProperties: false },
+      input: { type: "object", properties: { keep: { type: "string", minLength: 1, maxLength: 2_000, description: "One line of what must survive into the working state." } }, additionalProperties: false },
       options: { codemode: false },
       execute: async (input, context) => ({ content: await controller.checkpointNow(input as { keep?: string }, context) }),
     })
@@ -975,7 +982,7 @@ export async function install(ctx: Plugin.Context) {
       await ctx.tool.transform((editor) => {
         editor.add({
           name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
-          input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 500, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
+          input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 2_000, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
           options: { permission: "defer_compaction", codemode: false },
           execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
         })
@@ -988,6 +995,20 @@ export async function install(ctx: Plugin.Context) {
   await ctx.session.hook("context", controller.onContext)
   await ctx.session.hook("compaction", controller.onCompaction)
   return controller
+}
+
+/** A tool failure in the last two minutes means the model is mid-diagnosis; cutting
+ *  right then would archive the error detail it still needs. The gate stays closed
+ *  one build — the next context build re-evaluates, and native overflow is the backstop. */
+function recentToolFailure(rows: readonly Row[], now = Date.now()): boolean {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]
+    if (typeof row.time?.created === "number" && now - row.time.created > 120_000) break
+    if (row.type === "user") return false
+    if (row.type === "assistant") return (row.content ?? []).some((part) =>
+      object(part) && part.type === "tool" && object(part.state) && part.state.status === "error")
+  }
+  return false
 }
 
 function textOnly(row: Row): boolean {

@@ -30,9 +30,23 @@ export function assertFits(model: Pick<ModelInfo, "limit">, prompt: string) {
 
 export function createModels(ctx: Plugin.Context) {
   let emit: ((sessionID: SessionID, message: string) => Promise<void>) | undefined
+  const warningEntries = (value: unknown): { time: number; message: string }[] => {
+    if (typeof value !== "string") return []
+    try {
+      const parsed: unknown = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed.filter((item) => object(item) && typeof item.time === "number" && typeof item.message === "string") : []
+    } catch { return [] }
+  }
   const warning = async (sessionID: SessionID, message: string) => {
     console.warn(`[nextdcp] ${message}`)
-    try { await ctx.storage.set(`${root(sessionID)}/warning`, message) } catch { /* The warning must not prevent fallback. */ }
+    try {
+      // Append-only, capped history: every fallback stays auditable in storage long
+      // after the toast is gone; the latest-message key still feeds the picker snapshot.
+      const historyKey = `${root(sessionID)}/warnings`
+      const entries = [...warningEntries(await ctx.storage.get(historyKey)), { time: Date.now(), message }].slice(-10)
+      await ctx.storage.set(historyKey, JSON.stringify(entries))
+      await ctx.storage.set(`${root(sessionID)}/warning`, message)
+    } catch { /* The warning must not prevent fallback. */ }
     try { await emit?.(sessionID, message) } catch { /* Clients may be disconnected. */ }
   }
   const preference = async (id: SessionID): Promise<ModelPreference> => {

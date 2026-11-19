@@ -13,7 +13,7 @@ export type Episode = {
   readonly end?: number
 }
 export type Checkpoint = { readonly id: string; readonly parent: string | null; readonly episode: Episode; readonly working?: WorkingMemory; readonly retiredConstraints?: Handoff["retiredConstraints"] }
-export type Pending = { readonly id: string; readonly parent: string | null; readonly rowIDs: readonly string[]; readonly archived: boolean }
+export type Pending = { readonly id: string; readonly parent: string | null; readonly rowIDs: readonly string[]; readonly archived: boolean; readonly episode?: string }
 
 /** The episode ends at the selected checkpoint (default: running), not at native compaction's retained-tail cut. */
 export function planCut(rows: readonly Row[], checkpoint?: string): { checkpoint: string; parent: string | null; rowIDs: string[] } {
@@ -25,13 +25,16 @@ export function planCut(rows: readonly Row[], checkpoint?: string): { checkpoint
 }
 
 /** A pending record preserves the old chain and archive boundary if generation fell back to native. */
-export function adoptNative(row: Row, episodeID: string, pending?: Pending): Checkpoint {
+export function adoptNative(row: Row, episodeID: string, pending?: Pending, inherited?: Pick<Checkpoint, "working">): Checkpoint {
   if (row.type !== "compaction" || row.status !== "completed" || typeof row.summary !== "string") throw new Error("Not a completed native checkpoint")
   if (pending && pending.id !== row.id) throw new Error("Pending checkpoint does not match")
   return {
     id: row.id,
     parent: pending?.parent ?? null,
     episode: { id: episodeID, summary: row.summary, rowIDs: pending?.rowIDs ?? [], native: true, ...(!pending?.archived ? { gap: true } : {}) },
+    // The parent's working state survives a native fallback: patch mode and rendered
+    // user constraints must not reset to nothing at the next cycle.
+    ...(inherited?.working ? { working: inherited.working } : {}),
   }
 }
 

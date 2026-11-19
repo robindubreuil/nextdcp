@@ -80,3 +80,12 @@ test("corrupt chains fail rather than silently dropping history", () => {
   assert.throws(() => resolveMemory("c2", new Map([["c1", record("c1", null, e1)], ["c2", record("c2", "c1", e1)]])), /Duplicate episode id/)
   assert.throws(() => episodeRows("missing", new Map()), /Missing episode/)
 })
+
+test("a native fallback inherits the parent's working state and the pending's reserved episode", () => {
+  const checkpoint = row("native", "compaction", "completed", { summary: "Native summary" })
+  const prior = { objective: "Continue the rollout", constraints: ["Keep the build green."], state: ["Patch mode is active."], next: ["Run the suite."], references: [] }
+  const adopted = adoptNative(checkpoint, "E7", { id: "native", parent: "c1", rowIDs: ["u7", "a7"], archived: true, episode: "E7" }, { working: prior })
+  assert.equal(adopted.episode.id, "E7", "the reservation riding the pending is adopted, not re-allocated")
+  assert.deepEqual(adopted.working, prior, "patch mode and rendered constraints survive the fallback")
+  assert.equal(adoptNative(checkpoint, "E8").working, undefined, "a root cut has no parent state to inherit")
+})

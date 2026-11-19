@@ -336,6 +336,34 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     await put(counterKey, next)
     return `E${next}`
   })
+  /** Record the episode id a cycle reserved, inside its pending record: a native
+   *  fallback adopting that checkpoint reuses the id, so the counter never burns
+   *  a number on a failed generation and the catalog shows no holes. */
+  const pendingEpisode = async (id: string, episode: string) => {
+    const stored = await getPending(id)
+    if (stored && stored.episode !== episode) await put(key("pending", id), { ...stored, episode })
+  }
+  /** Whether any committed checkpoint already carries this episode id: a reservation
+   *  left by an abandoned branch (revert, precompute) must never be reused then. */
+  const episodeCommitted = async (episode: string): Promise<boolean> => {
+    for (const { id, value } of await all("checkpoints")) {
+      try { if (decode<Checkpoint>(value, key("checkpoints", id))?.episode?.id === episode) return true } catch { /* unreadable record */ }
+    }
+    return false
+  }
+  /** The episode id for a cut below this checkpoint. A failed gate-window precompute
+   *  leaves its reservation here; the next cut for the same parent (or the next
+   *  precompute over it) reuses it — unless the id was committed in the meantime by
+   *  a branch that has since been reverted away. */
+  const reservedEpisode = async (parent: string | null): Promise<string> => {
+    if (parent !== null) {
+      const reserved = await get<string>(key("reserved", parent))
+      if (typeof reserved === "string" && reserved && !(await episodeCommitted(reserved))) return reserved
+    }
+    const episode = await nextEpisode()
+    if (parent !== null) await put(key("reserved", parent), episode)
+    return episode
+  }
   const all = async (kind: string): Promise<{ id: string; value: unknown }[]> => {
     const prefix = `${root}${kind}/`, result: { id: string; value: unknown }[] = []
     let after: string | undefined
@@ -485,5 +513,5 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     } while (after !== undefined)
     for (const key of keys) await storage.remove(key)
   }
-  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, getCheckpoint, saveCheckpoint, chain, nextEpisode, episodeNotes, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
+  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, pendingEpisode, getCheckpoint, saveCheckpoint, chain, nextEpisode, reservedEpisode, episodeNotes, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
 }

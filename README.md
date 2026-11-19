@@ -86,8 +86,10 @@ empty, nextdcp **warns and uses the main model**. It never silently truncates th
 transcript to fit. The estimate is conservative, not an exact provider tokenizer;
 provider rejections also take this fallback. A failed main-model handoff falls
 back to native OpenCode compaction and its configured model. Fallbacks appear in
-the server log, in a toast for the current TUI session, and as the last fallback
-when opening its picker. There is no automatic switch to an arbitrary provider.
+a toast for the current TUI session, as the last fallback when opening its
+picker, in the server process's stderr, and as a timestamped append-only history
+(`sessions/<id>/model/warnings`, last 10) in plugin storage. There is no
+automatic switch to an arbitrary provider.
 
 Summaries are still lossy. Neither quality-neutral substitution nor lower total
 cost is guaranteed; compare representative workloads before choosing a cheaper

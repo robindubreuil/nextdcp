@@ -122,3 +122,28 @@ test("state resolution chooses the selected checkpoint, not a future or reverted
   delete first.working
   assert.match(renderHandoff(resolveMemory("c1", records)), /cold first/)
 })
+
+test("a compactor response framed in prose or fences still yields its payload", () => {
+  const payload = raw()
+  for (const shell of [
+    `Here is the handoff:\n\n${payload}\n\nDone.`,
+    "```json\n" + payload + "\n```",
+    `Compacted.\n\n\`\`\`\n${payload}\n\`\`\`\n\nAnything else?`,
+    `{"note": "no archive field"}\n${payload}\ntrailing commentary`,
+  ]) {
+    assert.deepEqual(parseHandoff(shell, undefined, [], ids).working, working())
+  }
+  const patch = JSON.stringify({ archive: "Title: Patched\nProse-framed patch.", working: { next: ["Ship it."] }, retiredConstraints: [] })
+  assert.deepEqual(parsePatchHandoff(`Prefix.\n${patch}\nSuffix.`, working(), [], ids).working, { ...working(), next: ["Ship it."] })
+  for (const bad of ['Here: {"archive": "Title: cut', '{"no": "archive"}', "prose { with } braces"]) {
+    assert.throws(() => parseHandoff(bad, undefined, [], ids), /valid JSON|invalid handoff schema/)
+  }
+})
+
+test("extraction is string-aware: braces, quotes, and escapes inside values cannot unbalance it", () => {
+  const objective = 'Keep braces } "quoted" { nested } and \\ escapes alive'
+  const payload = raw({ working: working({ objective, state: ["a } brace", "an { inside"] }) })
+  const parsed = parseHandoff(`Prose before.\n${payload}\nTail prose with { unbalanced braces`, undefined, [], ids)
+  assert.equal(parsed.working.objective, objective)
+  assert.deepEqual(parsed.working.state, ["a } brace", "an { inside"])
+})

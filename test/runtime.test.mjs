@@ -1972,7 +1972,7 @@ test("empty reasons, disabled budgets, staged reverts, and sessions without a ro
   h.state.rows = [user("u", "x".repeat(800))]
   await armGate(h)
   assert.match(await h.controller.deferCompaction({ reason: "  " }, toolContext), /concrete current need/)
-  assert.match(await h.controller.deferCompaction({ reason: "y".repeat(501) }, toolContext), /1 to 500 characters/)
+  assert.match(await h.controller.deferCompaction({ reason: "y".repeat(2_001) }, toolContext), /1 to 2,000 characters/)
   h.state.info.revert = { messageID: "old" }
   assert.match(await defer(h), /staged revert/)
   delete h.state.info.revert

@@ -57,10 +57,39 @@ export function renderWorking(working: WorkingMemory, through: string, gap = fal
  *  the user out of their own archive. The note must not use a script the user never did. */
 const CJK = /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/
 
+/** Extract the first parseable JSON object containing "archive": stateless generation
+ *  has no provider JSON mode, so a compactor may frame its payload in prose or fences
+ *  even when told to return only JSON. This is the standard structured-output
+ *  extraction, not silent repair — the extracted object must still pass every check. */
+function extractObject(raw: string): unknown {
+  for (let start = raw.indexOf("{"); start >= 0;) {
+    let depth = 0, inString = false, escaped = false, end = -1
+    for (let at = start; at < raw.length; at++) {
+      const char = raw[at]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (char === "\\") escaped = true
+        else if (char === '"') inString = false
+      } else if (char === '"') inString = true
+      else if (char === "{") depth++
+      else if (char === "}" && --depth === 0) { end = at; break }
+    }
+    if (end < 0) return undefined
+    try {
+      const value: unknown = JSON.parse(raw.slice(start, end + 1))
+      if (object(value) && "archive" in value) return value
+    } catch { /* try the next balanced object */ }
+    start = raw.indexOf("{", end + 1)
+  }
+  return undefined
+}
+
 /** Parse a model response shell (fence-stripped): archive note, working object, retirements. */
 function parseShell(raw: string): Record<string, unknown> {
+  const stripped = raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")
   let value: unknown
-  try { value = JSON.parse(raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")) } catch { throw new HandoffError("Compactor did not return valid JSON") }
+  try { value = JSON.parse(stripped) } catch { value = extractObject(stripped) }
+  if (value === undefined) throw new HandoffError("Compactor did not return valid JSON")
   if (!object(value) || !keys(value, ["archive", "working", "retiredConstraints"]) || !text(value.archive) || value.archive.length > 4_000 ||
       !object(value.working) || !Array.isArray(value.retiredConstraints)) throw new HandoffError("Compactor returned an invalid handoff schema")
   return value
