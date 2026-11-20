@@ -1,536 +1,623 @@
 # nextdcp — design
 
-Architecture and rationale; the README documents installation, options, and
-user-visible behavior. Design priorities, in order: reliability across models,
-simplicity (KISS), prompt-cache friendliness, and low cost.
+Current architecture for **0.16**, targeting OpenCode V2 **2.3.2+**. The README
+documents installation and options. `GATE-PLAN.md` and `PLAN-0.10.md` are historical
+proposals, not the current contract.
 
-## Core idea
+Priorities: truthful continuity and recoverable evidence, simple state
+transitions, then prompt-cache behavior and cost. A smaller request is not, by
+itself, evidence of better task quality or lower total cost.
 
-> **Do not rebuild compaction. Make OpenCode's native compaction lossless and
-> episodic, and give the model one tool to recall anything.**
+## Boundary and invariants
 
-OpenCode V2 already handles the hard, fragile parts: trigger thresholds, overflow
-retries, choosing the cut at a user-turn boundary, rendering the checkpoint,
-auto-continue, revert, and UI events. Its weaknesses are:
+OpenCode owns prompt admission, the compaction boundary, transcript replacement,
+the recent tail, overflow recovery, and continuation. nextdcp adds an archive,
+replacement working state, on-demand recall, and advisory scheduling through
+documented hooks. It does not prune or rewrite individual live tool results.
 
-1. A single *rolling* summary that gets rewritten at every compaction, so it drifts
-   and loses detail ("summary of summary").
-2. No retrieval of what was dropped.
-3. No pruning in V2, so stale tool outputs keep piling up until a costly compaction.
-
-nextdcp fixes exactly these three things, using official hooks only:
-
-```
- request = [system] [checkpoint: working state + recent tail] [messages since checkpoint, raw]
-                          ▲
-        compaction hook (archive first, then summarize = the only elision)
- archive (ctx.storage)  ◄── raw rows and tool calls saved at each compaction
- recall tool  ──► archive + live history
+```text
+request: [system/tools] [checkpoint: working state + native recent tail] [new rows]
+                                  ▲
+main-model build → optional checkpoint_now edit + evidence fence
+                                            │
+actual host cut → archive originals → validate edit OR generate → save → handoff
+                       │
+                       └──────────── recall on demand
 ```
 
-## Working set, not a diary
+The contract is:
 
-The visible checkpoint is one replacement working state: objective, standing
-user constraints, relevant verified state, unfinished work, and at most three
-archive references. One compactor request also writes a short cold archive note.
-Completed work does not earn permanent context space because it shares a topic.
-The archive retains full original rows/tool calls; no topic graph, embeddings,
-background observer, automatic per-turn retrieval, or merge generation is needed.
+1. **Archive at the actual cut, before replacement.** No speculative compactor
+   request. A main-authored edit must still fit its evidence fence; otherwise the
+   complete final cut is supplied to generation.
+2. **Serialize a session's checkpoint pipeline.** Reuse a committed handoff on a
+   repeated hook; do not generate it again or accept a changed boundary.
+3. **Generate only when needed, with two shared attempt slots.** A fresh valid
+   main edit uses zero. Patch, full regeneration, repair, and selected-model fallback
+   do not get independent retry budgets.
+4. **Preserve active constraints, disclose failures.** Compactness is a soft
+   target, not permission to silently truncate instructions or conceal a recall gap.
+5. **Separate capacity from growth.** Retained checkpoints, instructions, tool
+   definitions, and media still consume capacity even when they are not new growth.
+6. **Own asynchronous work and stored data.** Session/project ownership is explicit;
+   deletion and unload close admission and drain work instead of racing a clear.
+7. **Label historical provenance.** Notes are summaries, off-chain originals are
+    not current-branch evidence, and recalled history is data rather than new orders.
+8. **Separate admission from completion.** An accepted control is a requested cut,
+   not an archive or completed working state. Diagnostics observe; they do not
+   change conversation or scheduling.
 
-The rendered handoff ends with one compact **archive anchor** line — the episode
-count, the first and last episode titles, and the covered time span at adaptive
-precision, then `Browse: recall catalog; search: recall(query)`. It is the only
-always-on archive context: a fixed, self-explanatory pointer that says the archive
-exists, roughly when it covers, and how to open it. The catalog is fetched on
-demand: a compact line per episode, one page per call, with one episode's whole
-note or the full-note view one request away.
+### Required host configuration
 
-The normal working-state ceiling is 2,000 estimated tokens for the complete
-rendered handoff, with a prompt target of about 1,000 or less. The estimate is
-chars/4 — with Han, kana and hangul characters counting as roughly one token
-each — not a provider-tokenizer guarantee, and does not include native retained
-tail, system instructions, tool definitions, or subsequent conversation.
-The existing soft/hard triggers are unchanged.
+Require **`compaction.background: false`**. OpenCode currently defaults it to
+`true`; its held-summary preparation can run without a durable running checkpoint
+and later apply that summary without another hook. Such preparation is not a
+supported cut. nextdcp saves accessible originals, warns, and refuses that hook
+instead of claiming to have produced a normal episode.
 
-## Round-scoped deferral
+A later native textual checkpoint is adopted with any known recall gap disclosed.
+The obsolete `experimental.background_compaction` key is not a substitute. See
+the current [compaction guide](https://opencode.ai/docs/compaction) and
+[server hook contract](https://opencode.ai/docs/build/plugins/server).
 
-Some tasks legitimately need many large results live at once. The `defer_compaction`
-tool lets the model propose skipping the budget trigger for the
-current round only; it is callable only while a budget-gate notice is open, and
-refuses without prompting anywhere else. Three gates apply in order: physics (the conversation
-must fit 80% of the model's window; an unknown window is refused, so no approval is
-spent on a context that would overflow anyway), user consent (the host permission
-system, action `defer_compaction`, default ask with native Always allow, shown with
-the model's reason), and idempotence within the round. A grant never disables
-recovery: a compaction already in flight still runs. The grant expires when its
-round ends — success, failure or interruption — and that round writes no deferred
-idle marker; without re-affirmation, the next round's mid-turn budget trigger
-catches up in one bounded compaction. One in-memory decision per session, never
-inherited or persisted.
+## Durable state and ownership
 
-## Commit and failure contract
+OpenCode storage is scoped to the **plugin**, not automatically to a project.
+Path segments below are encoded; project keys use the session's actual
+`projectID`, never a literal shared `project/` prefix.
 
-1. Archive the new cut first, independently recording individual recall gaps.
-2. Read the checkpoint's prior structured state and snapshot the model policy.
-3. Generate one schema-validated JSON handoff using prior state and the complete
-   new cut. Main-model generation preserves native history/media; separate-model
-   generation uses readable originals and safe-capacity checks, visibly falling
-   back to the main model for unsupported inputs/errors. Never truncate a cut.
-4. Carry forward standing constraints omitted by the model. Retirement requires
-   the exact old constraint plus a new user row ID and verbatim quote from it.
-   Keep task-local requirements in state/next, not the permanent constraint list.
-   Persist retirement evidence with the checkpoint for audit.
-5. Validate references against the reachable archive and count the entire rendered
-   state. The archive note must begin with a `Title:` line and stay in the language
-   of the user's messages — a compactor may not introduce a writing system the user
-   never used. An invalid/oversized/off-language handoff gets at most one repair
-   attempt, and every retry carries the exact validation failure so the stronger
-   model repairs the defect instead of repeating it. Network or essential-storage
-   failures do not trigger speculative repair requests.
-6. Save the structured state and cold archive note before returning version-2
-   metadata. Never truncate active constraints. A custom result must fit its
-   budget; when the final repair is still over, commit the shortest valid
-   handoff, disclosed by a warning — a structured, constraint-preserving
-   artifact beats native's unbounded summary plus raw tail at any size. Native
-   compaction stays in control only when no valid handoff was produced, or when
-   saving fails. A native fallback can exceed this budget and is an explicit
-   exception, not bounded success.
-
-Existing episode archives remain unchanged and recallable. Old checkpoints
-are migrated on their next compaction, not eagerly rewritten. Forks/reverts select
-the corresponding structured state; historical fork reconstruction renders exactly
-that checkpoint, preserving its summary and independent originals/media.
-
-## Components
-
-### One elision boundary (`session.hook("compaction")`)
-
-Earlier versions elided stale tool outputs mid-request ("observation masking",
-the SWE-agent "garbage collection"). It was removed: a stub in the request is
-quiet — the model cannot tell it from content, recovery re-reads the stub
-instead of the original, and every commit rewrote the request prefix. Elision
-now happens in exactly one place: the compaction summary that replaces the
-archived cut, next to the capture-time archive that stores raw rows and tool
-calls. The conversation runs raw through the round; whatever the summary omits
-is one `recall` hop away.
-
-### Episodic archive (`session.hook("compaction")`)
-
-When a compaction fires (native trigger, or the deferred / hard-budget triggers):
-
-1. **Cut:** let native compaction choose it. No `keepID` override.
-2. **Archive first, before any generation:** store the new cut's persisted rows and
-   its completed parent checkpoint from `ctx.session.context` (rows have DB ids;
-   provider-format tool messages in `event.messages` do not) as compact JSON text
-   in `ctx.storage`, keyed by row id. Do not rewrite older immutable history:
-   cumulative archive-row writes grow linearly across compactions. Store tool
-   inputs and outputs in full and index them by call id. Process items
-   independently: log
-   failures and conflicting call ids, keep the first original, continue with the
-   rest, and mark the episode with a recall gap if anything was missed.
-3. **One handoff request** produces the replacement working state and the short
-   cold archive note together, covering all messages after the previous checkpoint
-   row — including the tail native compaction will keep. The boundaries are then
-   unambiguous ("everything after the checkpoint"), so no message has to be quoted
-   to mark them. When the prior working state is structured, this same request runs
-   in **patch mode**: the model returns only changed fields of `working` (present
-   fields replace entirely; omitted fields carry forward unchanged), and the patch
-   is validated as the merged whole — same schema, reference, and budget checks as
-   a full regeneration — so output tokens scale with what changed, not with state
-   size. An invalid or over-budget patch falls back to exactly one fresh full
-   regeneration, never a blind retry. The tail appears both in this episode and
-   verbatim in the new
-   checkpoint's recent context; the next episode starts after the new checkpoint
-   row, so episodes never overlap and never leave gaps. Episode notes are fixed and
-   dense: a `Title:` line, task and outcome, exact paths/symbols/error strings and
-   search terms. The rendered episode header takes its title from that line.
-   Main-model generation goes through `ctx.session.generate` with full native
-   history plus an instruction, preserving native projection and cache behavior.
-   A separate compaction model uses `ctx.experimental.generate.text` with the
-   prior working state and the complete readable new-cut transcript, including
-   original tool text; it omits hidden reasoning and provider metadata and never
-   silently truncates. Unsupported content, unavailable models, unsafe capacity,
-   empty responses and request errors warn and fall back to the main model.
-4. **Return** `event.result = { summary: render(working state), metadata: { nextdcp: { version: 2 } } }`.
-   Native compaction wraps this in `<conversation-checkpoint>`.
-5. **If episode generation or essential checkpoint storage fails, leave `result`
-   unset.** Native compaction runs as usual. Individual archive failures do not
-   block the episode: they produce an explicit recall gap instead. Losslessness is
-   guaranteed only when the relevant archive writes succeed.
-
-The episode chain is keyed by compaction-row id (each record points to its parent
-checkpoint). Rendering follows the chain from the *current* checkpoint, so reverts
-and undos are handled for free. Each episode records a `start`/`end` span from its
-rows' `time.created` — one pair per episode, never per turn — used only to render
-time in the catalog and the anchor line. **Native checkpoint without `nextdcp`
-metadata**
-(after a fallback, a fork, or lost storage): adopt its native summary text as one
-episode (`Ek — (native summary)` in the catalog) and continue the chain from it.
-
-`/compact-model` is a TUI-only picker backed by a portable, schema-validated
-`nextdcp.model` RPC. Its keymap layer is global so slash autocomplete and the
-command palette can discover it in their own input modes; the command itself
-is enabled only on a session route. Policies are `default` (honor
-`agents.compaction.model`), `main`, or a specific provider/model/variant. Persist
-them under `sessions/<id>/model`, outside the checkpoint chain; reloads preserve
-them, reverts do not change them, and forks do not copy them. Read the policy
-once before summary generation. Saving a policy validates the live text-model
-catalog but generates nothing. No new tool or LLM command is exposed. Warnings
-are persisted, logged and emitted to TUI clients; event subscriptions retry
-across reloads. The main model is never set.
-
-Keep `experimental.background_compaction` disabled (the default): a precomputed
-native summary can be applied without rerunning the plugin hook, so a recall gap
-is possible. If a provider-native checkpoint has no textual summary, leave it
-under native control rather than replacing it with an empty episode. Episode
-resolution and archive search may then be unavailable on that chain; an already
-archived tool call can still be retrieved directly by id.
-
-### `recall` tool (the standing prompt surface)
-
-```
-recall({ query?: string, id?: string, layer?: string, page?: number })
+```text
+sessions/<sessionID>/
+  owner                         projectID, Location, subagent flag
+  rows/<rowID>                  original persisted row as compact JSON
+  calls/<callID>                complete tool input/result, first original wins
+  pending/<checkpointID>        parent, ordered row IDs, archive status, reserved E ID
+  checkpoints/<checkpointID>    parent, episode note, author, working state or native summary
+  episode-counter               monotonic E<n> allocation
+  deferred-compaction           branch-specific next-prompt marker
+  gate-stats                    advisory telemetry only
+  model                         per-session compaction-model policy
+  model/warning, model/warnings  current warning and capped timestamped history
+  fork                          successful inheritance marker
+projects/<projectID>/
+  thermostat                    learned entries per main provider/model
+  episodes/P<n>                 graduated notes with source session and end time
+  episode-counter               monotonic P<n> reservation
+  episodes-revision             invalidates graduated-note caches
+deleted/<sessionID>              durable namespace tombstone
 ```
 
-Two calls, one grammar. `query` searches the archive; `id` is a **target
-address** — the same lean string the system renders everywhere, so any address
-the model sees is copy-paste runnable:
+Ownership is read and saved while the session exists. `ctx.location` describes
+the plugin instance, not every session it can access. Public events are global:
+route by recorded event Location, including workspace ID, or resolved/persisted
+session ownership. Missing ownership is not guessed, including during deletion.
+Older unowned `project/*` records are neither imported into a guessed project nor
+deleted automatically.
 
+Durable-key queues are shared in-process across host contexts and hot-reloaded
+modules. They serialize counters, call originals, fork imports, cuts, and the
+session write fence. They are not distributed locks across independent services.
+
+## One serialized checkpoint pipeline
+
+### 1. Capture the actual boundary
+
+Read `ctx.session.context` and require a running compaction row. `planCut` selects
+every row after the previous completed checkpoint and before that running row;
+it does not override native `keepID` or use the shorter retained-tail boundary.
+The replacement therefore accounts for the final assistant reply and newly completed
+tool work, including material OpenCode will also retain as recent context.
+
+Save a pending boundary first. Archive this cut and its completed parent
+checkpoint, not the whole old history again. Store full rows and index complete
+or error tool results by call ID. Process individual failures independently;
+conflicting calls keep the first original and mark the cut incomplete. Essential
+boundary-storage failure falls back to native compaction. Partial archive failure
+instead marks the episode with a recall gap.
+
+Reserve the episode ID in the pending record. Native fallback adoption can reuse
+that reservation. Failed cycles and reverted branches can still leave gaps in the
+visible catalog; IDs are addresses, not a count of successful episodes.
+
+### 2. Assemble authoritative prior state
+
+Checkpoint records form a parent chain keyed by host compaction-row ID. Follow
+only the active checkpoint's ancestry, so a revert selects the matching working
+state and catalog. Previously archived branch originals are not erased by revert.
+
+A structured prior state enables patch mode. A **native textual checkpoint
+invalidates stale structured objective/state/next**: its summary is authoritative,
+and the next regeneration receives it rather than patching pre-fallback state.
+Still-active standing constraints travel separately across that transition.
+
+Adoption uses the saved pending boundary when available. Without an archived cut,
+the native episode explicitly reports the missing originals. An opaque provider
+checkpoint with no textual summary stays under native control; episode resolution
+and search may then be unavailable. Store-only call/row lookup remains independent
+of a readable episode chain.
+
+### 3. Select an author; generate only when necessary
+
+`checkpoint_now` accepts `archive`, partial `working` fields, and optional
+`retire: [{ constraint, quote }]`. Its base is the **latest canonical working state**,
+including earlier main-authored edits, not a frozen compactor seed. Omitted fields
+carry forward; present lists replace their predecessors. Standing constraints
+remain additive/protected until explicitly retired with new-user evidence. New
+entries are themselves self-contained exact quotes from actual new user text;
+host rules and unchecked assistant paraphrases cannot become protected entries.
+No additional model-authored provenance envelope is needed. A short cold note
+accompanies each direct edit; there is no appended notes log.
+
+Validate the merged edit before admission. Without structured prior state, require
+all working fields or let `{}` request compactor seeding. `{}` always chooses
+generation. No obsolete `keep` input or once-per-round slot is retained. There is
+no arbitrary edit-string or total payload cap; schema/constraint/reference checks
+still apply, and the complete merged state is measured against a soft size target.
+
+Each context build captures ordered semantic row hashes: user/injected/media
+evidence, assistant text/tool inputs/results/errors, structured human question
+answers, shell data, and completed
+checkpoint summary/tail. Timing, billing, hidden reasoning, idle markers and
+noncompleted compaction controls are not evidence. Payload keys named `time` or
+`tokens` inside user/tool data remain evidence, not bookkeeping.
+
+A newly admitted edit stages its base checkpoint, fence, validated full handoff,
+and ToolContext message/call IDs. At the archived cut, require the same base and
+ordered evidence, excluding only the proposal's own sole `checkpoint_now`
+publication. The tool must have completed successfully; another tool in its step
+precludes direct use. New user prompt admission also invalidates a staged edit,
+even before the user's row appears. Revalidate schema, constraints and references
+at the cut. Missing observations, changed/late evidence or a changed base select
+safe compactor regeneration, never a stale commit.
+
+Only a fresh admission can stage a proposal. Concurrent duplicates cannot replace
+it; rejection/timeout clears it. Uncommitted proposals and evidence hashes are
+in-memory only, so reload safely regenerates. Committed working state and
+`main`/`compactor` authorship are durable and reused on repeated hooks.
+
+#### Compactor path
+
+One response contains a cold archive note and replacement working state:
+
+```text
+archive: Title line + short searchable note about only this cut
+working: objective, constraints[], state[], next[], references[at most 3]
+retiredConstraints: exact old constraint + verbatim new-user evidence
 ```
-recall E57                   an episode, conversation layer (default)
-recall E57 layer tools page 2  an episode's tool output, page 2
-recall call_01HZ2a3          one exact tool call
-recall catalog               the episode catalog, newest first (one line per episode)
-recall catalog all           every episode's archive note
-recall catalog E7            one episode's archive note
+
+The first attempt is a patch if the prior working state is structured, otherwise
+a full handoff. Present patch fields replace whole fields; omitted fields carry
+forward. The merged whole receives the same validation as full generation.
+
+After any failure, the remaining attempt requests a complete replacement and
+carries the failure text. If a selected compaction model failed, the remaining
+attempt uses the main model. **There are two attempt slots for the pipeline, not
+two per mode or model.** Unsupported-input and capacity refusals conservatively
+consume a slot even if no provider request was sent. Native host fallback may
+make its own request afterward; it is outside this plugin attempt bound.
+
+Main-model generation uses `ctx.session.generate`, preserving native request
+projection and media handling. Its checkpoint and user text are already in that
+context: the prompt does not copy them again or add a user-snippet directory.
+Retirement quotes resolve to durable user-row or question-call IDs in the shared validator; authors
+need not copy IDs (older explicit-ID handoffs remain valid). After native fallback,
+separately protected constraints are still supplied if its summary omitted them.
+An explicitly selected/configured compaction
+model uses `ctx.experimental.generate.text`: prior state plus the complete
+readable new-cut transcript, including original tool text. It omits hidden
+reasoning/provider metadata, refuses attachments or unsupported content, and
+never silently truncates the cut to fit.
+
+The selected model must be an available text model/variant with known safe input
+capacity. Its estimate uses a 20% padding plus 1,024 tokens and reserves advertised
+output (8,192 if absent), honoring both context and separate input limits.
+Unavailable models, unsafe capacity, unsupported inputs, empty responses, and
+request errors warn and fall back rather than picking an arbitrary provider.
+
+### 4. Validate and commit
+
+Validate the schema, reachable archive references, title, constraint retirements,
+and complete rendered working-state size. Prior standing constraints omitted by
+the model are carried forward, including legacy rules without source metadata.
+A new constraint must itself occur verbatim in a real user row's text or a completed
+built-in `question` call's structured `state.metadata.answers` in the new cut.
+Only that human-answer envelope is normalized as user evidence; question input,
+rendered tool prose, other tools' metadata, attachments, injected skills and queued
+relevance hints cannot supply proof. Separate answers never form a joined quote.
+Retirement requires an exact prior constraint and a quote from such a new human
+source: explicit withdrawal or correction of a misattributed rule. These are source
+checks, **not proof** of semantic intent; the author must distinguish quoted
+evidence from actual standing instructions. Legacy rules are not silently erased.
+Task-local requirements belong in state/next, not an ever-growing permanent list.
+
+The author keeps only information needed for the next decision or action, an
+unresolved uncertainty, or expensive rediscovery. Host/project instructions stay
+in their authoritative sources. Cold notes are brief outcomes and search cues,
+not a second working-state copy. Gate notices and reminders ask for normal work or direct
+authorship, never a preliminary summary for a compactor that already has the data.
+
+The prompt asks for the user's language. A limited writing-system check rejects
+new CJK script in the archive note when absent from new user messages; it is not
+a general language detector. The parser does not prove semantic completeness.
+
+The normal working-state target is at most about 1,000 estimated tokens and its
+soft ceiling is `memory.budget` (default 2,000). Count all rendered headings,
+constraints, references, archive anchor, and gap disclosure. A working state
+sets `metadata.keepID: null`, so OpenCode keeps no verbatim recent tail beside it;
+system instructions, tool schemas, and later conversation are **additional**.
+For a **valid main-authored edit**, exceeding this target warns and commits unchanged:
+no truncation and no generation merely to shrink it. For **compactor generation**,
+if neither attempt fits but a structurally valid oversized handoff exists, commit
+the shortest valid candidate with a warning. Never slice constraints to meet the
+budget. When no valid handoff exists, or essential checkpoint saving fails, leave
+`event.result` unset and disclose native fallback as an unbounded exception.
+
+Save the structured checkpoint and its archive note before returning
+`{ summary, metadata: { nextdcp: { version: 2, author: "main" | "compactor" } } }`. OpenCode renders the checkpoint
+wrapper and recent tail. A repeated hook with the same committed boundary renders
+that saved handoff without another model request.
+
+The live handoff contains current work, not an episode directory. One archive
+anchor gives coverage, episode endpoints, and `recall catalog` / `recall(query)`.
+Cold notes and old originals are fetched only when needed. Summaries remain lossy;
+recoverability depends on successful archive writes and use of recall.
+
+## Scheduling: capacity first, preferences second
+
+### Three meters
+
+- **Retained conversation (automatic mode):** the latest completed summary and
+  native `metadata.recent` tail plus persisted rows after that checkpoint,
+  excluding ephemeral reasoning and older archived rows. This meter schedules
+  the overdue-checkpoint safeguard.
+- **New durable growth:** persisted rows after the completed checkpoint. Count
+  user text/skills/attachments, retained assistant text/tool data, shell output,
+  and relevant injected text; exclude ephemeral reasoning and the retained
+  checkpoint/tail. It schedules explicit `budget`/`idle` overrides, gives every
+  admission its identity, and prevents zero-growth recompaction loops.
+- **Complete request projection:** assembled hook messages, system parts, and
+  serialized tool definitions, including checkpoint/tail, skills, shell, and
+  media. This meter requests capacity recovery before honoring any soft hold.
+
+Returned evidence — successful tool results except `question`/`checkpoint_now`,
+plus foreground shell output — is a mechanical subset of durable growth. It
+buys temporary room until it ages out and is excluded from baseline learning; it is not
+a claim that every result is necessary.
+
+Text estimates use chars/4 with Han/kana/hangul near one token per character;
+media has fixed estimates. `usageScale` applies the median of up to three usable
+provider-input-growth/estimated-growth ratios. Samples exclude checkpoint/model
+boundaries and implausible ratios. Cache accounting and provider behavior remain
+assumptions to validate against traces, not exact tokenization.
+
+On each eligible context build, before any held-round or low-growth return:
+
+```text
+reserve = explicit hook maxTokens, else advertised output, else 8192
+capacity = max(0, min(contextWindow - reserve, separateInputLimit) - 1024)
 ```
 
-An address is a handle (`E57`, `call_01HZ2a3`, `catalog`) plus optional
-`layer <conversation|tools|full>` and `page <n>` pairs; `catalog` instead takes
-an optional view — `all`, or one exact entry label (`E7`). Listings return one
-page per call and continue at `page <n>`; a single entry note fetches whole like
-any original.
-The same `layer` and `page` also work as direct parameters — for a query they set
-the search depth and result page, for an id they fill in what the address omits,
-and the address wins where both set one.
+If the calibrated complete projection exceeds capacity and there is new growth,
+clear the soft hold/gate and request compaction. Running compaction and staged
+reverts are left alone. Unknown windows disable this plugin capacity check and
+automatic soft budget; explicit soft thresholds still work. Native recovery is
+unchanged. This is a queued recovery request, not a guarantee that every provider
+request fits: fixed instructions/tool schemas, later hook/transport changes, and
+estimation error can still dominate.
 
-#### Layers: the depth within a chapter
+### Soft scheduling, guidance and the gate
 
-An episode is a chapter; `layer` selects the depth to read or search. The default
-is **`conversation` everywhere** — for fetching an episode and for searching — so
-there is exactly one rule to remember. Raise the depth only when the question
-needs it.
+Automatic mode compares the retained conversation with a **live threshold**:
+the adaptive baseline plus a temporary fresh-evidence allowance. An explicit
+`budget` overrides it with a new-durable-growth threshold; `false` disables soft
+gates and reminders. An explicit `idle` independently overrides/disables the
+next-prompt path. Neither disables manual compaction or the known-window
+capacity check.
 
-| `layer` | `recall {id:"E57", layer}` | `recall {query, layer}` |
+- **Fresh-evidence room:** returned evidence after the checkpoint and since the
+  last successful turn end (an `idle` row whose outcome is not `interrupted` or
+  `failed`) earns weight 1 for 12 assistant steps of age, then declines
+  linearly to 0 at step 28. Interruptions, failures and steering continue the
+  same work, so they do not reset it. Ages are per result, so later reads never
+  rejuvenate older ones. `allowance = min(1.5 × weighted, capacity − requestOverhead − baseline)`,
+  where overhead is the projected request minus the retained conversation, so
+  instructions, schemas, output reserve and margin stay out of reach. The
+  allowance applies on the very build carrying the results, clears an open gate
+  that is no longer crossed (so round end cannot repay it), and is
+  diagnostic-only in `/memory`.
+- **Pause reminders (automatic, tail placement only, mid-round only):** a pause
+  is the latest assistant step having at least 60 estimated tokens of visible
+  text, following the model's own previous step rather than a user row, and
+  calling tools (so the round continues) with no newer user row and no
+  `question` call pending a human answer. A finished round is left to
+  next-prompt scheduling, which is steered by the user's message and needs no
+  extra model step. A pause is suppressed when that step's own returned
+  evidence plus newer input exceeds 5% of the baseline or any of its tools
+  failed — those results are unseen. A reminder also requires new durable growth
+  of at least 25% of the baseline since the checkpoint and since the previous
+  reminder. Independently, a complete projection at or above 85% of safe
+  capacity warns once per checkpoint, with the same growth floor. Delivery
+  identity is (checkpoint, assistant-step count): an identical rebuild replays
+  unanswered guidance; a new step marks it delivered. A cut resets spacing.
+  Reminders never queue admission, are omitted when they would not fit
+  capacity, and are skipped with `notice: "system"` to avoid rewriting the
+  cached prefix for optional text. Replaying this session's own 277-step history
+  placed 9 reminders against 9 actual checkpoints, four of them at or within six
+  steps before one; that is a sanity check, not a benchmark.
+- **Mid-round crossing:** open one gate for the current round/checkpoint. Append
+  a clearly automated notice at the conversation tail (provider user role), or
+  a system part for `notice: "system"`. The model's next step still has raw
+  context; the following build requests the actual cut. Continue is the default;
+  a `checkpoint_now` edit can supply the next state without a second generation.
+  Authorized delegation is an option, not an automatic operation by nextdcp. No
+  compactor summary is prepared during that evaluation step. A required notice
+  that would exceed capacity yields to capacity recovery.
+- **No later build:** a round ending with an unheld open gate repays its crossing.
+  Without a live round, an eligible crossing requests compaction silently. For
+  explicit budgets only, a recent tool failure postpones the soft decision during
+  diagnosis; never capacity recovery or the automatic safeguard. Guards/cooldowns
+  suppress repeated admission.
+- **Successful-turn scheduling:** include final retained output, then persist only
+  `{ checkpoint, after, tokens, threshold }` when due, comparing the automatic
+  baseline (the successful turn end has reset evidence credit) or the explicit threshold. No idle
+  summary request. The next prompt hook verifies that exact branch/boundary,
+  recomputes new growth for admission identity, and awaits compaction
+  admission, not generation, before admitting the new message. Its first 2,000
+  trimmed characters become labeled relevance evidence, not a user row or a
+  basis for retiring constraints. Reopening alone does nothing.
+- **`checkpoint_now`:** approval-free working-state-edit admission; refuse a staged
+  revert/inactive round and report an already running/pending cut. An open gate
+  is only a schedule: admit and stage the edit normally, then clear the gate on
+  admission. No once-per-round restriction; a completed cut moves the boundary,
+  permitting another edit. Pending/duplicate-boundary/cooldown safeguards remain.
+
+All admission paths share one session guard. Context hooks never await the
+runner's compaction; prompt hooks share its admission promise. The guard clears
+on outcome/rejection, a verified successful execution without running compaction,
+or a three-minute timeout. A failed cut imposes a three-minute retry cooldown.
+Gate, explicit-budget spike, manual-checkpoint, and capacity counts are telemetry, not controller
+inputs; reminders are visible only as the last in-memory decision. Model-window lookups are cached per provider/model.
+
+Admission returns an explicit `requested`, `already-pending`, `not-admitted`, or
+`failed` outcome. Concurrent callers share the admission result, including a
+failure; guards, cooldowns and duplicate attempts are not successful new requests.
+Only accepted early requests count. A refused/failed edit is not staged for a
+future cut. No tool waits for the cut that needs its own step to finish.
+Host outcome events, not saved/prepared handoffs, establish completion separately.
+
+### Read-only accounting
+
+`/memory` is a TUI dialog backed by the portable `nextdcp.memory.get({ sessionID })`
+RPC. It is not another model-visible tool or a source of automatic prompt text.
+It reads the session and saved metadata directly, without invoking ownership
+saves, archive adoption/inheritance, scheduling hooks, model generation or writes.
+The TUI resolves the session's Location and reads the current client per attempt.
+Only `rpc.unavailable` is retried during cold plugin registration, with bounded,
+abortable backoff. The native dialog bounds its scroll viewport to terminal height,
+supports keyboard/wheel scrolling, and releases resize/focus resources on close.
+
+Show current summary and native `metadata.recent` characters/estimated tokens,
+new durable row growth, retained total, calibration and threshold scope. In
+automatic mode show the live threshold, its adaptive baseline, the temporary
+evidence allowance recomputed only for the same model, checkpoint and round as
+the last build, and the baseline bounds. Retain only numeric counts
+for the last context-hook projection: messages, system parts, serialized tool
+definitions, total, output reserve, safety margin and known capacity limits.
+Include this plugin's gate notice in those counts. The projection is a timestamped
+observation at this hook, not a reconstruction of a future or final wire request.
+Row estimates are not added again to the message total. Raw latest provider
+input/cache/output/reasoning counters are a separate measurement with its source ID.
+
+Last decision/hold and completed/failed cut reasons are small in-memory diagnostics.
+Show saved checkpoint authorship when known; do not infer generation from admission.
+Reload discards them and the request observation; missing values stay unavailable,
+and an older checkpoint's request snapshot is labeled stale. Host checkpoint rows
+can still establish a recorded outcome without inventing its trigger. No summary
+text or prompt bodies are copied into diagnostic state; no extra model request,
+tail tuning, or durable telemetry namespace is added.
+
+### Adaptive baseline
+
+Persist learned entries per **main model and actual project**, versioned so
+older growth/demand budgets reseed instead of masquerading as this policy. A
+committed custom handoff closes a cycle; ordinary subagents and unknown windows
+do not train it. Recall frequency is not a control signal.
+
+For context window `W`, output reserve `O` (fallback 8,192) and separate input
+limit `I`:
+
+```text
+capacity = max(1, floor(min(W - O, I) - 1024))
+start    = min(capacity, W / 2, 200000)
+floor    = ceil(0.75 * start)          ceiling = min(capacity, floor(1.5 * start))
+routine  = durable - returnedEvidence  (per committed cycle)
+target   = retainedAtCycleStart + 28 * EMA(routine / assistantSteps)
+next     = clamp(target, max(floor, ceil(0.8 * prev)), min(ceiling, floor(1.5 * prev)))
+```
+
+EMAs are half-weight; observed span feeds only the short-cycle diagnostic,
+which refers to the upper policy bound, never physical window exhaustion. A
+changed window can force an immediate clamp. Excluding returned evidence keeps
+one read-heavy cycle from permanently raising the threshold for ordinary work;
+such reads get temporary fresh-evidence room instead. Neither 200k, 28 steps nor the step
+limits are benchmarked quality or cost optima, and the baseline is a fallback,
+not a checkpoint cadence. Storage failures report and fall back to defaults.
+
+### Explicit-budget spike hold
+
+Only for an explicit positive `budget`: at a soft crossing in a live round, if
+the last ten assistant steps' durable growth rate is at least twice the learned
+rate, hold soft compaction for that round. It requires a learned rate and a
+known window; **complete capacity is rechecked on every eligible build before
+the hold**. A hold expires on success, failure, interruption, or plugin reload
+and writes no idle catch-up marker. The automatic safeguard never uses it.
+
+## Recall: one protocol, truthful evidence
+
+The standing protocol lives in the `recall` tool description; there is no
+per-turn observer/retriever, embedding service, topic graph, or system-prefix
+rewrite. Apart from the optional gate notice, live history is left unchanged.
+
+Provide exactly one of `query` or `id`. Addresses accept optional `layer` and
+`page` pairs; direct parameters fill only what the address omits:
+
+```text
+recall E57
+recall E57 layer tools page 2
+recall call_<full opaque ID>
+recall msg_<full opaque ID>
+recall P12
+recall catalog
+recall catalog all
+recall catalog E7
+```
+
+Rendered opaque IDs are full, never a fixed-length prefix that might collide.
+An exact input ID wins; a unique prefix resolves; ambiguity lists distinct full
+candidates. Pages must be positive safe integers, and unreasonable catalog ID
+ranges are rejected before allocating a missing-ID list.
+
+| Layer | Fetch an episode | Search |
 |---|---|---|
-| **conversation** *(default)* | dialogue + tags for tool/shell commands, activated skills and attached text (name + head, no bodies) | search that conversation text |
-| **tools** | full calls + shell output + injected skill/attachment text, from the `calls/` and row originals | search that non-dialogue content only |
-| **full** | everything interleaved (the raw conversation) | search everything |
+| `conversation` (default) | Dialogue and lean tool/shell/skill/attachment tags | Dialogue homes |
+| `tools` | Full calls, shell output, injected skill/attachment text | Call/row originals |
+| `full` | Both interleaved | All homes, labeled archive notes, project graduated notes |
 
-`full` is the raw transcript. `conversation` is what was *said and asked*; `tools`
-is what the tools *returned*. That separation is the point: "why did we decide X"
-is a `conversation` question, "what was the exact error" is a `tools` question, and
-a broad probe is `full`. Tool output renders from the `calls/` original, the
-canonical archive record. Tool tags in
-the conversation layer render the call target as `recall call_01HZ2a3`, so any
-output is one hop away. A tag identifies a call, it does not carry it: a heavy
-input (a hand-rolled script written live, a long heredoc) reduces to its first
-200 characters plus the omitted count — the whole input stays in the call
-original, one hop away, and script-content search lands on that `tools` home
-instead of cluttering the dialogue. The same rule covers injected content: an
-activated skill or an inline text attachment renders as a tag (name plus
-character count) pointing at its row original, which is that text's one home —
-injected bodies never ride the dialogue. Hidden reasoning is stored but not rendered in any layer
-yet; it joins the matrix later.
+Heavy tool arguments/results live in call originals. Shell output, activated
+skills, and decoded inline attachment text live in row originals. Dialogue tags
+point there rather than duplicating their bodies. Hidden reasoning and provider
+metadata are stored with raw rows but not rendered/indexed as conversation.
+Search indexes archived data, not already visible live history. Recall-output
+echoes are excluded from ranking while retaining fetchable text/page alignment.
 
-#### The catalog: the only summary surface
+BM25 ranks bounded passages, with Unicode-normalized terms and CJK unigrams and
+overlapping bigrams. Prefer compact weighted query coverage, whole/quoted phrases
+and exact structured identifiers, including their internal punctuation. Keep
+original offsets through normalization and do not form matches across recall
+echoes. These are bounded ranking preferences, not new mandatory-match filters:
+broader lexical evidence remains reachable.
 
-`recall catalog` returns the episode list — id, title, time span, and the cold
-archive note — **newest first**, the whole thing in one call up to 30,000
-characters. Episode notes are labels, not content: they live here and nowhere else
-except as labeled `archive note` hits in unfiltered `full` search (the cheap "which
-episode was about X" probe). There is no summary *layer* to reach for a single note
-— triage is the catalog's job.
+An optional query-only `episode: "E57"` filters by active episode provenance before
+ranking. Dialogue and archive notes belong to their episode; row/call originals
+carry the episodes that reference them. A scoped miss never widens silently;
+graduated notes and off-chain originals have no place in that active scope.
+Cached document arrays are not mutated by a per-call scope.
 
-#### Addresses and IDs
+Return up to four focused, deduplicated excerpts per page,
+at most 40 ranked results. Notes are explicitly labeled summaries, not original
+quotations, and are indexed as the exact `catalog E<n> page N` bytes they point to.
+Archived call/row evidence outside the active episode chain is labeled
+as such, including potentially reverted work; it remains directly fetchable.
 
-Every rendered target — tool-call tags, search hits, page labels —
-reads `recall <address>`. IDs abbreviate to their unique 12-character prefix
-(`call_01HZ2a3` for `call_01HZ2a3b4c5…`), and recall resolves any unambiguous
-prefix git-style: an exact ID wins, a unique prefix resolves, an ambiguous one
-errors listing its candidates. Full IDs keep working, so nothing stored breaks and
-old addresses stay valid.
+A default fetch returns up to 30,000 characters; larger originals disclose the
+remaining pages, each at most 6,000 characters. Explicit pages fetch one page;
+catalog listings also return one page per call. Compact catalog entries give
+title/time, `catalog E<n>` gives one whole note, and `catalog all` gives the note
+view. Pagination preserves surrogate pairs and exact original reconstruction.
 
-#### Time: one rule, three surfaces
+Media returns as native file content on the page containing its label, including
+direct row/call fetches, not JSON/base64 expansion. The current model must support
+that media, and URI-only files must still exist. Archived inline text is decoded
+for search. Immutable transcript rendering uses a bounded 8-million-character LRU;
+the corpus is cached by checkpoint and invalidated by local archive/chain changes.
+Graduated-note caches additionally check the project's durable revision.
 
-*A span renders at the unit its own elapsed time justifies; a stamp renders only
-the fields its reference can't already imply; a standalone fetch re-anchors at full
-precision.*
+## Forks, lifecycle, and privacy
 
-- **Span unit-matching:** elapsed < 1 day → times; ≥ 1 day → days (times dropped);
-  ≥ 1 year → years — plus a compact duration at that scale (`14h 32m`, `32d`,
-  `2y 3mo`).
-- **Stamp cascade:** `14:30` → `11-03 14:30` → `2027-01-02 09:12` — each stamp omits
-  what the surrounding rendering already states; the date-day is atomic. Episode
-  times come from rows' `time.created`, recorded once per episode as `start`/`end`.
+Fork inheritance uses the current awaited `session.hook("fork")`, after native
+rows are copied and before the fork returns, with retry on first use. Match
+copied checkpoints to the parent's fork-boundary history; reconstruct historical
+boundaries from ordered saved cuts if needed. Copy only that branch's records,
+rows, and calls into independent child storage and reserve above inherited/source
+episode IDs. Commit the import marker last so partial imports are retryable.
+Reconstructed checkpoints are not stored as purported original transcript rows.
 
-The archive anchor line and the catalog use this ladder, so they stay one line and
-one screen at any session length.
+A completed import survives parent deletion; an archive already lost before
+import cannot be recreated. Ordinary subagents do not inherit archives. Forks do
+not inherit session model overrides, deferred markers, or transient holds.
 
-#### Search corpus: one home per fact
+Deletion closes local admission immediately and aborts cancellable session work.
+A shared per-session write fence admits the durable tombstone and drains already
+admitted, non-cancellable writes before final clearing. Other plugin instances
+check that tombstone under the same fence and cannot repopulate the namespace.
+Owned hook/tool/model-RPC work, telemetry, and relevant writes are tracked; closed
+model RPCs reject rather than report a successful no-op. Unload aborts/drains
+owned work and clears caches without deleting saved data. Event cleanup rechecks
+cancellation after asynchronous ownership resolution.
 
-Every fact is indexed in exactly one place. Conversation documents carry only
-tags; each `calls/` original is its own document; each shell row and each
-skill/attachment-bearing user or skill row is its own document. A query therefore hits
-*the fact itself*, and hit lines render runnable
-targets (`recall call_01HZ2a3`, `recall E57 page 2`). `layer` filters which homes a
-search covers; archive-note hits surface only in unfiltered `full` search. A recall
-result's own output is marked an echo and excluded from ranking, so a
-re-presentation of evidence never competes with the original it quotes. Immutable
-transcripts and originals are cached in memory (bounded LRU), and the assembled
-corpus is cached per checkpoint: a warm query rescans nothing, and the next
-compaction — the only mutation that can change it — rebuilds it fresh.
+After draining, read final ownership, intentionally graduate committed notes,
+then clear the session namespace. **Deletion is not complete erasure.** Graduated
+notes deliberately remain under the owning project and can contain sensitive
+information. This is a retention policy, not anonymization or secure deletion of
+the database and backups. Raw archive storage is also sensitive and grows with
+retained history; protect the OpenCode database accordingly.
 
-**Graduated notes** (v0.10) extend the corpus past the session's death. Deleting a
-session first graduates its committed episode notes into `project/episodes/P<n>`
-— notes only, deduplicated by exact text so fork copies never land twice, numbered
-above the highest existing `P<n>`, capped at the 200 most recent. Raw transcripts
-and calls die with the session; the note becomes the fetchable original, returned
-whole with a provenance header (source session, age). Graduated notes join only
-unfiltered `full` search — they have no layer home — and carry a linear 30-day
-recency boost that re-ranks equal term matches (fresh experience over stale
-advice) but cannot rescue a zero match: BM25 stays the gatekeeper. The session
-catalog is unchanged: `P` entries never appear in it. Subagent sessions never
-graduate (their findings return via the delegation summary); corrupt records are
-skipped individually; a graduation failure reports and never blocks the deletion.
+Graduation deduplicates exact text against retained notes, skips subagents, and
+keeps the 200 most recent notes. Reserve monotonic `P<n>` IDs before writing so
+pruning and failed writes cannot recycle an address. Each fetch carries source
+session and age. Notes join only full-layer queries, not the session catalog;
+their recency multiplier declines from 1 to a positive 0.9 floor over 30 days,
+so old matches still rank by relevance. Graduation failures report and do not
+prevent raw-session cleanup.
 
-#### Content and privacy
+## Model policy, deployment, and verification
 
-Media stays native: return text plus file content parts on the page containing each
-attachment label, without JSON/base64 expansion. Decode inline text attachments so
-they are searchable; their home is the row original, and the conversation layer
-carries only their tag. Archived rows stay complete in compact JSON, but every
-rendering and its search index show readable user, assistant, tool, shell, synthetic
-and checkpoint text — never row ids, timestamps, costs, provider metadata,
-signatures, or hidden reasoning. Tool output is not clipped.
+`/compact-model` is a TUI picker backed by the schema-validated `nextdcp.model`
+RPC. Policies are configured default (`agents.compaction.model`), main, or a
+specific provider/model/variant. Read the policy once when a cut needs generation; persist it
+outside the checkpoint chain. Saving validates availability but sends no model
+request and never changes the session's main model. Reload preserves preferences;
+revert does not change them; forks start at default. Warnings are logged, emitted
+to clients, and kept in a last-ten timestamped history, not silently discarded.
 
-The `recall` tool description is the *entire* protocol the model needs to know;
-since v0.9 it also carries the standing context model — budget, gate, continue,
-`defer_compaction`, delegation — so a gate notice only has to
-trigger, not teach. There is
-nothing in the system prompt, no message-ID tags, no nudges, no reminders and no
-priority labels — with one exception: the budget-gate notice, one automated
-message appended at the **conversation tail** (a system part only under
-`notice: "system"`, for providers that drop trailing messages), sent only when
-the raw conversation crosses the compaction budget mid-round, because it must
-reach the model before its next step, not after it asks. The tail position is
-deliberate: a request-scoped message touches no cached prefix, unlike a system
-part prepended before the whole history. Recall
-results are ordinary tool outputs; the single compaction elision boundary keeps the
-system bounded.
+Ship self-contained ESM server/TUI bundles with `@opencode/plugin` external and
+no additional runtime dependencies. The peer range is `>=2.3.2 <3`; the development
+SDK is pinned to 2.3.2. There is no older-host adapter. Node 22.18+ runs source
+tests with native type stripping; installed bundles require Node 20+.
 
-### Keeping context low (three compaction triggers, one gate)
+Local activation uses content-addressed, never-overwritten release directories,
+not development `dist`. `release:local` typechecks/tests/builds and prints a URI;
+it does not edit host configuration or publish to npm. Deliberately change the
+URI and verify the target session's explicit Location, since server defaults can
+differ from the terminal directory. Config watching applies the release without
+a service restart; retain the old URI for rollback.
 
-The aim is a context that stays small all the time, without asking the model to
-manage it. Native compaction triggers at window − 15%, which is far too late for
-cost and quality (context rot), so the plugin adds two automatic triggers and
-one model-requested:
+Tests cover pure validation/search and controller scheduling, fallback, ownership,
+fork reconstruction, and blocked-write deletion/unload races. Request fixtures
+are checked against OpenCode 2.3.2 shapes but are not a replacement for the host.
+Live activation, a completed custom checkpoint, and retrieval of its newly
+archived dialogue/tool originals establish a narrower smoke-test result—not
+live proof of every fork, fallback, or deletion path.
 
-- **Deferred soft trigger (the main one; option `idle`).** The end of a successful
-  turn is a natural "topic finished" boundary, but not proof that the conversation
-  will continue. Subscribe to `session.execution.succeeded` and, if at least
-  `idle` tokens (default 25k) of new conversation have accumulated since the last
-  checkpoint, persist only `{ checkpoint, after, tokens }`, where `after` is the
-  last history-row id. No model call runs while the user is away. On the next
-  `session.hook("prompt")`, validate that the current checkpoint and last row
-  still match, then await compaction **admission**, not summary generation, before
-  allowing OpenCode to admit the new prompt. Native steered compaction runs before
-  pending prompts, so the new message stays verbatim after the checkpoint. The
-  queued message's text (trimmed, capped at 2,000 characters) is added to the
-  generation data as `queued`: a relevance signal for what stays live and which
-  references matter — evidence, never instructions — and it cannot retire
-  constraints because retirement requires an exact quote tied to a real user row
-  ID. Opening a session alone does nothing. The marker survives plugin/service
-  reloads, is not inherited by forks, and does not apply to a staged revert or
-  child session. Missing/corrupt storage or rejected admission must not block the
-  prompt; the hard budget and native overflow remain safety nets. Growth is
-  measured from the actual context request rather than a duplicate
-  row-to-message projection, and a measurement is usable only for its checkpoint.
-  Failed, interrupted and transient executions do not mark compaction due;
-  measuring growth avoids loops on the retained tail. The tradeoff is resume
-  latency and possibly a colder provider prompt cache; avoiding a summary for an
-  abandoned conversation takes priority.
-- **Hard budget (within a turn).** In the context hook, estimate conversation
-  tokens with chars/4, excluding system instructions and tool definitions, and
-  calibrate the estimate toward real tokens against provider-reported usage from
-  recent completed requests (native chars/4 units apply until a usable pair of
-  usage-bearing rows exists). Above `budget` (default adaptive, see the
-  thermostat below; initial value `min(50% window, 100k)`),
-  compact when growth since the checkpoint is at least `min(idle, budget / 4)`.
-  A live-round crossing first opens the **budget gate**: compaction pauses one
-  evaluation step while an automated notice — numbers only; options continue
-  (default), `defer_compaction`, delegate — rides the
-  conversation tail (option `notice: "system"` restores the legacy system
-  part). The evaluation window doubles as the generation window (v0.11): the
-  would-be episode is archived and its handoff generated statelessly while the
-  model reads the notice, so a gate that closes on continue commits that
-  precomputed handoff with no additional model request — the gate adds no
-  latency at the cut. The precompute is discarded — that cut generates inline
-  exactly as before — when a deferral is granted, when `checkpoint_now` leaves
-  an explicit keep note, or when the cut's boundary no longer matches what the
-  window covered (same parent, window rows a prefix of the cut's). The next build of the same round and checkpoint closes the gate and
-  compacts; a gate still open when its round ends or fails is repaid
-  immediately, unless a deferral grant held it. Without a live-round stamp —
-  unreadable round, staged revert, guard or cooldown active — the crossing
-  compacts silently, as before. Native overflow handling still accounts for the
-  complete request.
-- **Model-requested (`checkpoint_now`).** The model can move the cut earlier
-  than any trigger, at a natural pause before a context-heavy phase.
-  Approval-free by design — it releases context, never holds it — once per
-  round, and refused politely while a compaction runs or a revert is staged.
-  At an open gate it is an alias for continue (v0.11): the crossing already
-  holds the cut one step away, so exactly one compaction path lands there; its
-  optional `keep` line still rides the same hint channel as a queued prompt —
-  relevance evidence for the working state, never instructions — and discards
-  the window's precompute, since that handoff cannot carry the note.
-- **Budget thermostat (v0.10).** The auto `budget` is learned per **main model**
-  from recall pressure. Recall executions are counted per **cycle** (one committed
-  handoff to the next) and folded into an EMA (α = 0.5) persisted at
-  `project/thermostat` under `provider/id`, shared by every session of the project
-  instance. At each committed cut, with at least four completed cycles of
-  evidence, EMA ≥ 2.0 raises the budget ×1.2 and EMA ≤ 0.5 lowers it ×0.9 — at
-  most one step per cycle, clamped to `[30k, window × 0.5]`, starting from
-  `min(window × 0.5, 100k)`. A model that keeps recalling after cuts earns a
-  larger live budget; a model that never recalls pays for less context. An
-  explicit `options.budget` wins absolutely (evidence still accumulates);
-  subagent sessions and unknown windows never feed the loop; every thermostat
-  failure reports and falls back to the static default.
-- Both triggers share one per-session admission guard. The context hook is
-  fire-and-forget; concurrent prompt hooks share and await the admission promise
-  so none race ahead of the compaction control. Errors are caught. The guard
-  clears on `session.compaction.ended`, `session.compaction.failed`, rejected
-  admission, the next successful execution with no running compaction, or after
-  three minutes. After `session.compaction.failed`, new requests are blocked for
-  three minutes so a persistent failure cannot cause a retry on every step. The
-  event subscriber retries if its stream ends unexpectedly; model windows are
-  cached by provider and model. Gate, deferral, checkpoint and precompute
-  outcomes are
-  counted per session in a `gate-stats` storage key — telemetry only, never a
-  trigger input; a failed count is reported and swallowed. On
-  `session.deleted`, the session's episode notes graduate into the project
-  archive (see above), then the session's storage keys
-  (including the deferred marker) and in-memory state are removed.
-- **Cost reasoning:** with caching, every step pays cache-read price × context
-  size, so a smaller steady-state context is a direct saving. Rewrites happen
-  only at compactions. A completed
-  conversation does not pay for a speculative final summary. Byte stability
-  holds *between* compactions; each compaction invalidates the cache from its
-  first change onward.
+Matched task-quality/cost benchmarks and provider calibration traces remain
+necessary. Include task success, constraint fidelity, recalls/re-reads, total
+input/cache/output cost, repair/fallback requests, and latency. Neither schema
+checks nor token reductions establish universal summary fidelity or savings.
 
-### Possible later
+### Source map
 
-- The thermostat hears only recall pressure. A model starved by too small a
-  budget can instead **redo** elided tool calls (re-reads, re-runs) — silent to
-  the loop and even rewarded with further ×0.9 steps. The honest signal would be
-  a re-execution ratio — the same tool and input reappearing in post-cut growth
-  when an identical archived call exists pre-cut — folded into the same EMA as
-  upward pressure. Ambiguous for reads (re-reading a changed file is correct),
-  so it would need per-tool weighting; deliberately not in v0.10.
-- A `/memory` command (list episodes, stats) and a TUI panel through RPC.
-- A per-checkpoint memo of the token accounting: `messageTokens` runs on every
-  context event at live sizes (~1,900 rows). Fine at current sizes; cache per
-  checkpoint if sessions grow.
-- A guard in `formatRow`: it parses its raw JSON unguarded, so a corrupt stored
-  row surfaces a raw `SyntaxError` instead of the transcript path's clean
-  `[Invalid archived row]` degradation. Cosmetic — plugin-written rows are
-  valid JSON — but worth tidying.
-- None of this is needed for the core.
-
-## Focused retrieval and deployment
-
-BM25 ranks bounded transcript passages and short archive notes, not whole long
-documents. Excerpts choose the densest relevant window, retain their source ID
-and raw-text page, and deduplicate identical evidence. Notes are explicitly labeled
-as summaries. Search returns four excerpts per page, at most 40 ranked results;
-opening an original returns the whole original in one call up to 30,000 characters,
-or 6,000-character pages for larger ones, with native files only on the part
-containing their label. Retrieved originals stay live once recalled; pagination
-preserves Unicode surrogate pairs.
-Only archived/hidden data is indexed; visible history is not redundantly retrieved.
-
-Local production installs use content-addressed, never-overwritten release copies.
-Build/test output is separate from the live plugin path. The release script tests
-first and prints a URI; it never edits host configuration. Activation is an explicit
-URI change after private-server validation, with the old release kept for rollback.
-
-This favors measured task success and total task cost, not token minimization at
-the expense of correctness. A 100-checkpoint synthetic test checks boundedness,
-and real-model checks cover task replacement, constraints, recall, model selection,
-reloads, native fallback paths, triggers, queues and forks/media. These do not prove
-universal summary fidelity or dollar savings; matched coding-workload benchmarks
-remain necessary. Research rationale: Anthropic's context-engineering guidance,
-The Complexity Trap (arXiv:2508.21433), and VibeMemBench (arXiv:2609.23570).
-
-Known trade-off: after compaction, native compaction renders the recent tail as
-**text** (reasoning dropped, tool outputs clipped to 1,250 chars). That is
-acceptable because `recall` gets the full outputs back. If it proves harmful, the
-compaction metadata can override the recent-context rendering.
-
-## Tech stack
-
-- **TypeScript**, using `@opencode/plugin` V2 (`Plugin.define`), peer range
-  `>=2.2.5 <3`. Erasable syntax only (no `enum` or `namespace`) so Node can run
-  the sources natively. The shipped artifacts are self-contained ESM bundles
-  (server and TUI) built by a development-only esbuild; `@opencode/plugin` stays
-  external and there are no runtime dependencies.
-- **Storage** is `ctx.storage` (the plugin-scoped KV in opencode.db); writes are
-  serialized per durable key across host contexts and hot reloads. **Search** is
-  in-memory BM25, enough for MB-scale archives (FTS5 only if ever needed).
-  **Tokens** are chars/4 with the CJK adjustment described above; estimates that
-  face model window limits are calibrated against provider-reported usage.
-- **Architecture:** a functional core with an imperative shell. Pure functions
-  `planCut`, `resolveMemory`, `renderMemory`, `search`, `messageTokens`
-  hold all the logic; the hooks are thin adapters.
-- **Tests:** `node --test` (Node 22.18+ for native type stripping) on the pure
-  core and the hook adapters.
-- **Config:** a handful of keys via plugin `options`: `idle`, `budget`,
-  `memory.budget`, `debug`. The size
-  of the kept tail is native config (`compaction.keep.tokens`).
-
-```
+```text
 src/
-  index.ts       Plugin.define entry
-  runtime.ts     hooks, compaction, recall tool and trigger adapters
-  tokens.ts      token estimation
-  memory.ts      checkpoint chains, episodes and rendering
-  working.ts     handoff schema: parsing, validation, budget
-  recall.ts      transcripts, pagination and BM25
-  store.ts       typed ctx.storage wrapper
-  prompts.ts     working-state prompt and tool descriptions
-  models.ts      compaction-model policy and safe-capacity checks
-  model-rpc.ts   nextdcp.model RPC schema and state
+  index.ts       registration, owned event subscription and cleanup
+  runtime.ts     serialized cuts, hooks/tools, scheduling and recall assembly
+  lifecycle.ts   task admission, cancellation, write fence and tombstones
+  store.ts       session/project persistence, imports and graduation
+  memory.ts      cut planning, native adoption, checkpoint chains and rendering
+  working.ts     schema, constraint evidence, patches and rendered size
+  checkpoint.ts  direct-edit schema/merger and ordered semantic evidence fence
+  estimate.ts    retained/growth/evidence/request meters and calibration
+  thermostat.ts  versioned adaptive baseline bounds and +50%/−20% updates
+  safeguard.ts   fresh-evidence allowance, pause detection and reminder spacing
+  recall.ts      readable originals, media, pagination, addresses and BM25
+  tokens.ts      text/media estimates
+  time.ts        spans and positive-floor recency preference
+  prompts.ts     generation contract and standing tool protocol
+  models.ts      policy, selected-model generation, warnings and capacity
+  model-rpc.ts   nextdcp.model RPC schema
   picker.ts      /compact-model TUI picker
-  tui.ts         TUI bundle entry
+  memory-rpc.ts  read-only nextdcp.memory RPC schema and accounting types
+  memory-view.ts /memory TUI dialog, no prompt or model-tool surface
+  tui.ts         TUI entry
 test/
-  support/history.ts test-only row-to-message projection
+  support/history.ts  abbreviated current-host request fixtures, tests only
 ```
-
-## Relation to opencode-dcp
-
-nextdcp is a clean-room rewrite, not an iteration on opencode-dcp (v3.2.0,
-AGPL-3.0; nextdcp is MIT). The problems observed there come from its core
-design, not from bugs:
-
-| Symptom | Root cause |
-|---|---|
-| Context breaks into many tiny blocks | The agent picks ranges ad hoc. Nothing ever consolidates them; nesting just copies summaries into new ones. |
-| Models echo reminders, misread `@4@` tags as images, etc. | IDs are injected into user text and tool outputs, and reminders are injected into history. The model has to understand a private protocol. |
-| No way to get details back | Compression is view-only; the model has no retrieval tool. Only the user can decompress. |
-| Housekeeping takes the agent's attention and costs output tokens | The main (expensive) model writes every summary, prompted by nudges. |
-| Fragility | About 9.6k LOC: a v1/v2 adapter, regex stripping and re-injection every turn, unpersisted ref maps, private SDK patching, and detecting internal agents by string matching. |
-| Prompt-cache churn | Every compress rewrites history from its anchor onward, and nudge anchors move. |
-
-Deliberately dropped from that design: the agent-driven `compress` tool and range
-IDs, message-ID injection, nudges and reminders, manual mode, the notifications
-UI, auto-update, the custom-prompt override tree, and V1 support. Model-visible
-ids appear only in episode headers and `recall` output.

@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin"
 import { tokens } from "./tokens.ts"
 import { modelRpc, modelLabel, type ModelPreference, type ModelRef, type ModelState } from "./model-rpc.ts"
 import { object } from "./guards.ts"
+import type { createLifecycle } from "./lifecycle.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type ModelInfo = Awaited<ReturnType<Plugin.Context["model"]["list"]>>["data"][number]
@@ -28,7 +29,7 @@ export function assertFits(model: Pick<ModelInfo, "limit">, prompt: string) {
   if (estimate > available) throw new Error(`transcript needs about ${estimate} input tokens including safety margin; safe capacity is ${Math.max(0, available)}`)
 }
 
-export function createModels(ctx: Plugin.Context) {
+export function createModels(ctx: Plugin.Context, ownership?: { lifecycle: ReturnType<typeof createLifecycle>; access: (id: SessionID) => Promise<unknown> }) {
   let emit: ((sessionID: SessionID, message: string) => Promise<void>) | undefined
   const warningEntries = (value: unknown): { time: number; message: string }[] => {
     if (typeof value !== "string") return []
@@ -47,7 +48,10 @@ export function createModels(ctx: Plugin.Context) {
       await ctx.storage.set(historyKey, JSON.stringify(entries))
       await ctx.storage.set(`${root(sessionID)}/warning`, message)
     } catch { /* The warning must not prevent fallback. */ }
-    try { await emit?.(sessionID, message) } catch { /* Clients may be disconnected. */ }
+    try {
+      await ownership?.lifecycle.assertOpen(sessionID)
+      await emit?.(sessionID, message)
+    } catch { /* Closed session or disconnected clients. */ }
   }
   const preference = async (id: SessionID): Promise<ModelPreference> => {
     const stored = await ctx.storage.get(root(id))
@@ -77,18 +81,33 @@ export function createModels(ctx: Plugin.Context) {
     }
   }
   const register = async () => {
+    const closed = Symbol("closed")
+    const scoped = async <T>(id: SessionID, work: () => Promise<T>): Promise<T> => {
+      if (!ownership) return work()
+      const result = await ownership.lifecycle.run<T | typeof closed>(id, async () => {
+        await ownership.access(id)
+        return work()
+      }, closed)
+      if (result === closed) throw new Error("Session archive is closed")
+      return result
+    }
     const registration = await ctx.rpc.register(modelRpc, {
-      get: async (input) => snapshot((input as { sessionID: SessionID }).sessionID),
+      get: async (input) => {
+        const { sessionID } = input as { sessionID: SessionID }
+        return scoped(sessionID, () => snapshot(sessionID))
+      },
       set: async (input, call) => {
         const { sessionID, preference: selected } = input as { sessionID: SessionID; preference: ModelPreference }
-        await ctx.session.get({ sessionID }) // Check existence and Location before writing anything.
-        if (!validPreference(selected)) return call.error("invalid_selection", "Invalid compaction-model selection", null)
-        if (selected.mode === "specific" && !matching(await choices(), selected.model)) {
-          return call.error("invalid_selection", "That text model or variant is unavailable; selection was not changed", null)
-        }
-        await ctx.storage.set(root(sessionID), selected)
-        await ctx.storage.remove(`${root(sessionID)}/warning`).catch(() => undefined)
-        return { preference: selected }
+        return scoped(sessionID, async () => {
+          await ctx.session.get({ sessionID }) // Check existence and Location before writing anything.
+          if (!validPreference(selected)) return call.error("invalid_selection", "Invalid compaction-model selection", null)
+          if (selected.mode === "specific" && !matching(await choices(), selected.model)) {
+            return call.error("invalid_selection", "That text model or variant is unavailable; selection was not changed", null)
+          }
+          await ctx.storage.set(root(sessionID), selected)
+          await ctx.storage.remove(`${root(sessionID)}/warning`).catch(() => undefined)
+          return { preference: selected }
+        })
       },
     })
     emit = (sessionID, message) => registration.events.emit("warning", { sessionID, message })
@@ -107,7 +126,7 @@ export function createModels(ctx: Plugin.Context) {
     async clearWarning(sessionID: SessionID) {
       await ctx.storage.remove(`${root(sessionID)}/warning`).catch(() => undefined)
     },
-    async generate(selected: ModelRef, prompt: string) {
+    async generate(selected: ModelRef, prompt: string, signal?: AbortSignal) {
       const model = matching(await choices(), selected)
       if (!model) throw new Error(`${modelLabel(selected)} is unavailable`)
       assertFits(model, prompt)
@@ -116,7 +135,7 @@ export function createModels(ctx: Plugin.Context) {
       const generate = ctx.experimental?.generate
       if (typeof generate?.text !== "function") throw new Error(`${modelLabel(selected)} cannot run stateless generation in this OpenCode build`)
       let result: Awaited<ReturnType<typeof ctx.experimental.generate.text>>
-      try { result = await generate.text({ model: selected as HostRef, prompt }) } catch {
+      try { result = await generate.text({ model: selected as HostRef, prompt }, { signal }) } catch {
         // Provider errors can contain prompts or credentials. Do not send them to clients.
         throw new Error(`${modelLabel(selected)} request failed`)
       }

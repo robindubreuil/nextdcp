@@ -1,5 +1,8 @@
 # Budget-gate redesign plan — making the model an informed participant
 
+> Historical plan, superseded by the 0.14 architecture. See README.md and
+> DESIGN.md for the current gate, lifecycle, and scheduling contract.
+
 Diagnosis of why `defer_compaction` is never called, what external evidence
 says, and the smallest set of changes that fixes it. Companion to DESIGN.md
 (§ Round-scoped deferral, § Keeping context low) and README § Defer compaction.

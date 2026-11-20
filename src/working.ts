@@ -1,5 +1,6 @@
 import { tokens } from "./tokens.ts"
 import { object } from "./guards.ts"
+import { userSources, type SourceRow, type UserSource } from "./user-sources.ts"
 
 export const DEFAULT_MEMORY_BUDGET = 2_000
 export class HandoffError extends Error {}
@@ -10,11 +11,11 @@ export type WorkingMemory = {
   readonly next: readonly string[]
   readonly references: readonly { readonly id: string; readonly why: string }[]
 }
+export type PriorConstraints = Pick<WorkingMemory, "constraints">
 type Retirement = { readonly constraint: string; readonly messageID: string; readonly quote: string }
 export type Handoff = { readonly archive: string; readonly working: WorkingMemory; readonly retiredConstraints: readonly Retirement[] }
 /** Compact always-on archive pointer: how many episodes, since when, and how to open them. */
 export type Anchor = { readonly count: number; readonly first?: string; readonly last?: string; readonly span?: string }
-type UserRow = { readonly id: string; readonly type: string; readonly text?: unknown }
 const text = (value: unknown): value is string => typeof value === "string" && !!value.trim()
 const list = (value: unknown): value is string[] => Array.isArray(value) && value.every(text)
 const keys = (value: Record<string, unknown>, expected: readonly string[]) => Object.keys(value).every((key) => expected.includes(key))
@@ -25,7 +26,7 @@ export function validWorking(value: unknown): value is WorkingMemory {
     value.references.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why))
 }
 
-/** Only the compactor's explicit Title line names an episode; the note body stays archived. */
+/** Only the author's explicit Title line names an episode; the note body stays archived. */
 export function episodeNote(summary: string): { readonly title?: string; readonly body: string } {
   const match = /^Title:[\t ]*([^\r\n]+?)[\t ]*(?:\r?\n|$)/.exec(summary)
   return match ? { title: match[1], body: summary.slice(match[0].length).replace(/^\r?\n/, "") } : { body: summary }
@@ -47,15 +48,21 @@ export function renderWorking(working: WorkingMemory, through: string, gap = fal
   }
   const tail = anchor?.count ? ` — ${anchor.count} episode${anchor.count === 1 ? "" : "s"}${range}${anchor.span ? `, ${anchor.span}` : ""}` : ""
   return `## Current working state\nObjective: ${working.objective}` +
-    section("Applicable user constraints", working.constraints) + section("Relevant state and decisions", working.state) +
-    section("Unfinished work and next action", working.next) + section("Evidence references", working.references.map((ref) => `${ref.id}: ${ref.why}`)) +
+    section("User constraints", working.constraints) + section("State", working.state) +
+    section("Next", working.next) + section("References", working.references.map((ref) => `${ref.id}: ${ref.why}`)) +
     `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are archived${tail}. Browse: recall catalog; search: recall(query).` +
     (gap ? " Some original history was not archived; recall reports these gaps." : "")
 }
 
-/** A compactor may drift into another language on a valid schema, which silently locks
- *  the user out of their own archive. The note must not use a script the user never did. */
-const CJK = /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/
+/** Detect prose drift, not an identifier or punctuation in an otherwise English
+ *  note. Code spans and paths are evidence; only predominantly CJK prose counts. */
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
+const cjkProse = (value: string): boolean => {
+  const prose = value.replace(/^Title:[\t ]*/, "").replace(/`[^`]*`/g, "").replace(/\S*(?:[/\\]|\.[\p{L}\p{N}_])\S*/gu, "")
+  const letters = prose.match(/\p{L}/gu) ?? []
+  const cjk = letters.filter((letter) => CJK.test(letter)).length
+  return cjk > 0 && cjk * 2 >= letters.length
+}
 
 /** Extract the first parseable JSON object containing "archive": stateless generation
  *  has no provider JSON mode, so a compactor may frame its payload in prose or fences
@@ -89,53 +96,65 @@ function parseShell(raw: string): Record<string, unknown> {
   const stripped = raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")
   let value: unknown
   try { value = JSON.parse(stripped) } catch { value = extractObject(stripped) }
-  if (value === undefined) throw new HandoffError("Compactor did not return valid JSON")
-  if (!object(value) || !keys(value, ["archive", "working", "retiredConstraints"]) || !text(value.archive) || value.archive.length > 4_000 ||
-      !object(value.working) || !Array.isArray(value.retiredConstraints)) throw new HandoffError("Compactor returned an invalid handoff schema")
+  if (value === undefined) throw new HandoffError("Handoff did not contain valid JSON")
+  if (!object(value) || !keys(value, ["archive", "working", "retiredConstraints"]) || !text(value.archive) ||
+      !object(value.working) || !Array.isArray(value.retiredConstraints)) throw new HandoffError("Handoff has an invalid handoff schema")
   return value
 }
 
 /** The new episode's note: a Title line first, in the language of the user's messages. */
-function shellArchive(value: Record<string, unknown>, users: readonly UserRow[]): string {
-  if (!text(value.archive)) throw new HandoffError("Compactor returned an invalid handoff schema")
+function shellArchive(value: Record<string, unknown>, users: readonly UserSource[], previous: PriorConstraints | undefined, priorSummary?: string): string {
+  if (!text(value.archive)) throw new HandoffError("Handoff has an invalid handoff schema")
   const archive = value.archive.trim()
   if (!/^Title:[\t ]*\S/.test(archive)) throw new HandoffError("Archive note must begin with a 'Title: <episode name>' line")
-  if (CJK.test(archive) && !users.some((row) => row.type === "user" && typeof row.text === "string" && CJK.test(row.text)))
+  // A cut may contain only assistant/tool work. The validated prior state still
+  // carries the task's language; the candidate being validated cannot authorize itself.
+  const inherited = validWorking(previous) ? [previous.objective, ...previous.constraints, ...previous.state, ...previous.next, ...previous.references.map((ref) => ref.why)] : previous?.constraints ?? []
+  if (cjkProse(archive) && !inherited.some(cjkProse) && !cjkProse(priorSummary ?? "") && !users.some((row) => cjkProse(row.text)))
     throw new HandoffError("Archive note must stay in the language of the user's messages")
   return archive
 }
 
 /** An omission is NOT evidence that a standing instruction stopped applying.
  *  Retirement must be explicit, auditable, and grounded in a new user message. */
-function shellRetirements(value: Record<string, unknown>, previous: WorkingMemory | undefined, users: readonly UserRow[]): Retirement[] {
+function shellRetirements(value: Record<string, unknown>, previous: PriorConstraints | undefined, users: readonly UserSource[]): Retirement[] {
   const retired = new Set<string>()
-  const items = value.retiredConstraints as readonly unknown[]
-  for (const item of items) {
-    if (!object(item) || !keys(item, ["constraint", "messageID", "quote"]) || !text(item.constraint) || !text(item.messageID) || !text(item.quote) ||
+  return (value.retiredConstraints as readonly unknown[]).map((item) => {
+    if (!object(item) || !keys(item, ["constraint", "messageID", "quote"]) || !text(item.constraint) || !text(item.quote) ||
+        item.messageID !== undefined && !text(item.messageID) ||
         !previous?.constraints.includes(item.constraint) || retired.has(item.constraint)) throw new HandoffError("Invalid constraint retirement")
-    const user = users.find((row) => row.type === "user" && row.id === item.messageID)
-    if (typeof user?.text !== "string" || !user.text.includes(item.quote)) throw new HandoffError("Constraint retirement needs a verbatim quote from a new user message")
-    retired.add(item.constraint)
-  }
-  return items as Retirement[]
+    const { constraint, quote, messageID } = item
+    const user = users.findLast((row) => (messageID === undefined || row.id === messageID) && row.text.includes(quote))
+    if (!user) throw new HandoffError("Constraint retirement needs a verbatim quote from a new user message")
+    retired.add(constraint)
+    return { constraint, messageID: user.id, quote }
+  })
 }
 
-const mergeConstraints = (previous: readonly string[], retired: ReadonlySet<string>, next: readonly string[]): string[] => {
+/** A new protected rule is its own source quote: no second author-written proof
+ *  envelope, host-instruction copies, or unchecked paraphrases that stick forever.
+ *  Previously committed (including legacy/native) rules keep omission protection. */
+const mergeConstraints = (previous: readonly string[], retired: ReadonlySet<string>, next: readonly string[], users: readonly UserSource[]): string[] => {
   const constraints = [...new Set([...previous.filter((item) => !retired.has(item)), ...next])]
   if (constraints.some((item) => retired.has(item))) throw new HandoffError("A retired constraint is still present in the handoff")
+  const inherited = new Set(previous)
+  if (next.some((item) => !inherited.has(item) && !users.some((row) => row.text.includes(item))))
+    throw new HandoffError("New standing constraints must be verbatim quotes from new user messages; keep task requirements in state/next and omit host instructions")
   return constraints
 }
 
 /** Validate before committing. Never repair malformed JSON by silently discarding fields. */
-export function parseHandoff(raw: string, previous: WorkingMemory | undefined, users: readonly UserRow[], ids: ReadonlySet<string>): Handoff {
+export function parseHandoff(raw: string, previous: PriorConstraints | undefined, rows: readonly SourceRow[], ids: ReadonlySet<string>, priorSummary?: string): Handoff {
   const value = parseShell(raw)
-  if (!validWorking(value.working)) throw new HandoffError("Compactor returned an invalid handoff schema")
-  const archive = shellArchive(value, users)
+  if (!validWorking(value.working)) throw new HandoffError("Handoff has an invalid handoff schema")
+  const users = userSources(rows)
+  // An inherited native summary supplies language only, never retirement proof.
+  const archive = shellArchive(value, users, previous, priorSummary)
   const retiredConstraints = shellRetirements(value, previous, users)
   const retired = new Set(retiredConstraints.map((item) => item.constraint))
   const working = value.working
   if (working.references.some((ref) => !ids.has(ref.id))) throw new HandoffError("Handoff references an unavailable archive")
-  return { archive, working: { ...working, constraints: mergeConstraints(previous?.constraints ?? [], retired, working.constraints) }, retiredConstraints }
+  return { archive, working: { ...working, constraints: mergeConstraints(previous?.constraints ?? [], retired, working.constraints, users) }, retiredConstraints }
 }
 
 const validField = {
@@ -151,19 +170,20 @@ const validField = {
  *  replaces the previous one entirely. The merged whole must then pass the same
  *  checks as a full handoff — a patch never weakens validation, it only shrinks
  *  the request. Constraint retirement keeps its exact-quote proof unchanged. */
-export function parsePatchHandoff(raw: string, previous: WorkingMemory, users: readonly UserRow[], ids: ReadonlySet<string>): Handoff {
+export function parsePatchHandoff(raw: string, previous: WorkingMemory, rows: readonly SourceRow[], ids: ReadonlySet<string>): Handoff {
   const value = parseShell(raw)
-  if (!object(value.working)) throw new HandoffError("Compactor returned an invalid patch schema")
+  if (!object(value.working)) throw new HandoffError("Handoff has an invalid patch schema")
   const fields: Record<string, unknown> = value.working
   if (!keys(fields, ["objective", "constraints", "state", "next", "references"]) ||
       Object.keys(fields).some((key) => !validField[key as keyof typeof validField](fields[key as keyof typeof validField])))
-    throw new HandoffError("Compactor returned an invalid patch schema")
-  const archive = shellArchive(value, users)
+    throw new HandoffError("Handoff has an invalid patch schema")
+  const users = userSources(rows)
+  const archive = shellArchive(value, users, previous)
   const retiredConstraints = shellRetirements(value, previous, users)
   const retired = new Set(retiredConstraints.map((item) => item.constraint))
   const working: WorkingMemory = {
     objective: typeof fields.objective === "string" ? fields.objective : previous.objective,
-    constraints: mergeConstraints(previous.constraints, retired, Array.isArray(fields.constraints) ? fields.constraints as string[] : []),
+    constraints: mergeConstraints(previous.constraints, retired, Array.isArray(fields.constraints) ? fields.constraints as string[] : [], users),
     state: Array.isArray(fields.state) ? fields.state as string[] : previous.state,
     next: Array.isArray(fields.next) ? fields.next as string[] : previous.next,
     references: Array.isArray(fields.references) ? fields.references as WorkingMemory["references"] : previous.references,

@@ -251,19 +251,41 @@ test("search scans all storage pages without crossing session boundaries", async
   assert.deepEqual(JSON.parse(archived.at(-1).text), bulk.at(-1))
 })
 
-test("corrupt storage is an error rather than silently discarding previous state", async () => {
-  const kv = new MemoryStorage(), store = createStore(kv, "s")
+test("exact corrupt records fail, while scans report and isolate unreadable originals", async () => {
+  const kv = new MemoryStorage(), reports = [], store = createStore(kv, "s", (message) => reports.push(message))
+  const good = { id: "good", name: "read", input: {}, result: { type: "text", value: "intact original" } }
+  kv.values.set("sessions/s/calls/good", JSON.stringify(good))
   kv.values.set("sessions/s/calls/x", "not json")
   await assert.rejects(store.getCall("x"), /Invalid stored JSON/)
+  assert.deepEqual(await store.getCalls(), [good])
   kv.values.set("sessions/s/calls/x", JSON.stringify({ id: "x", name: "read" }))
   await assert.rejects(store.getCall("x"), /Invalid archived call/)
-  await assert.rejects(store.getCalls(), /Invalid archived call/)
+  assert.deepEqual(await store.getCalls(), [good])
+  kv.values.set("sessions/s/rows/bad", { not: "serialized" })
+  kv.values.set("sessions/s/rows/good", JSON.stringify({ id: "good", type: "shell", command: "test" }))
+  await assert.rejects(store.getRow("bad"), /Invalid archived row/)
+  assert.deepEqual((await store.getRows()).map(({ id }) => id), ["good"])
+  assert.equal(reports.filter((message) => message.includes("unreadable archived call x")).length, 2)
+  assert.ok(reports.some((message) => message.includes("unreadable archived row bad")))
   assert.equal(kv.writes.length, 0)
+})
+
+test("opaque prefix discovery scans matching keys without decoding unrelated payloads", async () => {
+  const kv = new MemoryStorage(), store = createStore(kv, "s")
+  kv.values.set("sessions/s/calls/call%2Fone", "not json")
+  kv.values.set("sessions/s/calls/call%2Ftwo", "not json")
+  kv.values.set("sessions/s/calls/unrelated", "not json")
+  kv.values.set("sessions/s/rows/call%2Frow", "not json")
+  kv.values.set("sessions/other/calls/call%2Fforeign", "not json")
+  const prefixes = [], scan = kv.scan.bind(kv)
+  kv.scan = async (options) => { prefixes.push(options.prefix); return scan(options) }
+  assert.deepEqual((await store.matchingIDs("call/")).sort(), ["call/one", "call/row", "call/two"])
+  assert.deepEqual(prefixes.sort(), ["sessions/s/calls/call%2F", "sessions/s/rows/call%2F"])
 })
 
 test("deferred compaction is durable, session-scoped, validated and removed with its session", async () => {
   const kv = new MemoryStorage(), store = createStore(kv, "s")
-  const value = { checkpoint: null, after: "last-message", tokens: 25_001 }
+  const value = { checkpoint: null, after: "last-message", tokens: 25_001, threshold: 25_000 }
   assert.equal(await store.getDeferredCompaction(), undefined)
   await store.saveDeferredCompaction(value)
   assert.deepEqual(await createStore(kv, "s").getDeferredCompaction(), value)
@@ -278,7 +300,7 @@ test("deferred compaction is durable, session-scoped, validated and removed with
 
 test("clear removes the whole session root, including keys written outside the store", async () => {
   const kv = new MemoryStorage(), store = createStore(kv, "s")
-  await store.saveDeferredCompaction({ checkpoint: null, after: "m1", tokens: 25_001 })
+  await store.saveDeferredCompaction({ checkpoint: null, after: "m1", tokens: 25_001, threshold: 25_000 })
   kv.values.set("sessions/s/model", JSON.stringify({ mode: "specific" }))
   kv.values.set("sessions/s/model/warning", "stale warning")
   kv.values.set("sessions/s/unknown-future-key", "x")
@@ -287,21 +309,21 @@ test("clear removes the whole session root, including keys written outside the s
   assert.deepEqual([...kv.values.keys()], ["sessions/other/rows/r9"], "the session root is gone; other sessions survive")
 })
 
-// Graduation: episode notes outlive their session at project/episodes/P<n>.
+// Graduation: episode notes outlive their session under their actual project ID.
 
 test("graduatedNotes drops corrupt records and reads what graduate wrote", async () => {
-  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  const kv = new MemoryStorage(), project = createProjectStore(kv, "test", () => {})
   assert.deepEqual(await project.graduatedNotes(), [])
   assert.equal(await project.graduate([{ note: "Title: Auth fix\nWork: rotated the client secret", end: 1_000 }, { note: "", end: 2_000 }], "ses_aaa"), 1, "empty notes never graduate")
-  kv.values.set("project/episodes/P9", "not json{")
-  kv.values.set("project/episodes/P10", JSON.stringify({ id: "P10", note: "valid note", session: "ses_bbb", end: 3_000 }))
-  kv.values.set("project/episodes/P11", JSON.stringify({ id: "P11", note: "no session", end: 3_000 }))
+  kv.values.set("projects/test/episodes/P9", "not json{")
+  kv.values.set("projects/test/episodes/P10", JSON.stringify({ id: "P10", note: "valid note", session: "ses_bbb", end: 3_000 }))
+  kv.values.set("projects/test/episodes/P11", JSON.stringify({ id: "P11", note: "no session", end: 3_000 }))
   const notes = await project.graduatedNotes()
   assert.deepEqual(notes.map(({ id }) => id).sort(), ["P1", "P10"], "corrupt records are skipped, valid ones kept")
 })
 
 test("graduate dedups exact text across sessions and sequences P<n> above the highest existing", async () => {
-  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  const kv = new MemoryStorage(), project = createProjectStore(kv, "test", () => {})
   assert.equal(await project.graduate([{ note: "note one", end: 10 }, { note: "note one", end: 20 }], "ses_a"), 1, "an exact duplicate within one batch graduates once")
   assert.equal(await project.graduate([{ note: "note one", end: 30 }], "ses_b"), 0, "fork copies across sessions never graduate twice")
   assert.equal(await project.graduate([{ note: "note two", end: 40 }, { note: "note three", end: 50 }], "ses_b"), 2)
@@ -311,13 +333,13 @@ test("graduate dedups exact text across sessions and sequences P<n> above the hi
     ["P2", "note two", "ses_b"],
     ["P3", "note three", "ses_b"],
   ])
-  kv.values.set("project/episodes/P40", JSON.stringify({ id: "P40", note: "planted high", session: "ses_z", end: 60 }))
+  kv.values.set("projects/test/episodes/P40", JSON.stringify({ id: "P40", note: "planted high", session: "ses_z", end: 60 }))
   assert.equal(await project.graduate([{ note: "note four", end: 70 }], "ses_c"), 1)
-  assert.ok(kv.values.has("project/episodes/P41"), "numbering continues above the highest existing P<n>")
+  assert.ok(kv.values.has("projects/test/episodes/P41"), "numbering continues above the highest existing P<n>")
 })
 
 test("graduate keeps the 200 most recent notes and removes overflow oldest first", async () => {
-  const kv = new MemoryStorage(), project = createProjectStore(kv, () => {})
+  const kv = new MemoryStorage(), project = createProjectStore(kv, "test", () => {})
   const batch = Array.from({ length: 205 }, (_, index) => ({ note: `note ${index}`, end: index }))
   assert.equal(await project.graduate(batch, "ses_a"), 205)
   const notes = await project.graduatedNotes()
@@ -327,8 +349,8 @@ test("graduate keeps the 200 most recent notes and removes overflow oldest first
 
 test("graduation storage failures report and never throw", async () => {
   const kv = new MemoryStorage(), reported = []
-  const project = createProjectStore(kv, (message) => reported.push(message))
-  kv.fail = (key) => key.startsWith("project/episodes/")
+  const project = createProjectStore(kv, "test", (message) => reported.push(message))
+  kv.fail = (key) => key.startsWith("projects/test/episodes/")
   assert.equal(await project.graduate([{ note: "note", end: 1 }], "ses_a"), 0)
   assert.equal(reported.length, 1)
   assert.ok(String(reported[0]).includes("graduate session notes"))
@@ -350,18 +372,33 @@ test("episodeNotes returns every committed episode's note with an end-time fallb
   assert.ok(notes.every(({ end }) => end === 4_500 || end >= before), "a missing end falls back to now")
 })
 
-test("episode reservations are per-parent, ride the pending record, and never reuse a committed id", async () => {
+test("actual-cut episode allocation rides the pending record and survives an archive retry", async () => {
   const kv = new MemoryStorage(), store = createStore(kv, "session/s")
   const pending = await store.prepareArchive(rows())
   assert.equal(pending.parent, "old/checkpoint")
-  assert.equal(await store.reservedEpisode("old/checkpoint"), "E1")
-  assert.equal(await store.reservedEpisode("old/checkpoint"), "E1", "an uncommitted reservation is reused by the next precompute or cut")
+  assert.equal(await store.nextEpisode(), "E1")
   await store.pendingEpisode(pending.id, "E1")
   assert.equal((await store.getPending(pending.id)).episode, "E1")
+  assert.equal((await store.prepareArchive(rows())).episode, "E1", "an idempotent retry preserves its actual-cut allocation")
   const adopted = adoptNative({ id: pending.id, type: "compaction", status: "completed", summary: "Native summary" }, "E1", await store.getPending(pending.id))
   await store.saveCheckpoint(adopted)
-  assert.equal(await store.reservedEpisode("old/checkpoint"), "E2", "a reverted branch's committed episode id is never handed out again")
-  assert.equal(await store.reservedEpisode(null), "E3", "a root cut always allocates a fresh id")
+  assert.equal(await store.nextEpisode(), "E2", "a committed episode id is never handed out again")
+  assert.equal(await store.nextEpisode(), "E3", "a new cut allocates a fresh id")
   await store.pendingEpisode("missing", "E9")
   assert.equal(await store.getPending("missing"), undefined, "recording a reservation cannot invent a pending record")
+})
+
+test("graduated IDs stay monotonic when the highest ID is pruned or its write fails", async () => {
+  const kv = new MemoryStorage(), project = createProjectStore(kv, "test", () => {})
+  await project.graduate(Array.from({ length: 200 }, (_, index) => ({ note: `recent ${index}`, end: 1_000 + index })), "recent")
+  await project.graduate([{ note: "late graduation of very old work", end: 1 }], "old")
+  assert.equal(kv.values.has("projects/test/episodes/P201"), false, "the newest ID can have the oldest timestamp and be pruned")
+  await project.graduate([{ note: "fresh work", end: 5_000 }], "fresh")
+  assert.equal(kv.values.has("projects/test/episodes/P202"), true, "pruning cannot recycle the old address")
+  kv.fail = (key) => key === "projects/test/episodes/P203"
+  await project.graduate([{ note: "failed reservation", end: 6_000 }], "failed")
+  kv.fail = () => false
+  await project.graduate([{ note: "after failure", end: 7_000 }], "fresh")
+  assert.equal(kv.values.has("projects/test/episodes/P204"), true, "a reserved ID survives a partial failure too")
+  assert.equal(kv.values.get("projects/test/episodes-revision"), "204")
 })

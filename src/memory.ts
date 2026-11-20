@@ -12,7 +12,7 @@ export type Episode = {
   readonly start?: number
   readonly end?: number
 }
-export type Checkpoint = { readonly id: string; readonly parent: string | null; readonly episode: Episode; readonly working?: WorkingMemory; readonly retiredConstraints?: Handoff["retiredConstraints"] }
+export type Checkpoint = { readonly id: string; readonly parent: string | null; readonly episode: Episode; readonly author?: "main" | "compactor"; readonly working?: WorkingMemory; readonly constraints?: readonly string[]; readonly retiredConstraints?: Handoff["retiredConstraints"] }
 export type Pending = { readonly id: string; readonly parent: string | null; readonly rowIDs: readonly string[]; readonly archived: boolean; readonly episode?: string }
 
 /** The episode ends at the selected checkpoint (default: running), not at native compaction's retained-tail cut. */
@@ -25,16 +25,17 @@ export function planCut(rows: readonly Row[], checkpoint?: string): { checkpoint
 }
 
 /** A pending record preserves the old chain and archive boundary if generation fell back to native. */
-export function adoptNative(row: Row, episodeID: string, pending?: Pending, inherited?: Pick<Checkpoint, "working">): Checkpoint {
+export function adoptNative(row: Row, episodeID: string, pending?: Pending, inherited?: Pick<Checkpoint, "working" | "constraints">): Checkpoint {
   if (row.type !== "compaction" || row.status !== "completed" || typeof row.summary !== "string") throw new Error("Not a completed native checkpoint")
   if (pending && pending.id !== row.id) throw new Error("Pending checkpoint does not match")
   return {
     id: row.id,
     parent: pending?.parent ?? null,
     episode: { id: episodeID, summary: row.summary, rowIDs: pending?.rowIDs ?? [], native: true, ...(!pending?.archived ? { gap: true } : {}) },
-    // The parent's working state survives a native fallback: patch mode and rendered
-    // user constraints must not reset to nothing at the next cycle.
-    ...(inherited?.working ? { working: inherited.working } : {}),
+    // The summary is authoritative now. Do not patch stale objective/state/next.
+    // Standing constraints survive independently until new user evidence retires them.
+    ...((inherited?.working?.constraints ?? inherited?.constraints)?.length
+      ? { constraints: inherited?.working?.constraints ?? inherited?.constraints } : {}),
   }
 }
 
@@ -61,14 +62,18 @@ export function resolveMemory(current: string | null, records: ReadonlyMap<strin
     episodes.push(record.episode)
   }
   const latest = current === null ? undefined : records.get(current)
-  return { episodes, catalog, working: latest?.working, through: latest?.episode.id }
+  return { episodes, catalog, working: latest?.episode.native ? undefined : latest?.working,
+    constraints: latest?.working?.constraints ?? latest?.constraints ?? [], through: latest?.episode.id }
 }
 
 /** Only the latest working state is visible; without one, adopted native summaries render as the bounded episode chain. */
 export function renderHandoff(memory: ReturnType<typeof resolveMemory>): string {
   const gap = [...memory.catalog.values()].some((episode) => episode.gap)
   const title = memory.through ? episodeNote(memory.catalog.get(memory.through)?.summary ?? "").title : undefined
-  if (!memory.working || !memory.through) return renderMemory(memory.episodes)
+  if (!memory.working || !memory.through) {
+    const constraints = memory.constraints.length ? `Applicable user constraints (preserve unless explicitly retired):\n${memory.constraints.map((item) => `- ${item}`).join("\n")}\n\n` : ""
+    return constraints + renderMemory(memory.episodes)
+  }
   const anchor = archiveAnchor(memory.episodes)
   return renderWorking(memory.working, memory.through, gap, title, anchor)
 }

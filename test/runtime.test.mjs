@@ -3,13 +3,18 @@ import { registerHooks } from "node:module"
 import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
+import { questionRow } from "./support/question.ts"
 import { WORKING_PROMPT, RECALL_DESCRIPTION, CHECKPOINT_NOW_DESCRIPTION, budgetGateNotice } from "../src/prompts.ts"
 import { tokens } from "../src/tokens.ts"
+import { durableTokens, latestProviderUsage, requestTokens, retainedTokens, usageScale } from "../src/estimate.ts"
+import { THERMOSTAT_VERSION } from "../src/thermostat.ts"
+import { memoryRpc } from "../src/memory-rpc.ts"
+import { CHECKPOINT_INPUT } from "../src/checkpoint.ts"
 import { createController, install } from "../src/runtime.ts"
-import { createStore } from "../src/store.ts"
+import { createProjectStore, createStore } from "../src/store.ts"
 
-// Node's dependency-free tests replace only Plugin.define, whose v2.2.0 implementation
-// returns its argument. The isolated-server test uses the real installed SDK.
+// Node's dependency-free tests replace only Plugin.define, whose v2.3.2 implementation
+// returns its argument. Live-service checks exercise the real installed SDK.
 const hook = registerHooks({
   resolve(specifier, context, next) {
     if (specifier === "@opencode/plugin") return {
@@ -48,19 +53,26 @@ const model = { providerID: "provider", id: "model" }
 const event = (sessionID = "s") => ({ sessionID, model, system: [], tools: {}, messages: [] })
 const completed = (id, result) => ({ id, type: "compaction", status: "completed", summary: result.summary, metadata: result.metadata })
 const native = (id, summary = "Native fallback summary") => ({ id, type: "compaction", status: "completed", summary })
+const location = { directory: "C:/nextdcp-test" }
+const owned = (info = {}) => ({ projectID: "test", location, ...info })
+const deferred = () => {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
 
 function harness(options = {}, storage = new MemoryStorage()) {
   const state = {
     rows: [], prompts: [], stateless: [], compact: 0, info: { model, time: { busy: 1 } }, failAdmission: false,
     failGenerate: false, failStateless: false, hooks: new Map(),
-    handoff: { archive: "Title: Continue work\nWork: preserve the exact request.", working: { objective: "Continue current work", constraints: ["Preserve the exact request."],
+    handoff: { archive: "Title: Continue work\nWork: preserve the exact request.", working: { objective: "Continue current work", constraints: [],
       state: [], next: ["Continue the task"], references: [] }, retiredConstraints: [] },
     models: [{ ...model, enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [], limit: { context: 100_000, output: 8_192 } }],
-    configured: undefined, warnings: [], permissions: [], tools: new Map(),
+    configured: undefined, warnings: [], permissions: [], tools: new Map(), rpcs: new Map(),
     agents: [{ id: "build", permissions: [{ action: "*", resource: "*", effect: "allow" }] }],
   }
   const ctx = {
-    options, storage,
+    options, storage, location: { ...location, project: { id: "test" } },
     model: { list: async () => ({ data: state.models }) },
     agent: {
       get: async () => ({ data: { model: state.configured } }),
@@ -71,12 +83,13 @@ function harness(options = {}, storage = new MemoryStorage()) {
     },
     permission: { assert: async (input) => { state.permissions.push(input) } },
     rpc: { register: async (definition, handlers) => {
-      state.rpc = handlers
+      state.rpcs.set(definition.id, handlers)
+      if (definition.id === "nextdcp.model") state.rpc = handlers
       return { dispose: async () => {}, events: { emit: async (name, data) => state.warnings.push({ name, data }) } }
     } },
     session: {
       context: async () => state.rows,
-      get: async () => state.info,
+      get: async () => owned(state.info),
       compact: async () => { state.compact++; if (state.failAdmission) throw new Error("admission failed"); return {} },
       generate: async ({ prompt }) => {
         state.prompts.push(prompt)
@@ -98,6 +111,21 @@ function harness(options = {}, storage = new MemoryStorage()) {
   }
   return { ctx, state, storage, store: createStore(storage, "s"), controller: createController(ctx) }
 }
+
+function wideHarness(options = {}) {
+  const h = harness(options)
+  h.state.models[0].limit = { context: 1_050_000, input: 922_000, output: 128_000 }
+  return h
+}
+const timed = (row, created) => ({ ...row, time: { created } })
+const readStep = (id, chars, created, text = "") => timed({ id, type: "assistant", content: [
+  ...(text ? [{ type: "text", text }] : []),
+  { type: "tool", id: `${id}-call`, name: "read", state: { status: "completed", input: { path: id }, content: [{ type: "text", text: "r".repeat(chars) }] } },
+] }, created)
+// Visible conclusions plus a small acknowledged action: nothing large is unseen.
+const conclusionStep = (id, created) => timed({ id, type: "assistant", content: [{ type: "text", text: "c".repeat(400) },
+  { type: "tool", id: `${id}-call`, name: "edit", state: { status: "completed", input: { path: "file" }, content: [{ type: "text", text: "ok" }] } },
+] }, created)
 
 // Successful turns only record growth. A subsequent prompt consumes that boundary.
 async function idle(h) {
@@ -122,6 +150,18 @@ async function compactRows(h, rows) {
 }
 
 const toolContext = { sessionID: "s", agent: "build", messageID: "assistant", id: "checkpoint-1" }
+const edit = (working = {}) => ({ archive: "Title: Main-authored checkpoint\nCurrent work and exact next action.", working })
+const publication = (input, context = toolContext) => ({ id: context.messageID, type: "assistant", content: [
+  { type: "tool", id: context.id, name: "checkpoint_now", state: { status: "running", input } },
+] })
+async function publishCheckpoint(h, input, observe = true, context = toolContext) {
+  if (observe) await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  const row = publication(input, context)
+  h.state.rows.push(row)
+  const output = await h.controller.checkpointNow(input, context)
+  row.content[0].state = { status: "completed", input, content: [{ type: "text", text: output }] }
+  return { row, output }
+}
 // Build N of the budget gate: a fresh crossing arms instead of compacting, with its notice.
 // Tests that run through setup() pass the registered hook as run to reach its own controller.
 const armGate = async (h, run = (request) => h.controller.onContext(request)) => {
@@ -133,7 +173,7 @@ const armGate = async (h, run = (request) => h.controller.onContext(request)) =>
   assert.equal(request.system.length, 0, "the notice rides the conversation tail, not the system block")
   const notice = request.messages.at(-1)
   assert.equal(notice?.role, "user", "the notice is a trailing user-role message")
-  assert.match(notice?.content?.[0]?.text ?? "", /Compaction budget gate/, "attributed as an automated notice")
+  assert.match(notice?.content?.[0]?.text ?? "", /(?:Compaction budget gate|Overdue checkpoint safeguard) — automated notice/, "attributed as an automated notice")
   assert.match(notice?.content?.[0]?.text ?? "", /Decide in THIS reply when the compaction cut lands/, "the options share one axis: when the cut lands")
 }
 
@@ -155,7 +195,7 @@ test("compaction archives every original before generation and recall retrieves 
   assert.ok(h.state.prompts[0].startsWith(WORKING_PROMPT))
   assert.match(compact.result.summary, /^## Current working state/)
   assert.match(compact.result.summary, /Archive through E1/)
-  assert.deepEqual(compact.result.metadata, { nextdcp: { version: 2 } })
+  assert.deepEqual(compact.result.metadata, { keepID: null, nextdcp: { version: 2, author: "compactor" } }, "no verbatim host tail duplicates the working state")
   assert.equal(compact.result.native, undefined)
   assert.deepEqual((await h.store.getCheckpoint("c1")).episode.rowIDs, ["u1", "a1"])
 
@@ -165,7 +205,46 @@ test("compaction archives every original before generation and recall retrieves 
   assert.match(await h.controller.recall("s", { query: "archiveneedle" }), /recall E1 page 1/)
   assert.match(await h.controller.recall("s", { query: "currentcontextneedle" }), /No matching/)
   assert.match(await h.controller.recall("s", { id: "E1", query: "x" }), /either id or query/)
-  assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive integer/)
+  assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive safe integer/)
+})
+
+test("episode-scoped queries include only that episode's dialogue, notes, call and row originals", async () => {
+  const h = harness()
+  const rows = (suffix) => [
+    { ...user(`u-${suffix}`, `episcope dialogue ${suffix} ${suffix.toUpperCase()}_SCOPE_ONLY`), skills: [{ name: "scope", text: `episcope injected ${suffix}` }] },
+    { id: `a-${suffix}`, type: "assistant", content: [{ type: "tool", id: `call-${suffix}`, name: "read", state: {
+      status: "completed", input: { path: `${suffix}.ts` }, content: [{ type: "text", text: `episcope tool original ${suffix}` }],
+    } }] },
+    { id: `shell-${suffix}`, type: "shell", command: "test", output: { output: `episcope shell original ${suffix}` } },
+  ]
+  h.state.handoff.archive = "Title: First scoped task\nepiscope first archive note"
+  const first = await compactRows(h, [...rows("first"), running("c1")])
+  h.state.handoff.archive = "Title: Second scoped task\nepiscope second archive note"
+  const second = await compactRows(h, [completed("c1", first), ...rows("second"), running("c2")])
+  h.state.rows = [completed("c2", second)]
+  await h.store.saveCall({ id: "outside-only", name: "read", input: {}, result: { type: "text", value: "episcope orphan original" } })
+  await createProjectStore(h.storage, "test").graduate(await h.store.episodeNotes(), "other-session")
+  h.storage.reads.length = 0
+
+  const conversation = await h.controller.recall("s", { query: "episcope", episode: "E1" })
+  assert.match(conversation, /Historical evidence in E1, page 1 of 1 \(1 hit\)/)
+  assert.match(conversation, /- recall E1 page 1:/)
+  const tools = await h.controller.recall("s", { query: "episcope", episode: "E1", layer: "tools" })
+  for (const id of ["call-first", "u-first", "shell-first"]) assert.ok(tools.includes(`recall ${id} page 1`))
+  assert.doesNotMatch(tools, /call-second|shell-second|outside-only|recall P\d/)
+  const full = (await Promise.all([1, 2].map((page) => h.controller.recall("s", { query: "episcope", episode: "E1", layer: "full", page })))).join("\n")
+  assert.match(full, /recall catalog E1 page 1 \(archive note/)
+  assert.doesNotMatch(full, /call-second|shell-second|outside-only|recall P\d|recall E2/)
+  assert.ok(!h.storage.reads.some((key) => key.startsWith("projects/test/episodes")), "an episode-scoped query never loads project-wide graduated notes")
+  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY", episode: "E2" }), /recall E2 page 1/)
+  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY", episode: "E1" }), /No matching snippets/, "a scoped miss never widens silently")
+  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY" }), /recall E2 page 1/, "scoping never mutates the shared corpus")
+
+  assert.match(await h.controller.recall("s", { id: "E1", episode: "E1" }), /episode applies only to a query/)
+  for (const episode of ["", "E", "E0", "E-1", "E1 layer tools", 1]) assert.match(await h.controller.recall("s", { query: "episcope", episode }), /exact episode label/)
+  assert.match(await h.controller.recall("s", { query: "episcope", episode: "E999" }), /No episode "E999" in the active archive/)
+  h.state.rows = [completed("c1", first)]
+  assert.match(await h.controller.recall("s", { query: "episcope", episode: "E2", layer: "full" }), /No episode "E2" in the active archive/, "a reverted episode cannot masquerade as an active scope")
 })
 
 test("catalog listings are compact and paged on demand; an entry note fetches whole like any original", async () => {
@@ -239,9 +318,10 @@ test("archive-note hits show the note itself, not a fetch call that cannot repro
   const first = await compactRows(h, [user("u1", "some context"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   const found = await h.controller.recall("s", { query: "notekeyword", layer: "full" })
-  assert.match(found, /- recall E1 \(archive note, not original evidence\):/)
+  assert.match(found, /- recall catalog E1 page 1 \(archive note, not original evidence\):/)
   assert.doesNotMatch(found, /- recall \{/, "no call that would fetch different content")
   assert.match(found, /page 1 of 1 \(1 hit\)/)
+  assert.match(await h.controller.recall("s", { id: "catalog E1 page 1" }), /notekeyword recorded in the cold archive note/, "the rendered target fetches the note, not a different transcript")
 })
 
 test("injected content homes in row originals and stays out of conversation search", async () => {
@@ -273,6 +353,52 @@ test("a corrupt archived row and an out-of-range page return plain content, neve
   assert.match(await h.controller.recall("s", { query: "wording" }), /No matching snippets/, "search skips the unreadable row without failing")
 })
 
+test("exact call and row fetches read only their originals and referenced calls, not the archive or project notes", async () => {
+  const h = harness()
+  await h.store.saveCall({ id: "call-good", name: "read", input: {}, result: { type: "text", value: "exact_call_needle" } })
+  await h.storage.set("sessions/s/rows/msg-good", JSON.stringify({ id: "msg-good", type: "assistant", content: [{ type: "tool", id: "call-good", name: "read", state: {
+    status: "completed", input: {}, content: [{ type: "text", text: "not the authoritative first original" }],
+  } }] }))
+  await h.storage.set("sessions/s/calls/unrelated-corrupt", "not json")
+  h.ctx.session.get = async () => { throw new Error("ownership is unavailable") }
+  h.ctx.session.context = async () => { throw new Error("context is unavailable") }
+  h.storage.scan = async () => { throw new Error("an exact original must not scan") }
+  h.storage.reads.length = 0
+  assert.match(await h.controller.recall("s", { id: "call-good" }), /exact_call_needle/)
+  assert.match(await h.controller.recall("s", { id: "msg-good" }), /exact_call_needle/)
+  assert.ok(h.storage.reads.every((key) => ["deleted/s", "sessions/s/calls/call-good", "sessions/s/calls/msg-good", "sessions/s/rows/msg-good"].includes(key)), "only the requested originals and the deletion fence are read")
+})
+
+test("an exact graduated-note fetch reads its own project record without scanning unrelated originals", async () => {
+  const h = harness()
+  await createProjectStore(h.storage, "test").graduate([{ note: "direct_graduated_note_needle", end: 1_000 }], "origin")
+  await h.storage.set("projects/test/episodes/P2", "not json")
+  h.storage.scan = async () => { throw new Error("an exact project original must not scan") }
+  assert.match(await h.controller.recall("s", { id: "P1" }), /direct_graduated_note_needle/)
+})
+
+test("corrupt calls do not poison exact, prefix, episode, query or graduated-note recall", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "intact_conversation_needle"), { id: "a1", type: "assistant", content: [
+    { type: "tool", id: "call-good", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "intact_tool_needle" }] } },
+  ] }, running("c1")])
+  h.state.rows = [completed("c1", first)]
+  await createProjectStore(h.storage, "test").graduate([{ note: "intact_project_needle", end: Date.now() }], "origin")
+  for (const bad of ["not json", JSON.stringify({ id: "call-bad", name: "read" })]) {
+    await h.storage.set("sessions/s/calls/call-bad", bad)
+    const reloaded = createController(h.ctx)
+    assert.match(await reloaded.recall("s", { id: "call-good" }), /intact_tool_needle/)
+    assert.match(await reloaded.recall("s", { id: "call-go" }), /intact_tool_needle/)
+    assert.match(await reloaded.recall("s", { id: "call-" }), /Ambiguous target/, "corrupt matching IDs still participate in ambiguity checks")
+    assert.match(await reloaded.recall("s", { id: "call-bad" }), /Recall unavailable: Invalid/)
+    assert.match(await reloaded.recall("s", { id: "E1" }), /intact_conversation_needle/)
+    assert.match(await reloaded.recall("s", { id: "E1", layer: "tools" }), /intact_tool_needle/)
+    assert.match(await reloaded.recall("s", { query: "intact_tool_needle", layer: "tools" }), /recall call-good page 1/)
+    assert.match(await reloaded.recall("s", { id: "P1" }), /intact_project_needle/)
+  }
+})
+
 test("the search corpus is cached per checkpoint: warm queries rescan nothing, a new cut rebuilds it fresh", async () => {
   const h = harness()
   let scans = 0
@@ -295,20 +421,33 @@ test("deleted sessions graduate their episode notes into the project archive; a 
   const h = harness()
   await compactRows(h, [user("u1", "needle wording"), running("c1")])
   await h.controller.onDeleted("s")
-  const graduatedKeys = [...h.storage.values.keys()].filter((key) => key.startsWith("project/episodes/"))
-  assert.deepEqual(graduatedKeys, ["project/episodes/P1"], "the episode note graduated exactly once")
+  const graduatedKeys = [...h.storage.values.keys()].filter((key) => key.startsWith("projects/test/episodes/"))
+  assert.deepEqual(graduatedKeys, ["projects/test/episodes/P1"], "the episode note graduated exactly once")
   assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")), "the session archive is still cleared")
-  assert.deepEqual(JSON.parse(h.storage.values.get("project/episodes/P1")), { id: "P1", note: "Continue work\nWork: preserve the exact request.", session: "s", end: JSON.parse(h.storage.values.get("project/episodes/P1")).end })
+  assert.deepEqual(JSON.parse(h.storage.values.get("projects/test/episodes/P1")), { id: "P1", note: "Continue work\nWork: preserve the exact request.", session: "s", end: JSON.parse(h.storage.values.get("projects/test/episodes/P1")).end })
 
   const fresh = harness({}, h.storage)
-  assert.match(await fresh.controller.recall("s", { query: "preserve the exact request", layer: "full" }),
+  assert.match(await fresh.controller.recall("fresh", { query: "preserve the exact request", layer: "full" }),
     /- recall P1 page 1 \(graduated session note, s, 0s ago\): /, "the full layer surfaces the graduated note as a fetchable hit")
-  assert.match(await fresh.controller.recall("s", { query: "preserve the exact request" }),
-    /No matching snippets/, "layer-scoped queries never see graduated notes: they have no home")
-  const fetched = await fresh.controller.recall("s", { id: "P1" })
-  assert.match(fetched, /Graduated session note P1 \(from session s, 0s ago\)/, "an opaque fetch returns the note with its provenance header")
+  assert.match(await fresh.controller.recall("fresh", { query: "preserve the exact request" }),
+    /Nothing is archived to search yet/, "layer-scoped queries never load graduated notes: they have no home")
+  const fetched = await fresh.controller.recall("fresh", { id: "P1" })
+  assert.match(fetched, /Graduated session note P1 \(from session s\)/, "an opaque fetch returns the note with its stable provenance header")
   assert.match(fetched, /preserve the exact request/, "the whole note text is the original")
-  assert.match(await fresh.controller.recall("s", { id: "catalog" }), /Nothing is archived yet/, "the catalog still lists episodes only, never P entries")
+  assert.match(await fresh.controller.recall("fresh", { id: "catalog" }), /Nothing is archived yet/, "the catalog still lists episodes only, never P entries")
+})
+
+test("graduated-note search addresses fetch the same page across a changing relative age", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000 })
+  const h = harness()
+  await createProjectStore(h.storage, "test").graduate([{ note: `${"filler ".repeat(854)} boundary_note_needle ${"tail ".repeat(1_500)}`, end: 1_000 }], "origin")
+  const hits = await h.controller.recall("s", { query: "boundary_note_needle", layer: "full" })
+  const target = /- recall (P1 page \d+)/.exec(hits)?.[1]
+  assert.ok(target)
+  const before = await h.controller.recall("s", { id: target })
+  assert.match(before, /boundary_note_needle/, "the search result lands on the page containing the match")
+  t.mock.timers.tick(86_400_000)
+  assert.equal(await h.controller.recall("s", { id: target }), before, "fetched page bytes are independent of relative age")
 })
 
 test("graduation ranks a recent note above an equally matching stale one", async () => {
@@ -322,7 +461,7 @@ test("graduation ranks a recent note above an equally matching stale one", async
   await compactRows(h, [completed("c1", first), { id: "u2", type: "user", text: "task", time: { created: recent } }, running("c2")])
   await h.controller.onDeleted("s")
   const fresh = harness({}, h.storage)
-  const hits = await fresh.controller.recall("s", { query: "gauge needle", layer: "full" })
+  const hits = await fresh.controller.recall("fresh", { query: "gauge needle", layer: "full" })
   assert.match(hits, /- recall P2 page 1 \(graduated session note, s, 0s ago\)/, "the recent note outranks the equal term match")
   assert.match(hits, /- recall P1 page 1 \(graduated session note, s, /, "the stale note still matches, just below")
   assert.ok(hits.indexOf("recall P2") < hits.indexOf("recall P1"), "recency ordering is strict")
@@ -335,18 +474,18 @@ test("subagent sessions never graduate their notes into the project archive", as
   // The session is gone at deletion time: only the stashed flag can identify the subagent.
   sub.ctx.session.get = async () => { throw new Error("session deleted") }
   await sub.controller.onDeleted("s")
-  assert.ok(![...sub.storage.values.keys()].some((key) => key.startsWith("project/episodes/")), "a subagent's episodes never graduate")
+  assert.ok(![...sub.storage.values.keys()].some((key) => key.startsWith("projects/test/episodes/")), "a subagent's episodes never graduate")
   const parent = harness()
   await compactRows(parent, [user("u1", "needle wording"), running("c1")])
   parent.ctx.session.get = async () => { throw new Error("session deleted") }
   await parent.controller.onDeleted("s")
-  assert.ok(parent.storage.values.has("project/episodes/P1"), "a main session with no stash still graduates via the fallback read")
+  assert.ok(parent.storage.values.has("projects/test/episodes/P1"), "persisted ownership survives the session disappearing")
 })
 
 test("graduation storage failures never block the deletion", async (t) => {
   const warnings = t.mock.method(console, "warn", () => {})
   const h = harness()
-  h.storage.fail = (key) => key.startsWith("project/episodes/")
+  h.storage.fail = (key) => key.startsWith("projects/test/episodes/")
   await compactRows(h, [user("u1", "needle wording"), running("c1")])
   await h.controller.onDeleted("s")
   assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")), "the session archive is cleared regardless")
@@ -362,7 +501,7 @@ test("forks retain episode IDs and originals, branch independently, and survive 
   h.ctx.session.context = async ({ sessionID }) => sessions.get(sessionID)
   h.ctx.session.get = async ({ sessionID }) => {
     if (!infos.has(sessionID)) throw new Error("parent deleted")
-    return infos.get(sessionID)
+    return owned(infos.get(sessionID))
   }
   await h.controller.onFork("child")
   assert.equal((await createStore(h.storage, "child").getCheckpoint("copied-c1")).episode.id, "E1")
@@ -390,8 +529,8 @@ test("ordinary subagents do not inherit archives and cyclic fork ancestry fails 
   const h = harness()
   const first = await compactRows(h, [user("u", "parent-only original"), running("cp")])
   h.state.rows = [completed("cp", first)]
-  h.ctx.session.get = async ({ sessionID }) => sessionID === "subagent" ? { parentID: "s" }
-    : { fork: { sessionID: sessionID === "cycle-a" ? "cycle-b" : "cycle-a", boundary: { type: "through", messageID: "cp" } } }
+  h.ctx.session.get = async ({ sessionID }) => owned(sessionID === "subagent" ? { parentID: "s" }
+    : { fork: { sessionID: sessionID === "cycle-a" ? "cycle-b" : "cycle-a", boundary: { type: "through", messageID: "cp" } } })
   assert.match(await h.controller.recall("subagent", { id: "E1" }), /Recall gap/)
   const reloaded = createController(h.ctx)
   assert.match(await reloaded.recall("cycle-a", { id: "E1" }), /Cyclic fork ancestry/)
@@ -402,7 +541,7 @@ test("first use of an existing fork imports its inherited checkpoint without rep
   const first = await compactRows(h, [user("u", "inherited original"), running("parent-cp")])
   const parent = completed("parent-cp", first)
   const child = [{ ...parent, id: "copied-cp" }, user("child-u", "newer child work"), native("child-native", "child's own summary")]
-  h.ctx.session.get = async ({ sessionID }) => sessionID === "s" ? {} : { fork: { sessionID: "s", boundary: { type: "through", messageID: "parent-cp" } } }
+  h.ctx.session.get = async ({ sessionID }) => owned(sessionID === "s" ? {} : { fork: { sessionID: "s", boundary: { type: "through", messageID: "parent-cp" } } })
   h.ctx.session.context = async ({ sessionID }) => sessionID === "s" ? [parent] : child
   assert.match(await h.controller.recall("existing-child", { id: "E1" }), /inherited original/)
   const store = createStore(h.storage, "existing-child")
@@ -423,9 +562,9 @@ test("historical forks recover their boundary from the archive after the parent 
   const second = await compactRows(h, [c1, user("u2", "parent future must not leak"), running("c2")])
   const sessions = new Map([["s", [completed("c2", second)]], ["child", [{ ...c1, id: "copied-c1" }]]])
   h.ctx.session.context = async ({ sessionID }) => sessions.get(sessionID)
-  h.ctx.session.get = async ({ sessionID }) => sessionID === "s" ? {} : {
+  h.ctx.session.get = async ({ sessionID }) => owned(sessionID === "s" ? {} : {
     fork: { sessionID: "s", boundary: { type: "before", messageID: "u2" } },
-  }
+  })
   await h.controller.onFork("child")
   assert.match(await h.controller.recall("child", { id: "E1" }), /inherited original/)
   assert.match(await h.controller.recall("child", { id: "old-call" }), /original tool output/)
@@ -461,7 +600,7 @@ test("forking a checkpoint hidden by a revert does not require a later compactio
   h.state.rows = [user("new-branch", "unrelated branch after revert")]
   const childRows = [completed("copied-c1", first)]
   h.ctx.session.context = async ({ sessionID }) => sessionID === "child" ? childRows : h.state.rows
-  h.ctx.session.get = async ({ sessionID }) => sessionID === "child" ? { fork: { sessionID: "s", boundary: { type: "through", messageID: "c1" } } } : {}
+  h.ctx.session.get = async ({ sessionID }) => owned(sessionID === "child" ? { fork: { sessionID: "s", boundary: { type: "through", messageID: "c1" } } } : {})
   await h.controller.onFork("child")
   assert.match(await h.controller.recall("child", { id: "E1" }), /REVERTED_CHECKPOINT_ORIGINAL/)
   assert.match(await h.controller.recall("child", { id: "reverted-call" }), /REVERTED_CALL_ORIGINAL/)
@@ -610,7 +749,46 @@ test("a separate compaction model's drifted handoff falls back to the main model
   assert.equal(h.state.stateless.length, 1)
   assert.equal(h.state.prompts.length, 1)
   assert.match(h.state.prompts[0], /previous attempt failed: Archive note must stay in the language/)
-  assert.ok(h.state.warnings.some((item) => String(item.data?.message ?? "").includes("Cannot produce a bounded handoff")))
+  assert.ok(h.state.warnings.some((item) => String(item.data?.message ?? "").includes("Cannot produce a handoff")))
+})
+
+test("a CJK task continues through generated and main-authored checkpoints with no new user row", async () => {
+  const h = harness()
+  h.state.handoff = { archive: "Title: 修复历史记录\n调查并修复了对话层污染问题。", working: {
+    objective: "调查并修复对话层污染问题", constraints: [], state: ["已验证问题"], next: ["继续测试"], references: [],
+  }, retiredConstraints: [] }
+  const first = await compactRows(h, [user("u1", "请调查并修复对话层污染问题。"), running("c1")])
+  h.state.handoff = { archive: "Title: 验证修复\n继续验证修复结果。", working: {}, retiredConstraints: [] }
+  const second = await compactRows(h, [completed("c1", first), assistant("a2", "继续验证修复结果。"), running("c2")])
+  assert.match(second.summary, /调查并修复对话层污染问题/)
+  assert.equal(h.state.prompts.length, 2, "the inherited-language patch succeeds on its first attempt")
+  h.state.rows = [completed("c2", second), assistant("a3", "测试已通过。")]
+  const input = { archive: "Title: 测试通过\n所有测试已通过。", working: { next: ["提交修复"] } }
+  assert.match((await publishCheckpoint(h, input)).output, /^Requested:/)
+  h.state.rows.push(running("c3"))
+  const cut = event()
+  await h.controller.onCompaction(cut)
+  assert.equal(cut.result?.metadata.nextdcp.author, "main")
+  assert.match(cut.result.summary, /提交修复/)
+  assert.equal(h.state.prompts.length, 2, "revalidation of a main-authored continuation needs no generation")
+})
+
+test("native CJK summaries support generated and main-authored full checkpoints without a new user row", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  for (const author of ["compactor", "main"]) {
+    const h = harness()
+    h.state.handoff = { archive: "Title: 验证修复\n继续验证修复结果。", working: {
+      objective: "调查并修复对话层污染问题", constraints: [], state: ["已验证问题"], next: ["继续测试"], references: [],
+    }, retiredConstraints: [] }
+    h.state.rows = [native("prior", "调查并修复对话层污染问题。"), assistant("a1", "继续验证修复结果。")]
+    if (author === "main") assert.match((await publishCheckpoint(h, { archive: h.state.handoff.archive, working: h.state.handoff.working })).output, /^Requested:/)
+    h.state.rows.push(running("c1"))
+    const cut = event()
+    await h.controller.onCompaction(cut)
+    assert.equal(cut.result?.metadata.nextdcp.author, author)
+    assert.match(cut.result.summary, /调查并修复对话层污染问题/)
+    assert.equal(h.state.prompts.length, author === "main" ? 0 : 1, "native-language continuation never retries or falls back")
+  }
 })
 
 test("an over-budget handoff commits the shortest valid artifact with a warning instead of native fallback", async () => {
@@ -748,6 +926,7 @@ test("model selection is snapshotted for the entire compaction", async () => {
 
 test("standing-constraint retirement uses new user evidence and persists across reloads", async () => {
   const h = harness()
+  h.state.handoff.working.constraints = ["Preserve the exact request."]
   const first = await compactRows(h, [user("u1", "Preserve the exact request."), running("c1")])
   const constraint = h.state.handoff.working.constraints[0]
   h.state.handoff.working.constraints = []
@@ -796,6 +975,8 @@ test("a missing experimental generate surface degrades to the main model with a 
   addCheap(h)
   await saveModel(h, { mode: "specific", model: cheap })
   h.ctx.experimental = undefined
+  h.controller = createController(h.ctx)
+  await h.controller.registerModels()
   const result = await compactRows(h, [user("u1", "END_MARKER never truncate"), running("c1")])
   assert.match(result.summary, /Archive through E1/)
   assert.equal(h.state.stateless.length, 0, "no stateless call was attempted")
@@ -861,12 +1042,13 @@ test("selected variants are honored and catalog failures do not leak provider er
 
 test("100 checkpoints replace working state without a growing diary, directory, or merge request", async () => {
   const h = harness({ memory: { budget: 512 } })
+  h.state.handoff.working.constraints = ["Preserve the exact request."]
   let previous, firstSize
   for (let i = 1; i <= 100; i++) {
     h.state.handoff.archive = `Title: Completed topic ${i}\narchivekeyword${i}.`
     h.state.handoff.working.state = [`currentfact${i}`]
     if (i > 1) h.state.handoff.working.constraints = [] // A careless omission must not erase the old constraint.
-    const result = await compactRows(h, [...(previous ? [previous] : []), user(`u${i}`, `originaltopic${i}`), running(`c${i}`)])
+    const result = await compactRows(h, [...(previous ? [previous] : []), user(`u${i}`, `originaltopic${i}${i === 1 ? ". Preserve the exact request." : ""}`), running(`c${i}`)])
     assert.match(result.summary, /Preserve the exact request/)
     assert.match(result.summary, new RegExp(`currentfact${i}\\b`))
     assert.doesNotMatch(result.summary, /archivekeyword|originaltopic/, "note bodies and originals stay out of the working state")
@@ -908,17 +1090,18 @@ test("unrepairable state or constraint overflow commits the shortest valid artif
   for (const field of ["state", "constraints"]) {
     const h = harness({ memory: { budget: 256 } })
     await h.controller.registerModels()
-    const first = await compactRows(h, [user("u1", "first"), running("c1")])
+    h.state.handoff.working.constraints = ["Preserve the exact request."]
+    const first = await compactRows(h, [user("u1", "first. Preserve the exact request."), running("c1")])
     const material = "essential long material ".repeat(1_000)
     h.state.handoff.working[field] = [material]
-    h.state.rows = [completed("c1", first), user("u2", "original never discarded"), running("c2")]
+    h.state.rows = [completed("c1", first), user("u2", `original never discarded${field === "constraints" ? `\n${material}` : ""}`), running("c2")]
     const second = event()
     await h.controller.onCompaction(second)
     assert.ok(second.result?.summary.includes(material), "the whole state/constraint commits, never sliced to fit")
     assert.ok((await h.store.getCheckpoint("c2")).working[field].includes(material), "the durable record keeps it whole")
     assert.match(await h.store.getRow("u2"), /original never discarded/)
-    // First cut + patch attempt (over-budget merge, falls back) + full generation + repair.
-    assert.equal(h.state.prompts.length, 4)
+    // First cut, then the shared budget allows only patch + full regeneration.
+    assert.equal(h.state.prompts.length, 3)
     assert.match(h.state.warnings.at(-1).data.message, /accepted the shortest valid handoff/)
     assert.equal((await h.store.getCheckpoint("c1")).working.constraints[0], "Preserve the exact request.")
   }
@@ -935,12 +1118,12 @@ test("a structured prior invites a minimal patch; omitted fields carry forward a
   assert.match(h.state.prompts.at(-1), /Patch mode/, "the second cut asks for a patch")
   assert.equal(h.state.prompts.length, 2, "a valid patch commits in one generation")
   const record = await h.store.getCheckpoint("c2")
-  assert.deepEqual(record.working, { objective: "Continue current work", constraints: ["Preserve the exact request."], state: [], next: ["Run the release."], references: [] })
+  assert.deepEqual(record.working, { objective: "Continue current work", constraints: [], state: [], next: ["Run the release."], references: [] })
   assert.match(second.result.summary, /Run the release\./)
   assert.doesNotMatch(second.result.summary, /Patch mode/)
 })
 
-test("an invalid patch falls back to one fresh full regeneration, not a repair", async () => {
+test("an invalid patch gets one full regeneration carrying its failure", async () => {
   const h = harness()
   const first = await compactRows(h, [user("u1", "first"), running("c1")])
   h.state.queue = [{ archive: "Title: Bad patch\nNo.", working: { objective: "" }, retiredConstraints: [] }]
@@ -948,7 +1131,8 @@ test("an invalid patch falls back to one fresh full regeneration, not a repair",
   const second = event()
   await h.controller.onCompaction(second)
   assert.equal(h.state.prompts.length, 3, "first cut, failed patch, full regeneration")
-  assert.ok(!h.state.prompts.at(-1).includes("Patch mode") && !h.state.prompts.at(-1).includes("The previous attempt"), "the fallback is a fresh full prompt")
+  assert.ok(!h.state.prompts.at(-1).includes("Patch mode"), "the fallback asks for a full replacement")
+  assert.match(h.state.prompts.at(-1), /The previous attempt failed:/, "the failure is not hidden from the retry")
   assert.equal((await h.store.getCheckpoint("c2")).working.objective, "Continue current work")
 })
 
@@ -967,11 +1151,11 @@ test("an over-budget patch merge falls back to full regeneration, which prunes i
 // The fire-and-forget thermostat write lands after onCompaction returns; wait for it.
 const awaitThermostat = async (h, cycles) => {
   for (let tick = 0; tick < 50; tick++) {
-    const raw = h.storage.values.get("project/thermostat")
+    const raw = h.storage.values.get("projects/test/thermostat")
     if (raw && Object.values(JSON.parse(raw)).some((entry) => entry.cycles >= cycles)) return JSON.parse(raw)
     await setImmediate()
   }
-  return h.storage.values.has("project/thermostat") ? JSON.parse(h.storage.values.get("project/thermostat")) : undefined
+  return h.storage.values.has("projects/test/thermostat") ? JSON.parse(h.storage.values.get("projects/test/thermostat")) : undefined
 }
 
 test("the thermostat adapts the auto budget per model from committed-cut turn rates", async (t) => {
@@ -986,14 +1170,14 @@ test("the thermostat adapts the auto budget per model from committed-cut turn ra
       ? [user(`u${cut}`, "x".repeat(804)), assistant(`a${cut}`), running(`c${cut}`)]
       : [completed(`c${cut - 1}`, previous), user(`u${cut}`, "x".repeat(804)), assistant(`a${cut}`), running(`c${cut}`)])
   }
-  assert.deepEqual(await awaitThermostat(h, 5), { "provider/model": { growth: 201, span: 1, cycles: 5, budget: 30_000 } },
+  assert.deepEqual(await awaitThermostat(h, 5), { "provider/model": { version: THERMOSTAT_VERSION, growth: 201, span: 1, cycles: 5, budget: 37_500 } },
     "five lean cycles: each cut steps the budget down to its floor")
-  h.state.rows = [completed("c5", previous), user("big", "y".repeat(260_000))]
+  h.state.rows = [completed("c5", previous), user("big", "go"), ...Array.from({ length: 200 }, (_, at) => assistant(`step-${at}`, "y".repeat(800)))]
   const request = { ...event(), messages: projectHistory(h.state.rows).messages }
   await h.controller.onContext(request)
   await setImmediate()
   assert.equal(h.state.compact, 0, "the crossing arms the gate instead of compacting")
-  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /budget 30000/, "the notice prints the adapted budget")
+  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /safeguard 37500/, "the notice prints the adapted safeguard")
 })
 
 test("an explicit options.budget wins absolutely over the learned budget", async (t) => {
@@ -1004,7 +1188,7 @@ test("an explicit options.budget wins absolutely over the learned budget", async
   const first = await compactRows(h, [user("u1", "task"), assistant("a1"), running("c1")])
   await h.controller.recall("s", { id: "catalog" })
   await compactRows(h, [completed("c1", first), user("u2", "task"), assistant("a2"), running("c2")])
-  assert.deepEqual(await awaitThermostat(h, 2), { "provider/model": { growth: 1, span: 1, cycles: 2, budget: 32_000 } },
+  assert.deepEqual(await awaitThermostat(h, 2), { "provider/model": { version: THERMOSTAT_VERSION, growth: 1, span: 1, cycles: 2, budget: 37_500 } },
     "evidence still accumulates, even while the explicit budget triggers")
   h.state.rows = [user("u", "x".repeat(800))]
   const request = { ...event(), messages: projectHistory(h.state.rows).messages }
@@ -1024,7 +1208,8 @@ test("each committed cut folds its own turn rate, and subagent sessions never fe
   await h.controller.recall("s", { id: "catalog" })
   const second = await compactRows(h, [completed("c1", first), user("u2", "task"), assistant("a2", "d".repeat(3_200)), running("c2")])
   await compactRows(h, [completed("c2", second), user("u3", "task"), assistant("a3", "d".repeat(2_000)), running("c3")])
-  assert.deepEqual(await awaitThermostat(h, 3), { "provider/model": { growth: 551, span: 1, cycles: 3, budget: 30_000 } },
+  const rates = (await awaitThermostat(h, 3))["provider/model"]
+  assert.deepEqual(rates, { version: THERMOSTAT_VERSION, growth: 551, span: 1, cycles: 3, budget: 37_500 },
     "each cycle folds its own rate: recalls between cuts never enter the law")
   const sub = harness()
   sub.state.info = { model, time: { busy: 1 }, parentID: "parent-session" }
@@ -1033,7 +1218,7 @@ test("each committed cut folds its own turn rate, and subagent sessions never fe
   await sub.controller.recall("s", { id: "E1" })
   await compactRows(sub, [user("u1", "task"), assistant("a1"), running("c1")])
   await setImmediate()
-  assert.equal(sub.storage.values.get("project/thermostat"), undefined, "a subagent's cycles are never folded")
+  assert.equal(sub.storage.values.get("projects/test/thermostat"), undefined, "a subagent's cycles are never folded")
 })
 
 test("an unknown window disables the thermostat alongside the auto budget", async (t) => {
@@ -1046,13 +1231,13 @@ test("an unknown window disables the thermostat alongside the auto budget", asyn
   const result = await compactRows(h, [user("u1", "task"), running("c1")])
   assert.ok(result, "the cut itself is unaffected")
   await setImmediate()
-  assert.equal(h.storage.values.get("project/thermostat"), undefined, "nothing is learned without physics to clamp against")
+  assert.equal(h.storage.values.get("projects/test/thermostat"), undefined, "nothing is learned without physics to clamp against")
 })
 
 test("thermostat storage failures never block a cut or the default budget", async (t) => {
   const warnings = t.mock.method(console, "warn", () => {})
   const h = harness()
-  h.storage.fail = (key) => key === "project/thermostat"
+  h.storage.fail = (key) => key === "projects/test/thermostat"
   h.state.rows = [user("u0", "small warmup")]
   await h.controller.onContext(event())
   await h.controller.recall("s", { id: "E1" })
@@ -1061,16 +1246,16 @@ test("thermostat storage failures never block a cut or the default budget", asyn
   assert.ok((await h.store.getCheckpoint("c1")).working, "the checkpoint persists")
   await setImmediate()
   assert.ok(warnings.mock.calls.some((call) => String(call.arguments[0]).includes("thermostat cycle for provider/model")), "the failure is reported")
-  h.state.rows = [user("u", "x".repeat(260_000))]
+  h.state.rows = [assistant("a", "x".repeat(260_000))]
   const request = { ...event(), messages: projectHistory(h.state.rows).messages }
   await h.controller.onContext(request)
   await setImmediate()
-  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /budget 50000/, "the gate falls back to the static default")
+  assert.match(request.messages.at(-1)?.content?.[0]?.text ?? "", /safeguard 50000/, "the gate falls back to the small window's default")
 })
 
 test("a rate spike holds the round's cut automatically while physics still fits", async (t) => {
   t.mock.method(console, "warn", () => {})
-  const h = harness()
+  const h = harness({ budget: 40_000 })
   h.state.rows = [user("u0", "small warmup")]
   await h.controller.onContext(event())
   const seed = await compactRows(h, [user("u1", "x".repeat(804)), assistant("a1"), running("c1")])
@@ -1082,7 +1267,7 @@ test("a rate spike holds the round's cut automatically while physics still fits"
   await setImmediate()
   assert.equal(h.state.compact, 0, "the spike hold replaces the gate for this build")
   assert.equal(request.messages.length, projectHistory(h.state.rows).messages.length, "no gate notice is appended")
-  assert.deepEqual(await h.store.getGateStats(), { gates: 0, silent: 0, continued: 0, repaid: 0, spikeHeld: 1, checkpoints: 0, precomputes: 0, precomputeHits: 0, gateAliases: 0 })
+  assert.deepEqual(await h.store.getGateStats(), { gates: 0, silent: 0, continued: 0, repaid: 0, spikeHeld: 1, checkpoints: 0, capacity: 0 })
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 0, "every later build of the held round is held too")
@@ -1180,7 +1365,7 @@ test("soft compaction waits for another prompt and its marker survives a control
   h.state.rows = [user("u1", "completed work with enough growth")]
   await idle(h)
   assert.equal(h.state.compact, 0)
-  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "u1", tokens: 8 })
+  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "u1", tokens: 8, threshold: 1 })
   await setImmediate()
   assert.equal(h.state.compact, 0, "leaving the conversation alone costs no summary call")
   h.controller = createController(h.ctx)
@@ -1201,7 +1386,7 @@ test("the queued message that resumes a marked session biases the working state"
   assert.equal(h.state.prompts.length, 1)
   const data = generationData(h.state.prompts[0])
   assert.equal(data.queued, "Now port the same fix to the TUI bundle.")
-  assert.deepEqual(data.users, [{ id: "u1", start: "finished debugging runtime.ts" }], "constraint retirement only ever quotes real user rows, never the queued text")
+  assert.ok(!("users" in data), "user quotes are resolved by the validator, not a repeated source directory")
 })
 
 test("a hint is omitted without message text and capped when huge", async () => {
@@ -1292,7 +1477,7 @@ test("a failed compaction keeps the hint for its next attempt; committing consum
   assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "committing consumed the hint")
 })
 
-test("the final assistant reply and reasoning can cross the soft threshold without being counted twice", async () => {
+test("final retained output can cross the soft threshold; ephemeral reasoning never counts as durable growth", async () => {
   const h = harness({ idle: 100, budget: 1_000_000 })
   h.state.rows = [user("u1", "x".repeat(320))]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
@@ -1300,9 +1485,9 @@ test("the final assistant reply and reasoning can cross the soft threshold witho
     { type: "reasoning", text: "r".repeat(40) }, { type: "text", text: "a".repeat(80) },
   ] }, { id: "idle", type: "idle", outcome: "succeeded" })
   await h.controller.onIdle("s")
-  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "idle", tokens: 110 })
+  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "idle", tokens: 100, threshold: 100 })
   await h.controller.onIdle("s")
-  assert.equal((await h.store.getDeferredCompaction()).tokens, 110)
+  assert.equal((await h.store.getDeferredCompaction()).tokens, 100)
   assert.equal(h.state.compact, 0, "the final answer must not start a summary while idle")
   await h.controller.onPrompt(prompt())
   assert.equal(h.state.compact, 1)
@@ -1397,7 +1582,8 @@ test("a plugin checkpoint without a stored record is adopted as a native episode
   const orphan = completed("c1", { summary: "## Episode E7 — Forked work\nkept facts", metadata: { nextdcp: { version: 1 } } })
   const result = await compactRows(h, [orphan, user("u2", "work after the fork"), running("c2")])
   assert.match(result.summary, /Current working state/)
-  assert.match(h.state.prompts[0], /kept facts/)
+  assert.doesNotMatch(h.state.prompts[0], /kept facts/, "inline generation does not duplicate its native checkpoint")
+  assert.match(projectHistory(h.state.rows).messages[0].content[0].text, /kept facts/)
   assert.match((await h.store.getCheckpoint("c1")).episode.summary, /kept facts/)
   assert.match(result.summary, /Archive through E2/)
 })
@@ -1411,87 +1597,81 @@ test("the budget gate arms at the crossing and pays it at the next build", async
   assert.equal(h.state.compact, 1, "the next build closes the gate and compacts")
 })
 
-test("a gate-window precompute commits at close without another generation", async () => {
+test("the actual cut, not the gate, generates a handoff covering every later suffix", async () => {
   const h = harness({ idle: false, budget: 40 })
   // Seed one cut so the gate window has a structured prior working state to patch.
   const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
   assert.equal(h.state.prompts.length, 1, "the seed generated inline")
-  h.controller.onCompactionFinished("s")
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  await h.controller.onCompactionFinished("s")
   h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
   await armGate(h)
-  assert.equal(h.state.stateless.length, 1, "the evaluation window runs its patch generation")
+  assert.equal(h.state.stateless.length, 0, "opening a gate never generates speculatively")
+  h.state.rows.push(assistant("suffix", "NEW_FINDING_AFTER_GATE"), user("new-constraint", "NEW_USER_CONSTRAINT_AFTER_GATE"))
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 1, "the next build closes the gate")
   h.state.rows = [...h.state.rows, running("c2")]
   const item = event()
   await h.controller.onCompaction(item)
-  assert.ok(item.result, "the close commits the precomputed handoff")
+  assert.ok(item.result, "the actual cut commits its own handoff")
   assert.equal(h.state.prompts.length, 1, "the commit added no inline generation")
-  assert.equal(h.state.stateless.length, 1, "the commit added no stateless generation")
+  assert.equal(h.state.stateless.length, 1, "only the actual cut generates")
+  assert.match(h.state.stateless[0].prompt, /NEW_FINDING_AFTER_GATE/)
+  assert.match(h.state.stateless[0].prompt, /NEW_USER_CONSTRAINT_AFTER_GATE/)
   const episode = (await h.store.getCheckpoint("c2")).episode
-  assert.equal(episode.id, "E2", "the precomputed episode id is reused, not skipped")
-  assert.deepEqual(episode.rowIDs, ["u"], "the episode carries the window's rows")
+  assert.equal(episode.id, "E2", "the episode id is allocated at the cut")
+  assert.deepEqual(episode.rowIDs, ["u", "suffix", "new-constraint"], "coverage matches the supplied transcript")
   await setImmediate()
-  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, spikeHeld: 0, checkpoints: 0, precomputes: 1, precomputeHits: 1, gateAliases: 0 })
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, spikeHeld: 0, checkpoints: 0, capacity: 0 })
 })
 
-test("a failed gate-window generation falls back to the inline cut", async () => {
+test("concurrent/repeated hooks for one cut reuse one durable checkpoint", async () => {
   const h = harness({ idle: false, budget: 40 })
   const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
   h.controller.onCompactionFinished("s")
   h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
-  h.state.failStateless = true
   await armGate(h)
-  h.state.failStateless = false
-  assert.equal(h.state.stateless.length, 1, "the window attempted its generation")
+  assert.equal(h.state.stateless.length, 0, "the gate makes no model request")
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
   assert.equal(h.state.compact, 1)
   h.state.rows = [...h.state.rows, running("c2")]
-  const item = event()
-  await h.controller.onCompaction(item)
+  const item = event(), repeated = event()
+  await Promise.all([h.controller.onCompaction(item), h.controller.onCompaction(repeated)])
   assert.ok(item.result, "the close still produces a handoff")
-  assert.equal(h.state.prompts.length, 2, "the close generates inline instead")
+  assert.deepEqual(repeated.result, item.result)
+  assert.equal(h.state.prompts.length, 2, "the seed plus one actual-cut generation")
+  const reloaded = event()
+  await createController(h.ctx).onCompaction(reloaded)
+  assert.deepEqual(reloaded.result, item.result, "the durable checkpoint also survives reload")
+  assert.equal(h.state.prompts.length, 2)
   await setImmediate()
-  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, spikeHeld: 0, checkpoints: 0, precomputes: 1, precomputeHits: 0, gateAliases: 0 })
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 1, repaid: 0, spikeHeld: 0, checkpoints: 0, capacity: 0 })
 })
 
-test("checkpoint_now at an open gate aliases to continue; a keep note discards the precompute", async () => {
-  const h = harness({ idle: false, budget: 40 })
-  const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
-  h.controller.onCompactionFinished("s")
-  h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
-  await armGate(h)
-  // Without keep: the alias changes nothing; the window's own close commits its precompute.
-  assert.match(await h.controller.checkpointNow({}, toolContext), /The budget gate is already open: the cut lands right after this step, so continue the work\./)
-  assert.equal(h.state.compact, 0, "the alias triggers no compaction of its own")
-  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
-  await setImmediate()
-  assert.equal(h.state.compact, 1, "the open gate's own close still lands the cut")
-  h.state.rows = [...h.state.rows, running("c2")]
-  const plain = event()
-  await h.controller.onCompaction(plain)
-  assert.ok(plain.result)
-  assert.equal(h.state.stateless.length, 1, "the window's precompute commits without another generation")
-  assert.equal(h.state.prompts.length, 1, "only the seed generated inline")
-  // With keep at a second gate: the note rides the hint; the precompute is discarded.
-  h.controller.onCompactionFinished("s")
-  h.state.rows = [completed("c2", plain.result), user("u2", "z".repeat(800))]
-  await armGate(h)
-  assert.equal(h.state.stateless.length, 2, "the second window precomputed too")
-  assert.match(await h.controller.checkpointNow({ keep: "Preserve the failing test name." }, toolContext), /gate is already open: the cut lands right after this step, so continue the work \(keep note attached\)/)
-  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
-  await setImmediate()
-  assert.equal(h.state.compact, 2)
-  h.state.rows = [...h.state.rows, running("c3")]
-  const kept = event()
-  await h.controller.onCompaction(kept)
-  assert.ok(kept.result)
-  assert.equal(h.state.prompts.length, 2, "the keep note forced inline generation")
-  assert.match(h.state.prompts.at(-1), /checkpoint_now keep: Preserve the failing test name\./, "the keep note rides the hint channel to the working state")
-  await setImmediate()
-  assert.deepEqual(await h.store.getGateStats(), { gates: 2, silent: 0, continued: 2, repaid: 0, spikeHeld: 0, checkpoints: 0, precomputes: 2, precomputeHits: 1, gateAliases: 2 })
+test("an open gate admits checkpoint_now normally, including a direct working-state edit", async () => {
+  for (const direct of [false, true]) {
+    const h = harness({ idle: false, budget: 40 })
+    const seed = await compactRows(h, [user("u1", "seed work"), running("c1")])
+    await h.controller.onCompactionFinished("s")
+    h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
+    await armGate(h)
+    const { output } = await publishCheckpoint(h, direct ? edit({ next: ["Verify the new direct checkpoint"] }) : {}, false)
+    assert.match(output, /^Requested:/, "a gate is not an already admitted cut")
+    assert.equal(h.state.compact, 1)
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    await setImmediate()
+    assert.equal(h.state.compact, 1, "the consumed gate cannot request a second cut")
+    const result = await compactRows(h, [...h.state.rows, running("c2")])
+    assert.equal(h.state.stateless.length, 0)
+    assert.equal(h.state.prompts.length, direct ? 1 : 2, "only an empty call asks the compactor to generate")
+    assert.equal(result.metadata.nextdcp.author, direct ? "main" : "compactor")
+    if (direct) assert.deepEqual((await h.store.getCheckpoint("c2")).working.next, ["Verify the new direct checkpoint"])
+    await setImmediate()
+    assert.equal((await h.store.getGateStats()).checkpoints, 1)
+  }
 })
 
 test("notice: system restores the legacy system-part placement without a tail message", async () => {
@@ -1506,20 +1686,20 @@ test("notice: system restores the legacy system-part placement without a tail me
 })
 
 test("gate outcomes are counted per session, and telemetry failures never gate a trigger", async () => {
-  const zeros = { gates: 0, silent: 0, continued: 0, repaid: 0, spikeHeld: 0, checkpoints: 0, precomputes: 0, precomputeHits: 0, gateAliases: 0 }
+  const zeros = { gates: 0, silent: 0, continued: 0, repaid: 0, spikeHeld: 0, checkpoints: 0, capacity: 0 }
   const h = harness({ idle: false, budget: 40 })
   h.state.rows = [user("u", "x".repeat(800))]
   await armGate(h)
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   await setImmediate()
-  assert.deepEqual(await h.store.getGateStats(), { ...zeros, gates: 1, continued: 1, precomputes: 1 })
+  assert.deepEqual(await h.store.getGateStats(), { ...zeros, gates: 1, continued: 1 })
   // A failed round repays its consumed crossing.
   const repaid = harness({ idle: false, budget: 40 })
   repaid.state.rows = [user("u", "x".repeat(800))]
   await armGate(repaid)
   repaid.controller.onRoundEnded("s")
   await setImmediate()
-  assert.deepEqual(await repaid.store.getGateStats(), { ...zeros, gates: 1, repaid: 1, precomputes: 1 })
+  assert.deepEqual(await repaid.store.getGateStats(), { ...zeros, gates: 1, repaid: 1 })
   // Without a round stamp the crossing cannot arm and compacts silently.
   const silent = harness({ idle: false, budget: 40 })
   silent.state.rows = [user("u", "x".repeat(800))]
@@ -1538,27 +1718,39 @@ test("gate outcomes are counted per session, and telemetry failures never gate a
   assert.equal(broken.state.compact, 1, "the silent trigger fires despite the stats failure")
 })
 
-test("checkpoint_now compacts on request, carries the keep note, and runs once per round", async () => {
-  const h = harness({ idle: false, budget: 100_000 })
-  h.state.rows = [user("u1", "work so far")]
-  assert.match(await h.controller.checkpointNow({ keep: "  Keep the failing test name.  " }, toolContext), /Checkpointing now \(keep note attached\)/)
-  assert.equal(h.state.compact, 1)
-  h.state.rows = [user("u1", "work so far"), running("c1")]
-  const item = event()
-  await h.controller.onCompaction(item)
-  assert.ok(item.result, "the requested checkpoint produces a handoff")
-  assert.match(h.state.prompts.at(-1), /checkpoint_now keep: Keep the failing test name\./, "the keep note rides the hint channel to the working state")
-  h.controller.onCompactionFinished("s")
-  h.state.rows = [completed("c1", item.result), user("u1", "work so far")]
-  assert.match(await h.controller.checkpointNow({}, toolContext), /already checkpointed/)
-  assert.equal(h.state.compact, 1, "once per round")
-  h.state.info = { model, time: { busy: 2 } }
-  h.state.rows = [completed("c1", item.result), user("u2", "more work"), running("c2")]
-  assert.match(await h.controller.checkpointNow({}, toolContext), /already running/)
-  assert.equal(h.state.compact, 1)
-  h.state.rows = [completed("c1", item.result), user("u2", "more work")]
-  assert.match(await h.controller.checkpointNow({}, toolContext), /Checkpointing now/)
-  assert.equal(h.state.compact, 2, "a new round may checkpoint again")
+test("successive main edits update the latest canonical state in the same round without generation", async () => {
+  const h = harness({ idle: false, budget: false })
+  const seed = await compactRows(h, [user("u1", "work so far"), running("c0")])
+  await h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c0", seed), user("u2", "continue")]
+  h.state.failGenerate = h.state.failStateless = true
+  const first = edit({ state: ["First verified main-model update"], next: ["First next action"] })
+  assert.match((await publishCheckpoint(h, first)).output, /^Requested:.*Validated working-state edit staged/)
+  assert.equal(await h.store.getCheckpoint("c1"), undefined, "admission is not a committed handoff")
+  const result = await compactRows(h, [...h.state.rows, running("c1")])
+  assert.equal(result.metadata.nextdcp.author, "main")
+  const saved = await h.store.getCheckpoint("c1")
+  assert.equal(saved.author, "main")
+  assert.deepEqual(saved.working, { ...h.state.handoff.working, ...first.working })
+  assert.equal(saved.episode.summary, first.archive)
+  assert.deepEqual(saved.episode.rowIDs, ["u2", "assistant"])
+  assert.match(await h.store.getRow("assistant"), /checkpoint_now/, "the edit publication is archived like any other original")
+  assert.doesNotMatch(result.summary, /Current work and exact next action/, "the cold note is not appended to live working state")
+  await h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", result)]
+  const second = edit({ next: ["Second next action"] })
+  assert.match((await publishCheckpoint(h, second, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /^Requested:/)
+  const next = await compactRows(h, [...h.state.rows, running("c2")])
+  assert.deepEqual((await h.store.getCheckpoint("c2")).working, { ...saved.working, next: ["Second next action"] }, "the base includes the first main edit, not just the last compactor output")
+  assert.equal(h.state.compact, 2, "a moved boundary permits another checkpoint in the same round")
+  assert.equal(h.state.prompts.length, 1, "only the original seed generated")
+  assert.equal(h.state.stateless.length, 0)
+  const repeated = event(), reloaded = event()
+  await h.controller.onCompaction(repeated)
+  await createController(h.ctx).onCompaction(reloaded)
+  assert.deepEqual(repeated.result, next)
+  assert.deepEqual(reloaded.result, next, "durable main authorship and rendering survive reload")
+  assert.equal(h.state.prompts.length, 1)
   await setImmediate()
   assert.equal((await h.store.getGateStats()).checkpoints, 2)
 })
@@ -1572,13 +1764,361 @@ test("checkpoint_now registers approval-free beside recall, and model-facing cop
     assert.deepEqual(tool.options, { codemode: false })
     assert.equal(tool.input.required, undefined)
     assert.equal(tool.input.additionalProperties, false)
+    assert.deepEqual(tool.input, CHECKPOINT_INPUT)
+    assert.deepEqual(Object.keys(tool.input.properties), ["archive", "working", "retire"])
     assert.equal(h.state.permissions.length, 0, "registration prompts no permission")
     for (const text of [CHECKPOINT_NOW_DESCRIPTION, RECALL_DESCRIPTION, budgetGateNotice(12_345, 60_000, 200_000), budgetGateNotice(12_345, 60_000)])
       assert.ok(!text.includes("NextDCP"), "model-facing copy names no product")
-    assert.match(RECALL_DESCRIPTION, /Context model:/, "the standing contract rides the recall description")
+    assert.doesNotMatch(RECALL_DESCRIPTION, /Compaction budget|checkpoint_now/, "recall does not repeat the checkpoint tool's scheduling instructions")
     assert.match(budgetGateNotice(12_345, 60_000, 200_000), /~6% of the 200000-token window/)
     assert.ok(!/-token window/.test(budgetGateNotice(12_345, 60_000)), "the window clause is omitted when unknown")
   } finally { cleanup() }
+})
+
+test("failed checkpoint admission is explicit, retryable, and cannot leak an unadmitted edit", async () => {
+  const h = harness({ idle: false, budget: false })
+  h.state.rows = [user("u1", "work so far")]
+  h.state.failAdmission = true
+  const failed = (await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "UNADMITTED_EDIT_MUST_NOT_COMMIT" }))).output
+  assert.match(failed, /^Failed: Compaction admission failed; no checkpoint was confirmed/)
+  assert.doesNotMatch(failed, /conversation is archived|Checkpointing now|edit staged/)
+  assert.equal((await h.store.getGateStats()).checkpoints, 0)
+  h.state.failAdmission = false
+  const retry = await h.controller.checkpointNow({}, toolContext)
+  assert.match(retry, /^Requested:.*Completion is not confirmed/)
+  assert.equal(h.state.compact, 2, "failed admission permits a retry")
+  h.state.rows.push(running("c1"))
+  const cut = event()
+  await h.controller.onCompaction(cut)
+  assert.equal(cut.result.metadata.nextdcp.author, "compactor")
+  assert.doesNotMatch(cut.result.summary, /UNADMITTED_EDIT_MUST_NOT_COMMIT/)
+  assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "a refused edit is not attached as a later relevance signal")
+  await setImmediate()
+  assert.equal((await h.store.getGateStats()).checkpoints, 1, "only the actually admitted early checkpoint is counted")
+})
+
+test("concurrent checkpoint calls share admission and cannot turn rejection into success", async () => {
+  for (const fail of [false, true]) {
+    const h = harness({ idle: false, budget: false }), entered = deferred(), release = deferred()
+    h.state.rows = [user("u1", "work so far")]
+    h.ctx.session.compact = async () => {
+      h.state.compact++
+      entered.resolve()
+      await release.promise
+      if (fail) throw new Error("SECRET host rejection")
+    }
+    const first = h.controller.checkpointNow({}, toolContext)
+    await entered.promise
+    const second = h.controller.checkpointNow({}, toolContext)
+    await setImmediate()
+    assert.equal(h.state.compact, 1)
+    release.resolve()
+    const outputs = await Promise.all([first, second])
+    if (fail) assert.ok(outputs.every((text) => text.startsWith("Failed:")))
+    else {
+      assert.match(outputs[0], /^Requested:/)
+      assert.match(outputs[1], /^Already pending:/)
+    }
+    assert.ok(outputs.every((text) => !text.includes("SECRET")))
+  }
+})
+
+test("checkpoint guard, cooldown, and duplicate-boundary refusal are distinct and never claim completion", async () => {
+  const pending = harness({ idle: 1, budget: false })
+  pending.state.rows = [user("u1", "work before an admitted idle request")]
+  await resume(pending)
+  assert.match(await pending.controller.checkpointNow({}, toolContext), /^Already pending:.*guarded as pending; completion is not confirmed/)
+  assert.equal(pending.state.compact, 1)
+  await pending.controller.onIdle("s") // Clears a stale guard without erasing the duplicate-attempt marker.
+  assert.match(await pending.controller.checkpointNow({}, toolContext), /^Not admitted: A recent request covered this same boundary/)
+  assert.equal(pending.state.compact, 1)
+  await pending.controller.onCompactionFinished("s", true)
+  assert.match(await pending.controller.checkpointNow({}, toolContext), /^Not admitted: A failed cut is cooling down/)
+  assert.equal(pending.state.compact, 1)
+})
+
+test("main edits have no payload cap and oversized merged state commits unchanged without regeneration", async () => {
+  const h = harness({ idle: false, budget: false, memory: { budget: 100 } })
+  h.state.rows = [user("u1", "work")]
+  const input = { archive: `Title: Large edit\n${"coldnote ".repeat(600)}`, working: { ...h.state.handoff.working, state: [`${"😀".repeat(2_100)}${"verified state ".repeat(3_000)}END`] } }
+  const { output } = await publishCheckpoint(h, input)
+  assert.match(output, /^Requested:.*soft target 100; no truncation or size-only rewrite/)
+  const result = await compactRows(h, [...h.state.rows, running("c1")])
+  assert.equal(result.metadata.nextdcp.author, "main")
+  assert.deepEqual((await h.store.getCheckpoint("c1")).working, input.working)
+  assert.equal((await h.store.getCheckpoint("c1")).episode.summary, input.archive.trim())
+  assert.match(result.summary, /END/)
+  assert.equal(h.state.prompts.length + h.state.stateless.length, 0)
+  assert.match(await h.storage.get("sessions/s/model/warning"), /soft budget.*accepted unchanged, without another generation or truncation/)
+  assert.ok(!JSON.stringify(CHECKPOINT_INPUT).includes("maxLength"), "no arbitrary edit-string cap is advertised")
+  assert.match(CHECKPOINT_NOW_DESCRIPTION, /Admission is not completion/)
+  await h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c1", result)]
+  const second = await publishCheckpoint(h, edit({ next: ["Measure the whole merged state"] }), true, { ...toolContext, messageID: "second", id: "second-cut" })
+  assert.match(second.output, /exceeds the soft target 100/, "a tiny patch is measured together with its carried-forward state")
+  await compactRows(h, [...h.state.rows, running("c2")])
+  assert.deepEqual((await h.store.getCheckpoint("c2")).working.state, input.working.state)
+  assert.equal(h.state.prompts.length + h.state.stateless.length, 0)
+})
+
+test("malformed edits are refused before admission and partial seeds explicitly need a full state or {}", async () => {
+  const h = harness({ idle: false, budget: false })
+  h.state.rows = [user("u1", "work")]
+  for (const input of [{ keep: "obsolete API" }, edit({ next: ["Partial without a base"] }), { ...edit(h.state.handoff.working), archive: "Missing title" },
+    edit({ ...h.state.handoff.working, references: [{ id: "E999", why: "not available" }] })]) {
+    assert.match(await h.controller.checkpointNow(input, toolContext), /^Not admitted:/)
+    assert.equal(h.state.compact, 0)
+  }
+  assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:.*compactor will generate/)
+  assert.equal((await compactRows(h, [...h.state.rows, running("c1")])).metadata.nextdcp.author, "compactor")
+})
+
+test("direct edits preserve standing constraints and retire only quotes from the new user span", async () => {
+  const h = harness({ idle: false, budget: false })
+  const quote = "You may stop preserving the exact request."
+  h.state.handoff.working.constraints = ["Preserve the exact request."]
+  const seed = await compactRows(h, [user("old", `Preserve the exact request. ${quote}`), running("c0")])
+  await h.controller.onCompactionFinished("s")
+  h.state.rows = [completed("c0", seed)]
+  const input = { ...edit({ constraints: [] }), retire: [{ constraint: "Preserve the exact request.", quote }] }
+  assert.match(await h.controller.checkpointNow(input, toolContext), /^Not admitted:.*new user message/, "an archived user quote is not new retirement evidence")
+  assert.equal(h.state.compact, 0)
+  h.state.rows.push(user("new-user", quote))
+  assert.match((await publishCheckpoint(h, input)).output, /^Requested:.*edit staged/)
+  await compactRows(h, [...h.state.rows, running("c1")])
+  const saved = await h.store.getCheckpoint("c1")
+  assert.deepEqual(saved.working.constraints, [])
+  assert.deepEqual(saved.retiredConstraints, [{ constraint: "Preserve the exact request.", quote, messageID: "new-user" }])
+  assert.equal(saved.author, "main")
+  assert.equal(h.state.prompts.length, 1)
+})
+
+test("new or changed evidence at the actual cut regenerates instead of committing a stale main edit", async () => {
+  for (const change of ["user", "tool-result", "changed-result", "parallel", "base", "publication-error", "queued-user"]) {
+    const h = harness({ idle: false, budget: false })
+    const read = { id: "read", type: "assistant", content: [{ type: "tool", id: "read-1", name: "read", state: {
+      status: "completed", input: { path: "test.ts", time: 1, tokens: 2 }, content: [{ type: "text", text: "Earlier evidence" }],
+    } }] }
+    h.state.rows = [user("u1", "work"), read]
+    const { row, output } = await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "STALE_MAIN_EDIT" }))
+    assert.match(output, /^Requested:.*edit staged/, change)
+    if (change === "user") h.state.rows.push(user("late-user", "LATE_USER_CONSTRAINT"))
+    if (change === "tool-result") h.state.rows.push(assistant("late-result", "LATE_TOOL_FINDING"))
+    if (change === "changed-result") read.content[0].state.content[0].text = "CHANGED_TOOL_FINDING"
+    if (change === "parallel") row.content.push({ type: "tool", id: "parallel", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "PARALLEL_FINDING" }] } })
+    if (change === "base") h.state.rows.unshift(native("unexpected-base", "Changed checkpoint"))
+    if (change === "publication-error") row.content[0].state = { ...row.content[0].state, status: "error", error: { type: "interrupted", message: "stopped" } }
+    if (change === "queued-user") await h.controller.onPrompt(prompt())
+    const result = await compactRows(h, [...h.state.rows, running("c1")])
+    assert.equal(result.metadata.nextdcp.author, "compactor", change)
+    assert.equal(h.state.prompts.length, 1, change)
+    assert.doesNotMatch(result.summary, /STALE_MAIN_EDIT/, change)
+    assert.match(await h.storage.get("sessions/s/model/warning"), /compactor will regenerate from the actual cut/, change)
+    if (change === "user") assert.match(await h.store.getRow("late-user"), /LATE_USER_CONSTRAINT/, "late evidence is archived at the same actual boundary")
+    if (change === "changed-result") assert.match(await h.store.getRow("read"), /CHANGED_TOOL_FINDING/)
+  }
+})
+
+test("stale, parallel or missing authoring evidence at admission selects explicit compactor regeneration", async () => {
+  for (const kind of ["changed", "parallel", "missing"]) {
+    const h = harness({ idle: false, budget: false })
+    h.state.rows = [user("u1", "work")]
+    if (kind !== "missing") await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    if (kind === "changed") h.state.rows.push(user("late-user", "New input before admission"))
+    const input = edit(h.state.handoff.working), row = publication(input)
+    if (kind === "parallel") row.content.push({ type: "tool", id: "read-parallel", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "NEW_RESULT" }] } })
+    h.state.rows.push(row)
+    const output = await h.controller.checkpointNow(input, toolContext)
+    assert.match(output, /^Requested:.*Edit not staged:.*compactor will regenerate/, kind)
+    row.content[0].state = { status: "completed", input, content: [{ type: "text", text: output }] }
+    const result = await compactRows(h, [...h.state.rows, running("c1")])
+    assert.equal(result.metadata.nextdcp.author, "compactor", kind)
+    assert.equal(h.state.prompts.length, 1, kind)
+  }
+})
+
+test("a reload before the cut loses the uncommitted proposal and safely regenerates", async () => {
+  const h = harness({ idle: false, budget: false })
+  h.state.rows = [user("u1", "work")]
+  await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "Uncommitted main proposal" }))
+  await h.controller.dispose()
+  h.controller = createController(h.ctx)
+  const result = await compactRows(h, [...h.state.rows, running("c1")])
+  assert.equal(result.metadata.nextdcp.author, "compactor")
+  assert.equal(h.state.prompts.length, 1)
+  assert.deepEqual((await h.store.getCheckpoint("c1")).working, h.state.handoff.working)
+})
+
+test("a concurrent duplicate cannot overwrite the proposal that owns admission", async () => {
+  const h = harness({ idle: false, budget: false }), entered = deferred(), release = deferred()
+  h.state.rows = [user("u1", "work")]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  const input = edit({ ...h.state.handoff.working, objective: "FIRST_EDIT_OWNS_ADMISSION" }), row = publication(input)
+  h.state.rows.push(row)
+  h.ctx.session.compact = async () => { h.state.compact++; entered.resolve(); await release.promise }
+  const first = h.controller.checkpointNow(input, toolContext)
+  await entered.promise
+  const second = h.controller.checkpointNow(edit({ ...h.state.handoff.working, objective: "DUPLICATE_MUST_NOT_OVERWRITE" }), toolContext)
+  await setImmediate()
+  release.resolve()
+  const outputs = await Promise.all([first, second])
+  assert.match(outputs[0], /^Requested:.*edit staged/)
+  assert.match(outputs[1], /^Already pending:.*No new edit was staged/)
+  row.content[0].state = { status: "completed", input, content: [{ type: "text", text: outputs[0] }] }
+  const result = await compactRows(h, [...h.state.rows, running("c1")])
+  assert.match(result.summary, /FIRST_EDIT_OWNS_ADMISSION/)
+  assert.doesNotMatch(result.summary, /DUPLICATE_MUST_NOT_OVERWRITE/)
+  assert.equal(h.state.prompts.length, 0)
+  assert.equal(h.state.compact, 1)
+})
+
+test("unreadable context, inactive rounds and staged reverts admit no checkpoint", async () => {
+  const h = harness()
+  h.ctx.session.context = async () => { throw new Error("context unavailable") }
+  assert.match(await h.controller.checkpointNow({}, toolContext), /^Failed:.*no checkpoint was requested/)
+  h.ctx.session.context = async () => []
+  for (const info of [{ time: {} }, { time: { busy: 1 }, revert: { messageID: "u1" } }]) {
+    h.state.info = info
+    assert.match(await h.controller.checkpointNow({}, toolContext), /^Not admitted:/)
+  }
+  assert.equal(h.state.compact, 0)
+})
+
+test("memory status is strictly read-only, including first use of an unadopted native checkpoint", async () => {
+  const h = harness()
+  const checkpoint = { ...native("c1", "state".repeat(80)), metadata: { recent: "native tail ".repeat(300) }, time: { created: 1_000 } }
+  h.state.rows = [checkpoint, user("u2", "new durable text"), { ...assistant("a2", "answer"), content: [
+    { type: "text", text: "answer" }, { type: "reasoning", text: "ephemeral".repeat(100) },
+  ] }]
+  const before = structuredClone(h.storage.values), writes = h.storage.writes.length
+  const status = await h.controller.memoryStatus("s")
+  assert.equal(status.checkpoint.id, "c1")
+  assert.equal(status.checkpoint.native, true)
+  assert.equal(status.summary.chars, checkpoint.summary.length)
+  assert.equal(status.summary.tokens, tokens(checkpoint.summary))
+  assert.equal(status.recent.tokens, tokens(checkpoint.metadata.recent))
+  assert.equal(status.growth.tokens, durableTokens(h.state.rows.slice(1)))
+  assert.equal(status.growth.rows, 2)
+  assert.equal(status.retained, status.summary.tokens + status.recent.tokens + status.growth.tokens)
+  assert.equal(status.budgetScope, "retained")
+  assert.equal(status.budget, 50_000)
+  assert.deepEqual(status.budgetBounds, { floor: 37_500, start: 50_000, ceiling: 75_000 })
+  assert.equal(status.request, undefined, "status does not synthesize a request or invent overhead")
+  assert.equal(status.lastCut.action, "completed")
+  assert.match(status.lastCut.reason, /trigger unavailable/)
+  assert.equal(status.decision, undefined)
+  assert.equal(h.storage.writes.length, writes, "no owner save, archive adoption, marker, telemetry or thermostat update")
+  assert.deepEqual(h.storage.values, before)
+  assert.equal(h.state.compact + h.state.prompts.length + h.state.stateless.length, 0)
+})
+
+test("memory separates current durable growth, the last hook projection, and raw provider usage", async () => {
+  const h = harness({ idle: false, budget: false })
+  const billed = (id, input, text) => ({ ...assistant(id, text), model,
+    tokens: { input, output: 37, reasoning: 11, cache: { read: 40, write: 20 } } })
+  h.state.rows = [billed("a1", 640, "x".repeat(1_200)), billed("a2", 1_000, ""), user("u1", "new work")]
+  const request = { ...event(), system: [{ type: "text", text: "system".repeat(100) }],
+    tools: { read: { description: "definition", input: { type: "object" } } },
+    messages: projectHistory(h.state.rows).messages, options: { maxTokens: 512 } }
+  await h.controller.onContext(request)
+  await setImmediate()
+  const writes = h.storage.writes.length, status = await h.controller.memoryStatus("s")
+  assert.equal(status.scale, usageScale(h.state.rows))
+  assert.equal(status.scale, 1.2)
+  assert.equal(status.request.total, requestTokens(request) * status.scale)
+  assert.ok(Math.abs(status.request.messages + status.request.system + status.request.tools - status.request.total) < 1e-8)
+  assert.equal(status.request.outputReserve, 512)
+  assert.equal(status.request.ceiling, 100_000 - 512 - 1_024)
+  assert.equal(status.budgetMode, "disabled")
+  assert.equal(status.budgetScope, "growth")
+  assert.equal(status.budget, undefined, "Infinity is never exposed as a JSON number")
+  assert.deepEqual(status.usage, { messageID: "a2", input: 1_000, output: 37, reasoning: 11, cacheRead: 40, cacheWrite: 20 })
+  assert.deepEqual(status.usage, latestProviderUsage(h.state.rows), "provider counters are not multiplied by the calibration scale")
+  h.state.rows.push(assistant("later", "later retained output"))
+  const later = await h.controller.memoryStatus("s")
+  assert.ok(later.growth.tokens > status.growth.tokens)
+  assert.deepEqual(later.request, status.request, "a read never rebuilds or silently refreshes the last hook projection")
+  assert.equal(h.storage.writes.length, writes)
+})
+
+test("memory accounts for the gate notice without consuming the gate or queuing a cut", async () => {
+  for (const notice of ["tail", "system"]) {
+    const h = harness({ idle: false, budget: 40, notice })
+    h.state.rows = [user("u1", "x".repeat(800))]
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+    await h.controller.onContext(request)
+    await setImmediate()
+    const writes = h.storage.writes.length
+    const status = await h.controller.memoryStatus("s")
+    assert.equal(status.request.total, requestTokens(request), notice)
+    assert.equal(status.decision.action, "gate-open")
+    assert.equal(status.budgetMode, "explicit")
+    assert.equal(status.budgetScope, "growth")
+    assert.equal(status.budgetBounds, undefined)
+    assert.equal(status.budget, 40)
+    assert.equal(h.state.compact, 0)
+    await h.controller.memoryStatus("s")
+    assert.equal(h.storage.writes.length, writes)
+    assert.equal(h.state.compact, 0)
+  }
+})
+
+test("memory reports cut completion separately from admission and a prepared handoff", async () => {
+  const h = harness({ idle: false, budget: false })
+  h.state.rows = [user("u1", "work so far")]
+  assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:/)
+  let status = await h.controller.memoryStatus("s")
+  assert.equal(status.compaction, "pending")
+  assert.equal(status.lastCut, undefined, "an admitted inbox item is not a completed cut")
+  h.state.rows.push(running("c1"))
+  const cut = event()
+  await h.controller.onCompaction(cut)
+  status = await h.controller.memoryStatus("s")
+  assert.equal(status.compaction, "running")
+  assert.equal(status.lastCut, undefined, "a saved handoff is not host completion either")
+  h.state.rows = [completed("c1", cut.result)]
+  await h.controller.onCompactionFinished("s")
+  status = await h.controller.memoryStatus("s")
+  assert.deepEqual(status.checkpoint, { id: "c1", episode: "E1", native: false, author: "compactor" })
+  assert.equal(status.lastCut.action, "completed")
+  assert.equal(status.lastCut.id, "c1")
+  assert.match(status.lastCut.reason, /model requested an early checkpoint/)
+  assert.equal(status.compaction, "idle")
+  assert.equal(status.growth.tokens, 0)
+})
+
+test("memory exposes unknown bounds honestly and does not persist observations across reload", async () => {
+  const h = harness({ idle: false })
+  h.state.models[0].limit = {}
+  h.state.rows = [user("u1", "work")]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  let status = await h.controller.memoryStatus("s")
+  assert.equal(status.budgetMode, "unknown")
+  assert.equal(status.budget, undefined)
+  assert.equal(status.request.ceiling, undefined)
+  assert.equal(status.request.window, undefined)
+  assert.match(status.decision.reason, /window is unknown/)
+  h.state.rows = [native("cp", "old native state")]
+  h.controller = createController(h.ctx)
+  status = await h.controller.memoryStatus("s")
+  assert.equal(status.request, undefined)
+  assert.equal(status.decision, undefined)
+  assert.equal(status.lastCut.id, "cp")
+  assert.match(status.lastCut.reason, /trigger unavailable/)
+  await h.controller.dispose()
+  await assert.rejects(h.controller.memoryStatus("s"), /archive is closed/)
+})
+
+test("memory RPC is read-only and the installed model-visible surface remains two tools", async () => {
+  const h = harness(), controller = await install(h.ctx)
+  assert.deepEqual([...h.state.rpcs.keys()], ["nextdcp.model", "nextdcp.memory"])
+  assert.deepEqual([...h.state.tools.keys()], ["recall", "checkpoint_now"])
+  assert.deepEqual(Object.keys(memoryRpc.methods), ["get"])
+  const writes = h.storage.writes.length
+  assert.equal((await h.state.rpcs.get("nextdcp.memory").get({ sessionID: "s" })).sessionID, "s")
+  assert.equal(h.storage.writes.length, writes)
+  await controller.onDeleted("s")
+  await assert.rejects(h.state.rpcs.get("nextdcp.memory").get({ sessionID: "s" }), /archive is closed/)
 })
 
 test("a consumed crossing never re-arms while guarded or cooling down", async () => {
@@ -1621,23 +2161,23 @@ test("provider-reported usage calibrates estimates that face model window limits
   assert.equal(h.state.compact, 1, "532 estimated tokens bill like 638 and pass the 600-token budget")
 })
 
-test("the growth gate converts the budget quarter into the estimator's own units", async () => {
+test("the growth gate compares calibrated NEW durable growth with the whole soft budget", async () => {
   const billed = (id, input) => ({ id, type: "assistant", model,
     tokens: { input, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, content: [{ type: "text", text: "x".repeat(8_000) }] })
   // Billed growth of 4,000 against 2,000 estimated tokens of the row in between: scale 2.
   const calibration = [billed("a1", 640), { ...billed("a2", 4_640), content: [{ type: "text", text: "" }] }]
   const fire = harness({ idle: false, budget: 4_000 })
-  fire.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(2_408))]
+  fire.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(8_408))]
   await fire.controller.onContext({ ...event(), messages: projectHistory(fire.state.rows).messages })
   await setImmediate()
   await fire.controller.onContext({ ...event(), messages: projectHistory(fire.state.rows).messages })
   await setImmediate()
-  assert.equal(fire.state.compact, 1, "602 estimated tokens bill like 1,204 and reach the gate at 1,000 real tokens of growth")
+  assert.equal(fire.state.compact, 1, "2,102 estimated tokens bill like 4,204 and cross the 4,000-token budget")
   const quiet = harness({ idle: false, budget: 4_000 })
-  quiet.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(1_600))]
+  quiet.state.rows = [...calibration, native("c0"), user("u1", "z".repeat(7_600))]
   await quiet.controller.onContext({ ...event(), messages: projectHistory(quiet.state.rows).messages })
   await setImmediate()
-  assert.equal(quiet.state.compact, 0, "400 estimated tokens bill like 800, under the gate although both cases already pass the budget line")
+  assert.equal(quiet.state.compact, 0, "1,900 estimated tokens bill like 3,800, still below the soft budget")
 })
 
 test("unusable usage data falls back to native chars/4 estimate units", async () => {
@@ -1663,7 +2203,7 @@ test("an unknown window announces its disabled budget trigger instead of failing
   const warnings = []
   t.mock.method(console, "warn", (text) => warnings.push(text))
   const h = harness({ idle: false, debug: true })
-  h.state.rows = [user("u1", "x".repeat(360_000))]
+  h.state.rows = [assistant("a1", "x".repeat(360_000))]
   await armGate(h)
   // The window can vanish mid-round; only the ref's own lookup decides what is known.
   h.state.models = []
@@ -1674,12 +2214,12 @@ test("an unknown window announces its disabled budget trigger instead of failing
   assert.ok(warnings.some((text) => text.includes("budget trigger is disabled")), "the disabled trigger is logged when debugging")
 })
 
-test("system and tool definitions above the budget never trigger compaction", async () => {
+test("system and tool definitions are not new growth while the complete request fits", async () => {
   const h = harness({ idle: false, budget: 100 })
   h.state.rows = [user("u1", "x".repeat(160))]
   const messages = projectHistory(h.state.rows).messages
   for (let i = 0; i < 3; i++) {
-    await h.controller.onContext({ ...event(), messages, system: [{ text: "system".repeat(10_000) }], tools: { giant: { description: "tool".repeat(10_000), input: {} } } })
+    await h.controller.onContext({ ...event(), messages, system: [{ type: "text", text: "system".repeat(10_000) }], tools: { giant: { description: "tool".repeat(10_000), input: {} } } })
     await setImmediate()
   }
   assert.equal(h.state.compact, 0)
@@ -1695,12 +2235,12 @@ test("budget compaction requires enough new growth and does not repeat on a larg
   h.state.rows = [prior, user("u1", "x".repeat(900))]
   await h.controller.onContext(request("prior", "x".repeat(900)))
   await setImmediate()
-  assert.equal(h.state.compact, 0, "225 new tokens are less than one quarter of the budget")
-  h.state.rows = [prior, user("u1", "x".repeat(1_200))]
-  await h.controller.onContext(request("prior", "x".repeat(1_200)))
+  assert.equal(h.state.compact, 0, "225 new tokens are below the budget; retained context is not new growth")
+  h.state.rows = [prior, user("u1", "x".repeat(4_800))]
+  await h.controller.onContext(request("prior", "x".repeat(4_800)))
   await setImmediate()
   // The crossing arms at build N and pays at build N+1.
-  await h.controller.onContext(request("prior", "x".repeat(1_200)))
+  await h.controller.onContext(request("prior", "x".repeat(4_800)))
   await setImmediate()
   assert.equal(h.state.compact, 1)
   h.controller.onCompactionFinished("s")
@@ -1738,13 +2278,13 @@ test("model window lookups are cached by provider and model, and missing models 
   assert.equal(lookups, 5)
 })
 
-test("native precompute and encrypted fallback leave native in control", async () => {
+test("unsupported background preparation is refused, while encrypted fallback remains native", async () => {
   const h = harness()
   h.state.rows = [user("u1", "precomputed archive"), { id: "a1", type: "assistant", content: [
     { type: "tool", id: "tool-opaque", name: "read", state: { status: "completed", input: { path: "original.ts" }, content: [{ type: "text", text: "archived tool data" }] } },
   ] }]
   const precompute = event()
-  await h.controller.onCompaction(precompute)
+  await assert.rejects(h.controller.onCompaction(precompute), /requires compaction.background: false/)
   assert.equal(precompute.result, undefined)
   assert.match(await h.store.getRow("u1"), /precomputed archive/)
   assert.equal(h.state.prompts.length, 0)
@@ -1764,7 +2304,7 @@ test("the plugin needs no permission surface, and a broken tool registration fai
   const h = harness()
   h.ctx.permission = undefined
   await install(h.ctx)
-  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction"], "the core hooks register without any permission surface")
+  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction", "fork"], "the awaited fork hook registers without any permission surface")
   assert.deepEqual([...h.state.tools.keys()], ["recall", "checkpoint_now"], "recall and checkpoint_now are the whole tool surface; the round hold is automatic, not a tool")
   assert.equal(warnings.length, 0, "nothing is optional, so nothing warns")
 
@@ -1791,8 +2331,8 @@ test("setup registers success-only idle events and clears the subscription", asy
   }
   const cleanup = await setup(h.ctx)
   await setImmediate()
-  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction"])
-  assert.deepEqual(subscribed, ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.compaction.ended", "session.compaction.failed", "session.deleted", "session.forked"])
+  assert.deepEqual([...h.state.hooks.keys()], ["prompt", "context", "compaction", "fork"])
+  assert.deepEqual(subscribed, ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.compaction.ended", "session.compaction.failed", "session.deleted"])
   assert.equal(h.state.tool.name, "recall")
   assert.equal(h.state.tool.description, RECALL_DESCRIPTION)
   assert.deepEqual(h.state.tool.options, { codemode: false })
@@ -1827,6 +2367,7 @@ test("setup registers success-only idle events and clears the subscription", asy
 
 test("event subscription retries after end or error, and stops after cleanup", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] })
+  const warnings = t.mock.method(console, "warn", () => {})
   const h = harness({ idle: 1 })
   h.state.rows = [user("u1", "completed work")]
   let subscriptions = 0, lastSignal
@@ -1866,4 +2407,820 @@ test("event subscription retries after end or error, and stops after cleanup", a
   await setImmediate()
   assert.equal(lastSignal.aborted, true)
   assert.equal(subscriptions, 4)
+  assert.ok(warnings.mock.calls.some((call) => String(call.arguments[0]).includes("event subscription")), "stream failures warn without debug mode")
+})
+
+test("deletion drains a blocked raw archive write before its final clear and closes reloaded controllers", { timeout: 5_000 }, async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness(), entered = deferred(), release = deferred()
+  const set = h.storage.set.bind(h.storage)
+  h.storage.set = async (key, value) => {
+    if (key === "sessions/s/rows/u1") { entered.resolve(); await release.promise }
+    return set(key, value)
+  }
+  h.state.rows = [user("u1", "private raw material"), running("c1")]
+  const cut = event(), compacting = h.controller.onCompaction(cut)
+  await entered.promise
+  let deleted = false
+  const deleting = h.controller.onDeleted("s").then(() => { deleted = true })
+  await setImmediate()
+  assert.equal(deleted, false, "non-cancellable storage must drain, not race the clear")
+  release.resolve()
+  await Promise.all([compacting, deleting])
+  assert.equal(cut.result, undefined, "a deleted cut cannot publish a handoff")
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")))
+  assert.equal(h.storage.values.get("deleted/s"), "cleared")
+  const before = h.storage.writes.length
+  const reloaded = createController(h.ctx)
+  await reloaded.onCompaction(event())
+  assert.match(await reloaded.recall("s", { id: "u1" }), /archive is closed/)
+  assert.equal(h.storage.writes.length, before, "a durable tombstone prevents resurrection after reload")
+})
+
+test("transient deletion scan and remove failures leave a visible pending journal and recover on plugin reload", async (t) => {
+  const warnings = t.mock.method(console, "warn", () => {})
+  for (const failure of ["scan", "remove"]) {
+    const h = harness()
+    await compactRows(h, [user("u1", "private raw material"), running("c1")])
+    const scan = h.storage.scan.bind(h.storage), remove = h.storage.remove.bind(h.storage)
+    let fail = true
+    h.storage.scan = async (options) => {
+      if (failure === "scan" && fail && options.prefix === "sessions/s/") { fail = false; throw new Error("transient clear scan failure") }
+      return scan(options)
+    }
+    h.storage.remove = async (key) => {
+      if (failure === "remove" && fail && key === "sessions/s/rows/u1") { fail = false; throw new Error("transient clear remove failure") }
+      return remove(key)
+    }
+    await assert.rejects(h.controller.onDeleted("s"), /transient clear/)
+    assert.equal(h.storage.values.get("deleted/s"), true, "unfinished cleanup remains durable")
+    assert.ok([...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")))
+    assert.match(await createController(h.ctx).recall("s", { id: "u1" }), /archive is closed/, "pending cleanup still fences stale writers and readers")
+    await h.controller.dispose()
+    const cleanup = await setup(h.ctx)
+    await setImmediate()
+    assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")), `${failure}: startup recovery finishes raw deletion`)
+    assert.equal(h.storage.values.get("deleted/s"), "cleared")
+    assert.equal((await createProjectStore(h.storage, "test").graduatedNotes()).length, 1, "recovery does not duplicate graduated notes")
+    await cleanup()
+  }
+  assert.equal(warnings.mock.calls.filter((call) => String(call.arguments[0]).includes("cleanup remains pending")).length, 2, "failures warn even without debug mode")
+})
+
+test("startup deletion recovery retries after a storage outage without blocking plugin registration", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const warnings = t.mock.method(console, "warn", () => {}), h = harness()
+  await h.store.archiveRows([user("u1", "raw bytes left by a previous instance")])
+  await h.storage.set("deleted/s", true)
+  const scan = h.storage.scan.bind(h.storage)
+  let fail = true, subscriptions = 0
+  h.storage.scan = async (options) => {
+    if (fail && options.prefix === "deleted/") { fail = false; throw new Error("journal temporarily unavailable") }
+    return scan(options)
+  }
+  h.ctx.event.subscribe = ({ signal }) => (async function* () {
+    subscriptions++
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))
+  })()
+  const cleanup = await setup(h.ctx)
+  await setImmediate()
+  assert.ok(h.state.tools.has("recall"), "recovery failure does not half-register the plugin")
+  assert.equal(subscriptions, 1, "journal recovery never blocks the event stream")
+  t.mock.timers.tick(250)
+  await setImmediate()
+  assert.equal(h.storage.values.get("deleted/s"), "cleared")
+  assert.equal(await h.store.getRow("u1"), undefined)
+  assert.equal(subscriptions, 1)
+  assert.ok(warnings.mock.calls.some((call) => String(call.arguments[0]).includes("deletion recovery")))
+  await cleanup()
+})
+
+test("one stuck deletion retries independently while other tombstones and live deletion events still clear", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  t.mock.method(console, "warn", () => {})
+  const h = harness(), remove = h.storage.remove.bind(h.storage)
+  for (const id of ["stuck", "z-pending", "live"]) await createStore(h.storage, id).archiveRows([user("u1", "private bytes")])
+  for (const id of ["stuck", "z-pending"]) await h.storage.set(`deleted/${id}`, true)
+  let fail = true
+  h.storage.remove = async (key) => {
+    if (fail && key.startsWith("sessions/stuck/")) throw new Error("one namespace is temporarily unavailable")
+    return remove(key)
+  }
+  h.ctx.event.subscribe = ({ signal }) => (async function* () {
+    yield { type: "session.deleted", location, data: { sessionID: "live" } }
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))
+  })()
+  const cleanup = await setup(h.ctx)
+  await setImmediate()
+  assert.equal(h.storage.values.get("deleted/stuck"), true)
+  for (const id of ["z-pending", "live"]) {
+    assert.equal(h.storage.values.get(`deleted/${id}`), "cleared")
+    assert.equal(await createStore(h.storage, id).getRow("u1"), undefined)
+  }
+  fail = false
+  t.mock.timers.tick(250)
+  await setImmediate()
+  assert.equal(h.storage.values.get("deleted/stuck"), "cleared")
+  assert.equal(await createStore(h.storage, "stuck").getRow("u1"), undefined)
+  await cleanup()
+})
+
+test("unload drains a pending recovery scan but does not start deletion after disposal", { timeout: 5_000 }, async () => {
+  const h = harness(), entered = deferred(), release = deferred(), scan = h.storage.scan.bind(h.storage)
+  await h.store.archiveRows([user("u1", "pending raw bytes")])
+  await h.storage.set("deleted/s", true)
+  h.storage.scan = async (options) => {
+    if (options.prefix === "deleted/") { entered.resolve(); await release.promise }
+    return scan(options)
+  }
+  const recovering = h.controller.recoverDeleted()
+  await entered.promise
+  const disposing = h.controller.dispose()
+  release.resolve()
+  await Promise.all([recovering, disposing])
+  assert.match(await h.store.getRow("u1"), /pending raw bytes/)
+  assert.equal(h.storage.values.get("deleted/s"), true, "the next live instance owns the remaining cleanup")
+})
+
+test("deletion cancels generation and ignores a late non-cooperative model response", { timeout: 5_000 }, async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness(), entered = deferred(), release = deferred()
+  let signal
+  h.ctx.session.generate = async (_input, options) => {
+    signal = options.signal
+    entered.resolve()
+    await release.promise
+    return { text: JSON.stringify(h.state.handoff) }
+  }
+  h.state.rows = [user("u1", "private generation input"), running("c1")]
+  const cut = event(), compacting = h.controller.onCompaction(cut)
+  await entered.promise
+  const deleting = h.controller.onDeleted("s")
+  assert.equal(signal.aborted, true)
+  release.resolve()
+  await Promise.all([compacting, deleting])
+  assert.equal(cut.result, undefined)
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")))
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("projects/test/episodes/")), "an uncommitted generation cannot graduate")
+})
+
+test("unload drains a blocked model RPC write, then rejects further RPC work without deleting saved data", { timeout: 5_000 }, async () => {
+  const h = harness(), entered = deferred(), release = deferred()
+  await h.controller.registerModels()
+  const rpc = h.state.rpc, set = h.storage.set.bind(h.storage)
+  h.storage.set = async (key, value) => {
+    if (key === "sessions/s/model") { entered.resolve(); await release.promise }
+    return set(key, value)
+  }
+  const saving = rpc.set({ sessionID: "s", preference: { mode: "main" } }, errorContext)
+  await entered.promise
+  let disposed = false
+  const disposing = h.controller.dispose().then(() => { disposed = true })
+  await setImmediate()
+  assert.equal(disposed, false)
+  release.resolve()
+  await Promise.all([saving, disposing])
+  assert.deepEqual(h.storage.values.get("sessions/s/model"), { mode: "main" }, "unload is not session deletion")
+  const before = h.storage.writes.length
+  await assert.rejects(rpc.set({ sessionID: "s", preference: { mode: "default" } }, errorContext), /archive is closed/)
+  assert.equal(h.storage.writes.length, before)
+  assert.equal(h.storage.values.get("deleted/s"), undefined)
+})
+
+test("deletion also drains RPC writes and a stale RPC cannot recreate its namespace", { timeout: 5_000 }, async () => {
+  const h = harness(), entered = deferred(), release = deferred()
+  await h.controller.registerModels()
+  const rpc = h.state.rpc, set = h.storage.set.bind(h.storage)
+  h.storage.set = async (key, value) => {
+    if (key === "sessions/s/model") { entered.resolve(); await release.promise }
+    return set(key, value)
+  }
+  const saving = rpc.set({ sessionID: "s", preference: { mode: "main" } }, errorContext)
+  await entered.promise
+  const deleting = h.controller.onDeleted("s")
+  release.resolve()
+  await Promise.all([saving, deleting])
+  await assert.rejects(rpc.get({ sessionID: "s" }), /archive is closed/)
+  assert.ok(![...h.storage.values.keys()].some((key) => key.startsWith("sessions/s/")))
+})
+
+test("cleanup cannot process a deletion event that was still resolving its owner", { timeout: 5_000 }, async () => {
+  const h = harness(), entered = deferred(), release = deferred()
+  await h.store.archiveRows([user("u1", "must survive an unload")])
+  h.ctx.session.get = async () => { entered.resolve(); await release.promise; return owned(h.state.info) }
+  h.ctx.event.subscribe = () => (async function* () { yield { type: "session.deleted", data: { sessionID: "s" } } })()
+  const cleanup = await setup(h.ctx)
+  await entered.promise
+  const cleaning = cleanup()
+  release.resolve()
+  await cleaning
+  assert.match(await h.store.getRow("u1"), /must survive an unload/)
+  assert.equal(h.storage.values.get("deleted/s"), undefined)
+})
+
+test("global lifecycle events are isolated by directory, workspace and persisted ownership", async () => {
+  const h = harness(), foreign = { directory: "C:/other-project" }
+  assert.equal(await h.controller.acceptsEvent("s", foreign), false)
+  assert.equal(await h.controller.acceptsEvent("s", { ...location, workspaceID: "other-workspace" }), false)
+  assert.equal(await h.controller.acceptsEvent("s", location), true)
+  await createStore(h.storage, "foreign").saveOwner({ projectID: "other", location: foreign, subagent: false })
+  h.ctx.session.get = async () => { throw new Error("session no longer exists") }
+  assert.equal(await h.controller.acceptsEvent("foreign"), false)
+  assert.equal(await h.controller.acceptsEvent("unknown"), false, "missing ownership is never guessed from the plugin location")
+  await h.store.saveOwner({ projectID: "test", location, subagent: false })
+  const reloaded = createController(h.ctx)
+  assert.equal(await reloaded.acceptsEvent("s"), true, "recorded ownership survives the session and plugin instance")
+})
+
+test("graduated notes never cross actual project ownership even when plugin storage is shared", async () => {
+  const a = harness()
+  a.state.handoff.archive = "Title: Project A\nalpha_private_project_needle"
+  await compactRows(a, [user("u1", "source in project A"), running("c1")])
+  await a.controller.onDeleted("s")
+  const b = harness({}, a.storage)
+  b.ctx.location = { directory: "C:/project-b", project: { id: "project-b" } }
+  b.state.info = { ...b.state.info, projectID: "project-b", location: { directory: "C:/project-b" } }
+  b.controller = createController(b.ctx)
+  assert.doesNotMatch(await b.controller.recall("session-b", { query: "alpha_private_project_needle", layer: "full" }), /recall P1/)
+  assert.match(await b.controller.recall("session-b", { id: "P1" }), /No matching/)
+  const same = harness({}, a.storage)
+  assert.match(await same.controller.recall("new-a", { query: "alpha_private_project_needle", layer: "full" }), /recall P1/)
+})
+
+test("warm project-note caches observe another instance's graduation without a checkpoint change", async () => {
+  const h = harness()
+  assert.match(await h.controller.recall("observer", { query: "fresh_graduation_needle", layer: "full" }), /Nothing is archived/)
+  await createProjectStore(h.storage, "test").graduate([{ note: "fresh_graduation_needle", end: Date.now() }], "deleted-writer")
+  assert.match(await h.controller.recall("observer", { query: "fresh_graduation_needle", layer: "full" }), /recall P1/)
+  assert.match(await h.controller.recall("observer", { id: "P1" }), /fresh_graduation_needle/)
+})
+
+test("native fallback facts and standing constraints both reach the next stateless FULL regeneration", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.state.handoff.working.constraints = ["Preserve the exact request."]
+  const first = await compactRows(h, [user("u1", "initial work. Preserve the exact request."), running("c1")])
+  h.state.failGenerate = true
+  h.state.rows = [completed("c1", first), user("u2", "native-only facts next"), running("c2")]
+  await h.controller.onCompaction(event())
+  h.state.failGenerate = false
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  await compactRows(h, [native("c2", "NATIVE_ONLY_FACT: the verified port is 4317"), user("u3", "follow up"), running("c3")])
+  const prompt = h.state.stateless.at(-1).prompt
+  assert.doesNotMatch(prompt, /Patch mode/)
+  assert.match(prompt, /NATIVE_ONLY_FACT: the verified port is 4317/)
+  assert.match(prompt, /Preserve the exact request\./)
+  assert.equal((await h.store.getCheckpoint("c2")).working, undefined)
+  assert.deepEqual((await h.store.getCheckpoint("c3")).working.constraints, ["Preserve the exact request."])
+})
+
+test("selected-model failure plus invalid main fallback exhausts exactly TWO attempts, including patch mode", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "seed"), running("c1")])
+  addCheap(h)
+  await saveModel(h, { mode: "specific", model: cheap })
+  h.state.failStateless = true
+  h.ctx.session.generate = async ({ prompt }) => { h.state.prompts.push(prompt); return { text: "not JSON" } }
+  h.state.rows = [completed("c1", first), user("u2", "later suffix"), running("c2")]
+  const cut = event()
+  await h.controller.onCompaction(cut)
+  assert.equal(cut.result, undefined, "native fallback remains available after the bounded pipeline")
+  assert.equal(h.state.stateless.length, 1)
+  assert.equal(h.state.prompts.length, 2, "one seed plus one main-model fallback, never a third repair")
+  assert.match(h.state.stateless[0].prompt, /Patch mode/)
+  assert.doesNotMatch(h.state.prompts.at(-1), /Patch mode/)
+  assert.match(h.state.prompts.at(-1), /The previous attempt failed:.*request failed/)
+})
+
+test("capacity counts every projected request component even when soft scheduling is disabled", async () => {
+  const oversized = "x".repeat(370_000)
+  const cases = [
+    ["system", (h, request) => { request.system.push({ type: "text", text: oversized }) }],
+    ["tool definitions", (h, request) => { request.tools = { giant: { description: oversized, input: { type: "object" } } } }],
+    ["checkpoint", (h) => { h.state.rows.unshift(native("prior", oversized)) }],
+    ["shell output", (h) => { h.state.rows.push({ id: "shell", type: "shell", command: "build", output: { output: oversized } }) }],
+    ["skill", (h) => { h.state.rows.push({ id: "skill", type: "skill", name: "giant", text: oversized }) }],
+    ["user skill body", (h) => { h.state.rows[0].skills = [{ name: "giant", text: oversized }] }],
+  ]
+  for (const [label, prepare] of cases) {
+    const h = harness({ idle: false, budget: false }), request = event()
+    h.state.rows = [user("u", "some new growth")]
+    prepare(h, request)
+    request.messages = projectHistory(h.state.rows).messages
+    await h.controller.onContext(request)
+    await setImmediate()
+    assert.equal(h.state.compact, 1, label)
+    assert.equal((await h.store.getGateStats()).capacity, 1, label)
+  }
+})
+
+test("inline compaction does not repeat the checkpoint or user snippets already in its session context", async () => {
+  const h = harness()
+  h.state.handoff.working.constraints = []
+  const first = await compactRows(h, [user("u1", "first task"), running("c1")])
+  h.state.handoff.working.state = ["Verified current fact"]
+  await compactRows(h, [completed("c1", first), user("u2", "later task"), running("c2")])
+  const data = generationData(h.state.prompts.at(-1))
+  assert.ok(!("previous" in data), "native generation already sees the rendered canonical checkpoint")
+  assert.ok(!("users" in data), "quote resolution belongs to the validator, not a duplicate user directory")
+})
+
+test("generated host-derived constraints are repaired, never silently promoted into permanent memory", async () => {
+  const h = harness()
+  const constraint = "Use the elevation helper for administrator tasks."
+  h.state.queue = [{ ...h.state.handoff, working: { ...h.state.handoff.working, constraints: [constraint] } }]
+  const result = await compactRows(h, [user("u1", "Review this plugin."), { id: "host", type: "system", text: constraint }, running("c1")])
+  assert.equal(h.state.prompts.length, 2)
+  assert.match(h.state.prompts[1], /previous attempt failed: New standing constraints/)
+  assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [])
+  assert.doesNotMatch(result.summary, /elevation helper/)
+  assert.match(await h.store.getRow("host"), /elevation helper/, "the original evidence is still archived")
+})
+
+test("the first checkpoint recognizes a real question reply without repair or native fallback", async () => {
+  const quote = "don't hesitate to search for insights online whenever useful."
+  for (const stateless of [false, true]) {
+    const h = harness({ idle: false, budget: false })
+    if (stateless) { addCheap(h); await saveModel(h, { mode: "specific", model: cheap }) }
+    h.state.handoff.working.constraints = [quote]
+    const reply = questionRow([[`It seems you're acting in quite a generic way, ${quote}`]], "call_human_reply")
+    reply.content[0].state.content = [{ type: "text", text: `User answered: ${quote}` }]
+    h.state.rows = [user("u1", "Investigate the model-list mismatch."), reply]
+    assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:/)
+    const result = await compactRows(h, [...h.state.rows, running("c1")])
+    assert.equal(result.metadata.nextdcp.author, "compactor")
+    assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [quote])
+    assert.equal(h.state.prompts.length, stateless ? 0 : 1)
+    assert.equal(h.state.stateless.length, stateless ? 1 : 0)
+    assert.equal(h.state.warnings.length, 0)
+    assert.match(await h.store.getRow(reply.id), /metadata.*answers/)
+    assert.ok((await h.controller.recall("s", { id: "call_human_reply" })).includes(quote), "the source call remains recallable")
+    if (stateless) assert.ok(h.state.stateless[0].prompt.includes(quote), "the selected model sees the complete original reply")
+  }
+})
+
+test("main-authored seeds and later retirements share structured human-answer proof at admission and cut", async () => {
+  const h = harness({ idle: false, budget: false })
+  const quote = "don't hesitate to search for insights online whenever useful."
+  h.state.rows = [user("u1", "Investigate the model list."), questionRow([[quote]])]
+  h.state.failGenerate = h.state.failStateless = true
+  const input = edit({ ...h.state.handoff.working, constraints: [quote] })
+  assert.match((await publishCheckpoint(h, input)).output, /^Requested:.*edit staged/)
+  const first = await compactRows(h, [...h.state.rows, running("c1")])
+  assert.equal(first.metadata.nextdcp.author, "main")
+  assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [quote])
+  await h.controller.onCompactionFinished("s")
+  const withdrawal = "You may stop remembering my web-search preference."
+  h.state.rows = [completed("c1", first), questionRow([[withdrawal]], "call_withdrawal")]
+  const next = { ...edit({ constraints: [] }), retire: [{ constraint: quote, quote: withdrawal }] }
+  assert.match((await publishCheckpoint(h, next, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /^Requested:.*edit staged/)
+  const result = await compactRows(h, [...h.state.rows, running("c2")])
+  const saved = await h.store.getCheckpoint("c2")
+  assert.equal(result.metadata.nextdcp.author, "main")
+  assert.deepEqual(saved.working.constraints, [])
+  assert.deepEqual(saved.retiredConstraints, [{ constraint: quote, quote: withdrawal, messageID: "call_withdrawal" }])
+  assert.equal(h.state.prompts.length + h.state.stateless.length, 0)
+})
+
+test("archived and post-boundary question answers cannot authorize new protected constraints", async () => {
+  const quote = "Always ask before publishing."
+  for (const position of ["archived", "future"]) {
+    const h = harness({ idle: false, budget: false }), reply = questionRow([[quote]])
+    const first = await compactRows(h, [user("u1", "First task"), reply, running("c1")])
+    await h.controller.onCompactionFinished("s")
+    h.state.rows = [reply, completed("c1", first), user("u2", "Continue the task.")]
+    assert.match(await h.controller.checkpointNow(edit({ constraints: [quote] }), toolContext), /^Not admitted: New standing constraints/)
+    h.state.queue = [{ ...h.state.handoff, working: { ...h.state.handoff.working, constraints: [quote] } }]
+    const rows = position === "archived" ? [...h.state.rows, running("c2")]
+      : [completed("c1", first), user("u2", "Continue the task."), running("c2"), reply]
+    const result = await compactRows(h, rows)
+    assert.equal(result.metadata.nextdcp.author, "compactor")
+    assert.deepEqual((await h.store.getCheckpoint("c2")).working.constraints, [])
+    assert.equal(h.state.prompts.length, 3, "the second cut must repair the unsupported proposal")
+  }
+})
+
+test("a metadata-only human-answer change selects regeneration, both before admission and at the cut", async () => {
+  for (const timing of ["admission", "cut"]) {
+    const h = harness({ idle: false, budget: false })
+    const reply = questionRow([["Original human preference"]])
+    h.state.rows = [user("u1", "Investigate this issue."), reply]
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    const change = () => { reply.content[0].state.metadata.answers[0][0] = "Changed human preference" }
+    if (timing === "admission") change()
+    const input = edit({ ...h.state.handoff.working, objective: "STALE_QUESTION_EDIT" })
+    const { output } = await publishCheckpoint(h, input, false)
+    assert.match(output, timing === "admission" ? /^Requested:.*Edit not staged:.*evidence changed/ : /^Requested:.*edit staged/)
+    if (timing === "cut") change()
+    const result = await compactRows(h, [...h.state.rows, running("c1")])
+    assert.equal(result.metadata.nextdcp.author, "compactor")
+    assert.doesNotMatch(result.summary, /STALE_QUESTION_EDIT/)
+    assert.equal(h.state.prompts.length, 1)
+  }
+})
+
+test("question-shaped metadata from another tool still fails strict compaction validation", async () => {
+  const h = harness({ idle: false, budget: false }), quote = "Always ask before publishing."
+  const reply = questionRow([[quote]])
+  reply.content[0].name = "read"
+  const invalid = { ...h.state.handoff, working: { ...h.state.handoff.working, constraints: [quote] } }
+  h.state.queue = [invalid, invalid]
+  h.state.rows = [user("u1", "Review this plugin."), reply, running("c1")]
+  const cut = event()
+  await h.controller.onCompaction(cut)
+  assert.equal(cut.result, undefined, "unsupported rules are neither promoted nor silently demoted")
+  assert.equal(await h.store.getCheckpoint("c1"), undefined)
+  assert.equal(h.state.prompts.length, 2)
+  assert.match(await h.storage.get("sessions/s/model/warning"), /New standing constraints.*native OpenCode compaction/)
+})
+
+test("a direct unsupported constraint is rejected before admission, without requesting another model", async () => {
+  const h = harness()
+  h.state.rows = [user("u1", "Review this plugin.")]
+  const input = edit({ ...h.state.handoff.working, constraints: ["Only use immutable releases."] })
+  assert.match((await publishCheckpoint(h, input)).output, /^Not admitted: New standing constraints/)
+  assert.equal(h.state.compact, 0)
+  assert.equal(h.state.prompts.length + h.state.stateless.length, 0)
+})
+
+test("native fallback's protected constraints reach inline generation without copying its summary", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  const constraint = "Always ask before publishing."
+  h.state.handoff.working.constraints = [constraint]
+  const first = await compactRows(h, [user("u1", constraint), running("c1")])
+  h.state.failGenerate = true
+  h.state.rows = [completed("c1", first), user("u2", "later work"), running("c2")]
+  await h.controller.onCompaction(event())
+  h.state.failGenerate = false
+  h.state.handoff.working.constraints = []
+  await compactRows(h, [native("c2", "NATIVE_ONLY_FACT: the verified port is 4317"), running("c3")])
+  const data = generationData(h.state.prompts.at(-1))
+  assert.deepEqual(data.constraints, [constraint])
+  assert.ok(!("previous" in data))
+  assert.doesNotMatch(h.state.prompts.at(-1), /NATIVE_ONLY_FACT/)
+  assert.deepEqual((await h.store.getCheckpoint("c3")).working.constraints, [constraint])
+})
+
+test("a queued relevance hint cannot authorize a new standing constraint", async () => {
+  const h = harness({ idle: 1 })
+  const constraint = "Always ask before publishing."
+  h.state.rows = [user("u1", "finished this task")]
+  await idle(h)
+  await h.controller.onPrompt({ ...prompt(), prompt: { text: constraint, files: [] } })
+  h.state.queue = [{ ...h.state.handoff, working: { ...h.state.handoff.working, constraints: [constraint] } }]
+  const result = await compactRows(h, [user("u1", "finished this task"), running("c1")])
+  assert.equal(h.state.prompts.length, 2, "the queued text is not an admitted user source")
+  assert.doesNotMatch(result.summary, /Always ask before publishing/)
+  assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [])
+})
+
+test("the next build rechecks complete capacity before honoring an already-held round", async () => {
+  const h = harness({ idle: false, budget: 100 })
+  h.storage.values.set("projects/test/thermostat", JSON.stringify({ "provider/model": {
+    version: THERMOSTAT_VERSION, growth: 1, span: 28, cycles: 3, budget: 37_500,
+  } }))
+  h.state.rows = [user("u", "x".repeat(800)), assistant("a", "y".repeat(800))]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate() // Gate telemetry is deliberately non-blocking.
+  assert.equal((await h.store.getGateStats()).spikeHeld, 1)
+  assert.equal(h.state.compact, 0)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages,
+    system: [{ type: "text", text: "new instructions ".repeat(25_000) }] })
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "a prior hold cannot hide later request growth")
+  assert.equal((await h.store.getGateStats()).capacity, 1)
+})
+
+test("capacity reserves explicit output and honors a model's separate input limit", async () => {
+  for (const separateInput of [false, true]) {
+    const h = harness({ idle: false, budget: false })
+    h.state.rows = [assistant("a", "x".repeat(40_000))]
+    if (separateInput) h.state.models[0].limit.input = 9_000
+    await h.controller.onContext({ ...event(), options: separateInput ? {} : { maxTokens: 90_000 }, messages: projectHistory(h.state.rows).messages })
+    await setImmediate()
+    assert.equal(h.state.compact, 1, separateInput ? "input ceiling" : "explicit output reserve")
+  }
+})
+
+test("recent tool errors postpone a soft cut instead of falling through to silent compaction", async () => {
+  const h = harness({ idle: false, budget: 100 })
+  h.state.rows = [user("u", "x".repeat(800)), { id: "a", type: "assistant", time: { created: Date.now() }, content: [
+    { type: "tool", id: "failed-call", name: "read", state: { status: "error", input: { path: "bad" }, error: "still diagnosing" } },
+  ] }]
+  for (let build = 0; build < 2; build++) await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  assert.equal(h.state.compact, 0)
+  assert.equal((await h.store.getGateStats()).gates, 0)
+  h.state.rows.push(assistant("fixed", "the diagnostic is resolved"))
+  await armGate(h)
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1)
+})
+
+test("fresh same-round tool results get working room immediately; pasted or generated text does not", async () => {
+  for (const kind of ["read", "user", "production"]) {
+    const h = wideHarness({ idle: false })
+    h.state.info = { model, time: { busy: 1_000 } }
+    h.state.rows = kind === "read" ? [timed(user("u", "review these files"), 1_000), readStep("read", 880_000, 1_001)]
+      : [timed(kind === "user" ? user("u", "x".repeat(880_000)) : assistant("a", "x".repeat(880_000)), 1_001)]
+    if (kind !== "read") { await armGate(h); continue }
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }, length = request.messages.length
+    await h.controller.onContext(request)
+    await setImmediate()
+    const status = await h.controller.memoryStatus("s")
+    assert.equal(h.state.compact, 0)
+    assert.equal(request.messages.length, length, "the build carrying the read gets no gate or reminder")
+    assert.equal(status.budgetBaseline, 200_000)
+    assert.ok(status.liveAllowance >= 300_000 && status.budget === status.budgetBaseline + status.liveAllowance)
+    assert.match(status.decision.reason, /temporary working room/)
+  }
+})
+
+test("complete-request capacity still wins over fresh-evidence room", async () => {
+  const h = wideHarness({ idle: false })
+  h.state.info = { model, time: { busy: 1_000 } }
+  h.state.rows = [timed(user("u", "read everything"), 1_000), readStep("read", 3_800_000, 1_001)]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1)
+  assert.equal((await h.store.getGateStats()).capacity, 1)
+})
+
+test("fresh evidence cancels a gate it made stale instead of repaying it at round end", async () => {
+  const h = wideHarness({ idle: false })
+  h.state.info = { model, time: { busy: 1_000 } }
+  h.state.rows = [timed(user("u", "x".repeat(840_000)), 1_000)]
+  await armGate(h)
+  h.state.rows.push(readStep("read", 120_000, 1_001))
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  h.controller.onRoundEnded("s")
+  await setImmediate()
+  assert.equal(h.state.compact, 0)
+  assert.deepEqual(await h.store.getGateStats(), { gates: 1, silent: 0, continued: 0, repaid: 0, spikeHeld: 0, checkpoints: 0, capacity: 0 })
+})
+
+test("evidence room ages by assistant steps and ends at a successful turn end, not an interruption", async () => {
+  const aged = wideHarness({ idle: false })
+  aged.state.info = { model, time: { busy: 1_000 } }
+  aged.state.rows = [readStep("read", 880_000, 1_001), ...Array.from({ length: 28 }, (_, index) => timed(assistant(`step-${index}`, "short"), 1_002 + index))]
+  await armGate(aged)
+  const next = wideHarness({ idle: false })
+  next.state.info = { model, time: { busy: 5_000 } }
+  next.state.rows = [readStep("read", 880_000, 1_001), timed({ id: "idle", type: "idle", outcome: "succeeded" }, 1_002), timed(user("u2", "continue"), 5_000)]
+  await armGate(next)
+  const resumed = wideHarness({ idle: false })
+  resumed.state.info = { model, time: { busy: 5_000 } }
+  resumed.state.rows = [readStep("read", 880_000, 1_001), timed({ id: "idle", type: "idle", outcome: "interrupted" }, 1_002), timed(user("u2", "go on"), 5_000)]
+  const request = { ...event(), messages: projectHistory(resumed.state.rows).messages }, length = request.messages.length
+  await resumed.controller.onContext(request)
+  assert.equal(request.messages.length, length, "an interruption or steering continues the same work")
+  assert.match((await resumed.controller.memoryStatus("s")).decision.reason, /temporary working room/)
+})
+
+test("a pause after substantial work suggests one checkpoint; rebuilds replay it, and progress spaces repeats", async () => {
+  const h = wideHarness({ idle: false })
+  h.state.info = { model, time: { busy: 1_000 } }
+  h.state.rows = [timed(user("u", "investigate"), 1_000), readStep("read-1", 240_000, 1_001), conclusionStep("conclude-1", 1_002)]
+  const build = async () => {
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }, length = request.messages.length
+    await h.controller.onContext(request)
+    await setImmediate()
+    return request.messages.length > length ? request.messages.at(-1).content[0].text : undefined
+  }
+  const first = await build()
+  assert.match(first, /^\[Checkpoint opportunity — automated notice, not a user message\]/)
+  assert.match(first, /Paused after ~60k tokens since the last checkpoint/)
+  assert.match(first, /checkpoint_now as the ONLY tool now/)
+  assert.match(first, /Else continue; nothing is queued/)
+  assert.doesNotMatch(first, /safeguard/, "the safeguard is not near")
+  assert.equal((await h.controller.memoryStatus("s")).decision.action, "reminded")
+  assert.equal(await build(), first, "an unanswered identical rebuild replays the same guidance")
+  h.state.rows.push(readStep("small-read", 400, 1_003))
+  assert.equal(await build(), undefined, "work continuing is not another pause")
+  h.state.rows.push(conclusionStep("conclude-2", 1_004))
+  assert.equal(await build(), undefined, "a second pause needs substantial new work")
+  h.state.rows.push(readStep("read-2", 240_000, 1_005), conclusionStep("conclude-3", 1_006))
+  assert.match(await build(), /Paused after ~120k tokens/)
+  assert.equal(h.state.compact, 0, "guidance never queues a cut")
+})
+
+test("reminders wait for unseen results, failures or human input and never rewrite the cached system prefix", async () => {
+  const cases = [
+    ["unseen result", (rows) => rows.push(readStep("fresh", 60_000, 1_002, "c".repeat(400)))],
+    ["failed step", (rows) => rows.push({ ...conclusionStep("failed", 1_002), content: [{ type: "text", text: "c".repeat(400) },
+      { type: "tool", id: "failed-call", name: "bash", state: { status: "error", input: {}, error: "failed" } }] })],
+    ["steering message", (rows) => rows.push(conclusionStep("conclude", 1_002), timed(user("steer", "also handle X"), 1_003))],
+    ["reply to the user", (rows) => rows.push(timed(user("steer", "also handle X"), 1_002), conclusionStep("reply", 1_003))],
+    ["pending question", (rows) => rows.push({ ...conclusionStep("ask", 1_002), content: [{ type: "text", text: "c".repeat(400) },
+      { type: "tool", id: "ask-call", name: "question", state: { status: "completed", input: {}, content: [{ type: "text", text: "answer" }] } }] })],
+    ["system notice", (rows) => rows.push(conclusionStep("conclude", 1_002)), { notice: "system" }],
+  ]
+  for (const [label, prepare, options = {}] of cases) {
+    const h = wideHarness({ idle: false, ...options })
+    h.state.info = { model, time: { busy: 1_000 } }
+    h.state.rows = [timed(user("u", "investigate"), 1_000), readStep("read", 240_000, 1_001)]
+    prepare(h.state.rows)
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }, length = request.messages.length
+    await h.controller.onContext(request)
+    assert.equal(request.messages.length, length, label)
+    assert.equal(request.system.length, 0, label)
+    assert.notEqual((await h.controller.memoryStatus("s")).decision.action, "reminded", label)
+  }
+})
+
+test("a finished round is left to next-prompt scheduling; a mid-round pause names a near safeguard", async () => {
+  const finished = wideHarness({ idle: false })
+  finished.state.info = { model, time: { busy: 5_000 } }
+  finished.state.rows = [timed(user("u1", "review"), 1_000), readStep("read", 640_000, 1_001), timed(assistant("final", "c".repeat(800)), 1_002),
+    timed({ id: "idle", type: "idle", outcome: "succeeded" }, 1_003), timed(user("u2", "next request"), 5_000)]
+  const first = { ...event(), messages: projectHistory(finished.state.rows).messages }, length = first.messages.length
+  await finished.controller.onContext(first)
+  assert.equal(first.messages.length, length, "the user's next prompt steers any due compaction; no extra model step")
+  const h = wideHarness({ idle: false })
+  h.state.info = { model, time: { busy: 1_000 } }
+  h.state.rows = [timed(user("u", "x".repeat(640_000)), 1_000), readStep("read", 80_000, 1_001), conclusionStep("conclude", 1_002)]
+  const request = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(request)
+  const text = request.messages.at(-1).content[0].text
+  assert.match(text, /Paused after ~180k tokens/)
+  assert.match(text, /; overdue safeguard ~230k is near\./)
+  assert.equal(h.state.compact, 0)
+})
+
+test("near safe capacity warns once per checkpoint without queuing a cut", async () => {
+  const h = harness({ idle: false })
+  h.state.info = { model, time: { busy: 1_000 } }
+  h.state.rows = [timed(user("u", "read"), 1_000), readStep("read", 320_000, 1_001)]
+  const build = async () => {
+    const request = { ...event(), messages: projectHistory(h.state.rows).messages }, length = request.messages.length
+    await h.controller.onContext(request)
+    return { text: request.messages.length > length ? request.messages.at(-1).content[0].text : undefined, request }
+  }
+  const { text, request } = await build()
+  assert.match(text, /^\[Checkpoint headroom — automated notice, not a user message\]/)
+  assert.match(text, /Projected input ~80k of ~91k safe tokens/)
+  assert.ok(requestTokens(request) <= 90_784, "the warning itself fits safe capacity")
+  h.state.rows.push(conclusionStep("conclude", 1_002))
+  assert.equal((await build()).text, undefined, "capacity is warned once; a pause right after needs new work too")
+  assert.equal(h.state.compact, 0)
+})
+
+test("baseline learning excludes returned evidence; temporary room handles bulk reads", async (t) => {
+  t.mock.method(console, "warn", () => {})
+  const h = harness()
+  h.state.rows = [user("u0", "warmup")]
+  await h.controller.onContext(event())
+  await compactRows(h, [user("u1", "task"), readStep("read", 800_000, 1), running("c1")])
+  const learned = (await awaitThermostat(h, 1))["provider/model"]
+  assert.equal(learned.cycles, 1)
+  assert.ok(learned.growth < 100, "200k tokens of read output did not become routine growth")
+})
+
+test("old 430k learning reseeds to 200k without any status write, while versioned learning survives reload", async () => {
+  const h = wideHarness({ idle: false })
+  h.storage.values.set("projects/test/thermostat", JSON.stringify({ "provider/model": {
+    growth: 10_000, generated: 500, demand: 0.8, span: 20, cycles: 10, budget: 429_982,
+  } }))
+  h.state.rows = [user("u", "x".repeat(840_000))]
+  const writes = h.storage.writes.length
+  const status = await h.controller.memoryStatus("s")
+  assert.equal(status.budget, 200_000)
+  assert.deepEqual(status.budgetBounds, { floor: 150_000, start: 200_000, ceiling: 300_000 })
+  assert.equal(h.storage.writes.length, writes, "reseed on read does not rewrite project state")
+  await armGate(h)
+  await h.controller.dispose()
+  h.storage.values.set("projects/test/thermostat", JSON.stringify({ "provider/model": {
+    version: THERMOSTAT_VERSION, growth: 10_000, span: 20, cycles: 2, budget: 250_000,
+  } }))
+  const reloaded = createController(h.ctx)
+  try { assert.equal((await reloaded.memoryStatus("s")).budget, 250_000) }
+  finally { await reloaded.dispose() }
+})
+
+test("automatic overdue cuts count the current summary and native tail, not just new growth or old archived rows", async () => {
+  const h = wideHarness({ idle: false })
+  h.state.rows = [user("archived", "old".repeat(400_000)), { ...native("c1", "s".repeat(40_000)), metadata: { recent: "t".repeat(600_000) } },
+    user("new", "x".repeat(180_000))]
+  const request = { ...event(), messages: projectHistory(h.state.rows.slice(1)).messages }
+  await h.controller.onContext(request)
+  const status = await h.controller.memoryStatus("s")
+  assert.equal(status.growth.tokens, 45_000)
+  assert.equal(status.retained, 205_000)
+  assert.equal(status.retained, retainedTokens(h.state.rows))
+  assert.equal(status.decision.action, "gate-open")
+  assert.match(request.messages.at(-1).content[0].text, /Retained conversation ~205000.*adaptive safeguard 200000/)
+})
+
+test("neither learned rate spikes nor recent tool errors postpone an overdue automatic safeguard", async () => {
+  for (const error of [false, true]) {
+    const h = wideHarness({ idle: false })
+    h.storage.values.set("projects/test/thermostat", JSON.stringify({ "provider/model": {
+      version: THERMOSTAT_VERSION, growth: 1, span: 28, cycles: 3, budget: 200_000,
+    } }))
+    h.state.rows = [user("u", "x".repeat(840_000)), { id: "a", type: "assistant", time: { created: Date.now() }, content: [
+      { type: "tool", id: "latest-call", name: "read", state: error
+        ? { status: "error", input: {}, error: "still diagnosing" }
+        : { status: "completed", input: {}, content: [{ type: "text", text: "latest result" }] } },
+    ] }]
+    await armGate(h)
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    await setImmediate()
+    assert.equal(h.state.compact, 1)
+    assert.equal((await h.store.getGateStats()).spikeHeld, 0)
+  }
+})
+
+test("unchanged over-threshold summary/tail and ephemeral reasoning never cause a zero-growth recompact loop", async () => {
+  const h = wideHarness()
+  h.state.rows = [{ ...native("c1", "s".repeat(40_000)), metadata: { recent: "t".repeat(1_200_000) } },
+    { ...assistant("reasoning-only"), content: [{ type: "reasoning", text: "r".repeat(40_000) }] }]
+  for (let build = 0; build < 3; build++) {
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    await h.controller.onIdle("s")
+  }
+  await h.controller.onPrompt(prompt())
+  await setImmediate()
+  const status = await h.controller.memoryStatus("s")
+  assert.equal(status.retained, 310_000)
+  assert.equal(status.growth.tokens, 0)
+  assert.match(status.decision.reason, /No new durable growth/)
+  assert.equal(h.state.compact, 0)
+  assert.equal(await h.store.getDeferredCompaction(), undefined)
+  assert.equal((await h.store.getGateStats()).gates, 0)
+})
+
+test("automatic bounds honor model input limits and the last request's explicit output reserve", async () => {
+  for (const separateInput of [false, true]) {
+    const h = wideHarness({ idle: false })
+    if (separateInput) h.state.models[0].limit.input = 180_000
+    h.state.rows = [user("small", "current work")]
+    await h.controller.onContext({ ...event(), options: separateInput ? {} : { maxTokens: 870_000 }, messages: projectHistory(h.state.rows).messages })
+    const status = await h.controller.memoryStatus("s")
+    assert.equal(status.budget, 178_976)
+    assert.equal(status.budgetBounds.ceiling, status.request.ceiling)
+  }
+})
+
+test("the default idle path shares the live soft threshold instead of imposing an independent 25k cut", async () => {
+  const h = harness()
+  h.state.rows = [assistant("a", "x".repeat(120_000))]
+  await idle(h)
+  assert.equal(await h.store.getDeferredCompaction(), undefined, "30k does not trip the old default idle threshold")
+  h.state.rows.push(assistant("final", "y".repeat(100_000)))
+  await h.controller.onIdle("s")
+  const marker = await h.store.getDeferredCompaction()
+  assert.equal(marker.tokens, 55_000)
+  assert.equal(marker.threshold, 50_000)
+})
+
+test("default idle scheduling includes the native tail and final output, then defers admission until the next prompt", async () => {
+  const h = wideHarness()
+  h.state.rows = [{ ...native("c1", "s".repeat(40_000)), metadata: { recent: "t".repeat(600_000) } }, user("u", "x".repeat(140_000))]
+  await idle(h)
+  assert.equal(await h.store.getDeferredCompaction(), undefined, "195k retained is below the 200k safeguard")
+  h.state.rows.push(assistant("final", "y".repeat(80_000)))
+  await h.controller.onIdle("s")
+  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: "c1", after: "final", tokens: 215_000, threshold: 200_000 })
+  assert.equal(h.state.compact, 0, "idle never requests a summary")
+  await h.controller.dispose()
+  const reloaded = createController(h.ctx)
+  try {
+    await reloaded.onPrompt(prompt())
+    assert.equal(h.state.compact, 1, "the retained-scope marker survives a controller reload")
+  } finally { await reloaded.dispose() }
+})
+
+test("direct row recall forwards native media, not just episode-level recall", async () => {
+  const h = harness()
+  const result = await compactRows(h, [{ ...user("msg_media", "inspect the diagram"), files: [
+    { mime: "image/png", name: "diagram.png", data: "AAAA" },
+  ] }, running("c1")])
+  h.state.rows = [completed("c1", result)]
+  for (const id of ["msg_media", "E1 layer tools"]) {
+    const content = await h.controller.recall("s", { id })
+    assert.ok(Array.isArray(content), id)
+    assert.ok(content.some((part) => part.type === "file" && part.uri === "data:image/png;base64,AAAA" && part.mime === "image/png"), id)
+  }
+})
+
+test("search labels retained branch originals outside the active episode chain", async () => {
+  const h = harness()
+  const first = await compactRows(h, [user("u1", "active work"), { id: "a1", type: "assistant", content: [
+    { type: "tool", id: "active-call", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "active_original_needle" }] } },
+  ] }, running("c1")])
+  await compactRows(h, [completed("c1", first), user("u2", "later reverted"), { id: "a2", type: "assistant", content: [
+    { type: "tool", id: "reverted-call", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "reverted_original_needle" }] } },
+  ] }, { id: "reverted-shell", type: "shell", command: "build", output: { output: "reverted_shell_needle" } }, running("c2")])
+  h.state.rows = [completed("c1", first), user("live", "continue the earlier branch")]
+  assert.doesNotMatch(await h.controller.recall("s", { query: "active_original_needle", layer: "tools" }), /outside the active/)
+  for (const query of ["reverted_original_needle", "reverted_shell_needle"]) {
+    assert.match(await h.controller.recall("s", { query, layer: "tools" }), /outside the active episode chain; may be from a reverted branch/)
+  }
+  assert.match(await h.controller.recall("s", { id: "reverted-call" }), /reverted_original_needle/, "the original remains fetchable")
+  for (const page of [Number.MAX_SAFE_INTEGER + 1, Infinity, NaN]) {
+    assert.match(await h.controller.recall("s", { query: "active", page }), /positive safe integer/)
+  }
 })

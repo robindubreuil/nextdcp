@@ -1,6 +1,6 @@
 import type { ArchivedCall } from "./tokens.ts"
 import type { Result } from "@opencode/plugin/promise/tool"
-import { formatDuration, formatSpan } from "./time.ts"
+import { formatSpan } from "./time.ts"
 import { object } from "./guards.ts"
 
 /** The depth within a chapter (episode) to read or search. `conversation` is the default everywhere. */
@@ -18,28 +18,64 @@ export type SearchDocument = {
   readonly boost?: number
   /** A graduated project note's provenance: carried onto the hit for its label. */
   readonly graduated?: { readonly session: string; readonly end: number }
+  /** Original evidence retained in storage but not covered by the current checkpoint chain. */
+  readonly outsideChain?: boolean
+  /** Active episode provenance for query scoping; originals can serve more than one cut. */
+  readonly episodes?: readonly string[]
   readonly echoes?: readonly (readonly [number, number])[]
 }
 type Location = { readonly id: string; readonly page: number }
-export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly graduated?: { readonly session: string; readonly end: number }; readonly also?: readonly Location[] }
+export type SearchHit = { readonly id: string; readonly page: number; readonly score: number; readonly snippet: string; readonly note?: boolean; readonly graduated?: { readonly session: string; readonly end: number }; readonly outsideChain?: boolean; readonly also?: readonly Location[] }
 export const RECALL_PAGE_CHARS = 6_000
 /** Whole-original recall returns up to five pages in one call; only larger originals page. */
 export const RECALL_ALL_CHARS = 5 * RECALL_PAGE_CHARS
 export const SEARCH_PAGE_HITS = 4
 export const MAX_SEARCH_HITS = 40
-export const SHORT_ID_CHARS = 12
 export type RecallFile = { readonly offset: number; readonly file: { readonly type: "file"; readonly uri: string; readonly mime: string; readonly name?: string } }
 export type RecallContent = NonNullable<Result["content"]>
 type Fragment = { readonly text: string; readonly files?: readonly RecallFile[]; readonly echoes?: readonly (readonly [number, number])[] }
-type Word = { readonly text: string; readonly index: number }
+type Word = { readonly text: string; readonly index: number; readonly end: number }
 
-const words = (text: string): Word[] => Array.from(text.matchAll(/[\p{L}\p{M}\p{N}_]+/gu), (match) => ({
-  text: match[0].normalize("NFKC").toLowerCase(),
-  index: match.index,
-}))
+const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
+// CJK has no reliable whitespace word boundary. Unigrams and overlapping bigrams
+// support ordinary substrings without a dictionary or an unbounded substring scan.
+const words = (text: string): Word[] => Array.from(text.matchAll(/[\p{L}\p{M}\p{N}_]+/gu)).flatMap((match) => {
+  if (!cjk.test(match[0])) return [{ text: match[0].normalize("NFKC").toLowerCase(), index: match.index, end: match.index + match[0].length }]
+  const found: Word[] = [], chars = Array.from(match[0])
+  let index = match.index, latin = "", start = index
+  for (let at = 0; at < chars.length; at++) {
+    const char = chars[at]
+    if (cjk.test(char)) {
+      if (latin) { found.push({ text: latin.normalize("NFKC").toLowerCase(), index: start, end: index }); latin = "" }
+      found.push({ text: char.normalize("NFKC"), index, end: index + char.length })
+      if (chars[at + 1] && cjk.test(chars[at + 1])) found.push({ text: (char + chars[at + 1]).normalize("NFKC"), index, end: index + char.length + chars[at + 1].length })
+    } else { if (!latin) start = index; latin += char }
+    index += char.length
+  }
+  if (latin) found.push({ text: latin.normalize("NFKC").toLowerCase(), index: start, end: index })
+  return found
+})
 const high = (unit: number) => unit >= 0xd800 && unit <= 0xdbff
 const low = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff
 const splitsPair = (text: string, index: number) => index > 0 && index < text.length && high(text.charCodeAt(index - 1)) && low(text.charCodeAt(index))
+
+const normalized = (text: string) => text.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ")
+type Literal = { readonly text: string; readonly terms: readonly string[] }
+const literal = (text: string): Literal => {
+  const parsed = words(text)
+  return { text: parsed.length ? normalized(text.slice(parsed[0].index, parsed.at(-1)!.end)) : "", terms: parsed.map((word) => word.text) }
+}
+/** Use original offsets after Unicode normalization; punctuation in an identifier
+ *  must match too. Never assemble a phrase across an excluded recall echo. */
+function literalMatch(needle: Literal, parsed: readonly Word[], starts: readonly number[], text: string, echoes: readonly (readonly [number, number])[]) {
+  if (!needle.terms.length) return undefined
+  for (const at of starts) {
+    if (at + needle.terms.length > parsed.length || !needle.terms.every((term, offset) => parsed[at + offset].text === term)) continue
+    const index = parsed[at].index, end = parsed[at + needle.terms.length - 1].end
+    if (!echoes.some(([from, to]) => from < end && to > index) && normalized(text.slice(index, end)) === needle.text) return { index, end }
+  }
+  return undefined
+}
 
 function snippet(text: string, index: number): string {
   let start = Math.max(0, index - 160)
@@ -64,13 +100,18 @@ function snippet(text: string, index: number): string {
 export function search(query: string, documents: readonly SearchDocument[], limit = 10, layer: Layer = "full"): SearchHit[] {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Search limit must be a positive integer")
   const terms = [...new Set(words(query).map((word) => word.text))]
+  const quoted = [...query.matchAll(/"([^"]+)"|“([^”]+)”/gu)].map((match) => match[1] ?? match[2])
+  const phrases = (quoted.length ? quoted : [query]).map(literal).filter((needle) => needle.terms.length > 1)
+  const identifiers = [...new Set([...query.matchAll(/[\p{L}\p{M}\p{N}_]+(?:[./\\:#-][\p{L}\p{M}\p{N}_]+)*/gu)]
+    .map((match) => match[0]).filter((word) => /[_./\\:#-]|\p{N}|[a-z][A-Z]/u.test(word)))].map(literal)
+  const literalStarts = new Set([...phrases, ...identifiers].flatMap((needle) => needle.terms.slice(0, 1)))
   const homes = documents.filter((document) => layer === "full" ? true : document.layer === layer && !document.note)
   if (!terms.length || !homes.length) return []
   const termSet = new Set(terms)
   const corpus = homes.flatMap((document) => {
     const bounds = pageBounds(document.text, RECALL_PAGE_CHARS)
     const pages = bounds.slice(1).map((_, index) => ({ id: document.id, page: index + 1, text: document.text,
-      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note, boost: document.boost ?? 1, graduated: document.graduated }))
+      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note, boost: document.boost ?? 1, graduated: document.graduated, outsideChain: document.outsideChain, echoes: document.echoes ?? [] }))
     let page = 0
     const echoes = document.echoes ?? []
     let echo = 0
@@ -90,9 +131,11 @@ export function search(query: string, documents: readonly SearchDocument[], limi
     const count = corpus.filter((item) => item.counts.has(term)).length
     return [term, Math.log(1 + (corpus.length - count + 0.5) / (count + 0.5))]
   }))
+  const totalWeight = [...weights.values()].reduce((sum, value) => sum + value, 0)
+  const idealSpan = terms.reduce((sum, term) => sum + term.length + 1, 0)
   const k = 1.2, b = 0.75
   type Draft = { readonly hit: SearchHit; readonly core: string; readonly size: number }
-  const drafts = corpus.flatMap(({ id, page, text, parsed, counts, note, boost, graduated }): Draft[] => {
+  const drafts = corpus.flatMap(({ id, page, text, parsed, counts, note, boost, graduated, outsideChain, echoes }): Draft[] => {
     let score = 0
     for (const term of terms) {
       const count = counts.get(term) ?? 0
@@ -122,12 +165,28 @@ export function search(query: string, documents: readonly SearchDocument[], limi
       }
       const width = word.index - matches[left].index
       if (coverage > best + 1e-10 || (Math.abs(coverage - best) < 1e-10 && width < span)) {
-        best = coverage; index = matches[left].index; end = word.index + word.text.length; span = width
+        best = coverage; index = matches[left].index; end = word.end; span = width
       }
     }
+    const starts = new Map<string, number[]>()
+    for (let at = 0; at < parsed.length; at++) if (literalStarts.has(parsed[at].text)) {
+      const positions = starts.get(parsed[at].text)
+      if (positions) positions.push(at)
+      else starts.set(parsed[at].text, [at])
+    }
+    const locate = (needle: Literal) => literalMatch(needle, parsed, starts.get(needle.terms[0]) ?? [], text, echoes) ?? []
+    const phraseMatches = phrases.flatMap(locate), identifierMatches = identifiers.flatMap(locate)
+    // Keep lexical recall (no new hard filter), but repeated generic words must not
+    // overwhelm complete, compact evidence or an exact path/symbol/error identifier.
+    score *= 0.25 + 0.75 * (best / totalWeight) ** 2
+    if (terms.length > 1) score *= 1 + 0.5 * Math.min(1, idealSpan / Math.max(idealSpan, end - index))
+    score *= 1 + (phrases.length ? 2 * phraseMatches.length / phrases.length : 0)
+    score *= 1 + (identifiers.length ? 4 * (identifierMatches.length / identifiers.length) ** 2 : 0)
+    const preferred = phraseMatches[0] ?? identifierMatches[0]
+    if (preferred) { index = preferred.index; end = preferred.end }
     // The matched core is what identifies the evidence; its surroundings differ per transcript.
     const core = words(text.slice(index, end)).map((word) => word.text)
-    return [{ hit: { id, page, score: score * boost, snippet: snippet(text, index), ...(note ? { note: true } : {}), ...(graduated ? { graduated } : {}) }, core: core.join(" "), size: core.length }]
+    return [{ hit: { id, page, score: score * boost, snippet: snippet(text, index), ...(note ? { note: true } : {}), ...(graduated ? { graduated } : {}), ...(outsideChain ? { outsideChain: true } : {}) }, core: core.join(" "), size: core.length }]
   })
   drafts.sort((a, b) => b.hit.score - a.hit.score || (a.hit.id < b.hit.id ? -1 : a.hit.id > b.hit.id ? 1 : a.hit.page - b.hit.page))
   // Repeated reads of one region come back as near-identical excerpts across episodes. Collapse
@@ -135,7 +194,7 @@ export function search(query: string, documents: readonly SearchDocument[], limi
   // distinct evidence. A short core is not distinctive enough to merge distinct snippets.
   const kept: (Draft & { also: Location[] })[] = []
   for (const draft of drafts) {
-    const twin = kept.find((other) => draft.hit.note === other.hit.note &&
+    const twin = kept.find((other) => draft.hit.note === other.hit.note && draft.hit.outsideChain === other.hit.outsideChain &&
       (draft.hit.snippet === other.hit.snippet || (draft.size >= 8 && draft.core === other.core)))
     if (twin) twin.also.push({ id: draft.hit.id, page: draft.hit.page })
     else kept.push({ ...draft, also: [] })
@@ -156,7 +215,7 @@ function pageBounds(text: string, pageChars: number): number[] {
 
 /** Paginate without splitting UTF-16 surrogate pairs; joining all pages reconstructs the original. */
 export function paginate(text: string, page = 1, pageChars = RECALL_PAGE_CHARS): { content: string; page: number; pages: number; nextPage?: number } {
-  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageChars) || pageChars < 2) throw new RangeError("Invalid page or page size")
+  if (!Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(pageChars) || pageChars < 2) throw new RangeError("Invalid page or page size")
   const bounds = pageBounds(text, pageChars)
   const pages = bounds.length - 1
   if (page > pages) throw new RangeError(`Page must be between 1 and ${pages}`)
@@ -355,18 +414,18 @@ export function formatTranscript(id: string, rows: readonly { readonly id: strin
     inline attachments); dialogue itself stays in the episode conversation home.
     A row that cannot be parsed or rendered degrades to the transcript's gap
     marker, the same way episodes disclose unreadable rows. */
-export function formatRow(raw: string, resolve?: Resolve): string {
+export function formatRow(raw: string, resolve?: Resolve, files: RecallFile[] = [], echoes: [number, number][] = []): string {
   try {
-    return transcriptRow(JSON.parse(raw), "tools", resolve, [], [])
+    return transcriptRow(JSON.parse(raw), "tools", resolve, files, echoes)
   } catch {
     return "[Invalid archived row; recall gap]"
   }
 }
 
-/** Render one graduated project note as its own fetchable original: the note is all
- *  that outlived the session, with its provenance as the header. */
-export function formatGraduated(note: { readonly id: string; readonly note: string; readonly session: string; readonly end: number }, now = Date.now()): string {
-  return `Graduated session note ${note.id} (from session ${shortId(note.session)}, ${formatDuration(Math.max(0, now - note.end))} ago)\n${note.note}`
+/** Search and fetch page this exact, immutable original. Relative age belongs on
+ *  the search-result label, never inside the paginated provenance or note bytes. */
+export function formatGraduated(note: { readonly id: string; readonly note: string; readonly session: string }): string {
+  return `Graduated session note ${note.id} (from session ${shortId(note.session)})\n${note.note}`
 }
 
 export type CatalogEntry = { readonly id: string; readonly title?: string; readonly start?: number; readonly end?: number; readonly note: string }
@@ -385,10 +444,13 @@ export function formatCatalogEntry(entry: CatalogEntry): string {
  *  cycles or reverted branches — explain themselves instead of reading as corruption.
  *  Bounded by sanity: a range dwarfing the entry count says non-sequential ids, not gaps. */
 const gapLine = (entries: readonly CatalogEntry[]): string | undefined => {
-  const ids = entries.map((entry) => Number(entry.id.slice(1))).filter((id) => Number.isInteger(id) && id > 0)
+  const ids = entries.map((entry) => /^E\d+$/.test(entry.id) ? Number(entry.id.slice(1)) : NaN).filter((id) => Number.isSafeInteger(id) && id > 0)
   if (ids.length < 2 || ids.length < entries.length) return undefined
+  const low = ids.reduce((min, id) => Math.min(min, id), Infinity), high = ids.reduce((max, id) => Math.max(max, id), 0)
+  const range = high - low + 1
+  if (!Number.isSafeInteger(range) || range > ids.length * 2 || range > 10_000) return undefined
   const present = new Set(ids)
-  const missing = Array.from({ length: Math.max(...ids) - Math.min(...ids) + 1 }, (_, offset) => Math.min(...ids) + offset)
+  const missing = Array.from({ length: range }, (_, offset) => low + offset)
     .filter((id) => !present.has(id))
   if (!missing.length || missing.length > ids.length) return undefined
   return `${missing.map((id) => `E${id}`).join(", ")} — allocated but never committed (failed cycles before reservations, or reverted branches)`
@@ -406,9 +468,9 @@ export function formatCatalog(entries: readonly CatalogEntry[], view: "compact" 
     .join(view === "all" ? "\n\n" : "\n")
 }
 
-/** A rendered ID is its unique 12-character prefix; recall resolves any unambiguous prefix. */
+/** Full opaque IDs are always unambiguous. Prefixes remain accepted as user input. */
 export function shortId(id: string): string {
-  return id.length <= SHORT_ID_CHARS ? id : id.slice(0, SHORT_ID_CHARS)
+  return id
 }
 
 /** The lean, copy-paste-runnable target the system renders everywhere: `E57 layer tools page 2`. */
@@ -436,7 +498,7 @@ export function parseTarget(input: string): ParsedTarget {
     for (let i = 1; i < tokens.length; i++) {
       const key = tokens[i], value = tokens[i + 1]
       if (key === "page" && value !== undefined && /^\d+$/.test(value)) {
-        if (Number(value) < 1) return { kind: "error", message: "Page must be a positive integer." }
+        if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) return { kind: "error", message: "Page must be a positive safe integer." }
         page = Number(value)
         i++
       }
@@ -452,7 +514,7 @@ export function parseTarget(input: string): ParsedTarget {
     const key = tokens[i], value = tokens[i + 1]
     if (key === "layer" && value !== undefined && (LAYERS as readonly string[]).includes(value)) { layer = value as Layer; i++ }
     else if (key === "page" && value !== undefined && /^\d+$/.test(value)) {
-      if (Number(value) < 1) return { kind: "error", message: "Page must be a positive integer." }
+      if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) return { kind: "error", message: "Page must be a positive safe integer." }
       page = Number(value)
       i++
     }
@@ -494,7 +556,7 @@ export function recallPage(base: string, text: string, page?: number, files: rea
     const whole = `${label}\n${text.slice(0, end)}`
     return attached.length ? [{ type: "text", text: whole }, ...attached] : whole
   }
-  if (!Number.isInteger(page) || page < 1) throw new RangeError("Invalid page")
+  if (!Number.isSafeInteger(page) || page < 1) throw new RangeError("Invalid page")
   if (page > pages) return `recall ${base} page ${page} is out of range: this original has ${pages} page${pages === 1 ? "" : "s"}; the last page is ${pages}.`
   const attached = attach(bounds[page - 1], bounds[page])
   const result = paginate(text, page)

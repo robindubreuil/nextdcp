@@ -3,6 +3,18 @@ import test from "node:test"
 import { address, formatCall, formatCatalog, formatCatalogEntry, formatGraduated, formatRow, formatTranscript, LAYERS, paginate, parseTarget, recallPage, resolveHandle, search, shortId, TAG_INPUT_CHARS, RECALL_ALL_CHARS, RECALL_PAGE_CHARS } from "../src/recall.ts"
 import { formatSpan, recencyBoost } from "../src/time.ts"
 
+test("graduated originals have stable provenance bytes and search pages fetch the matching text", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000 })
+  const note = { id: "P1", session: "ses_origin", end: 1_000, note: `${"filler ".repeat(855)} pageboundaryneedle ${"tail ".repeat(1_500)}` }
+  const text = formatGraduated(note)
+  const [hit] = search("pageboundaryneedle", [{ id: note.id, text }])
+  assert.ok(hit)
+  assert.match(paginate(text, hit.page).content, /pageboundaryneedle/)
+  t.mock.timers.tick(86_400_000)
+  assert.equal(formatGraduated(note), text, "relative age must not move any paginated content")
+  assert.match(text, /Graduated session note P1 \(from session ses_origin\)/)
+})
+
 test("BM25 ranks matching archive and live documents and breaks ties deterministically", () => {
   const documents = [
     { id: "E2", text: "banana grape" },
@@ -471,8 +483,8 @@ test("parseTarget reads every rendered address and rejects what it cannot mean",
   assert.match(parseTarget("call_01HZ2a3 layer tools").message, /layer applies only to an episode/)
   assert.match(parseTarget("E57 sideways 2").message, /Cannot parse target near "sideways"/)
   assert.match(parseTarget("").message, /Provide a target/)
-  assert.match(parseTarget("E57 page 0").message, /Page must be a positive integer/, "a zero page in an address is a client error, not a failure")
-  assert.match(parseTarget("catalog E7 page 0").message, /Page must be a positive integer/)
+  assert.match(parseTarget("E57 page 0").message, /Page must be a positive safe integer/, "a zero page in an address is a client error, not a failure")
+  assert.match(parseTarget("catalog E7 page 0").message, /Page must be a positive safe integer/)
   assert.match(parseTarget(`E57 ${"q".repeat(300)}`).message, new RegExp(`near "${"q".repeat(120)}…`), "a pathological token is clipped, not echoed")
 })
 
@@ -494,7 +506,7 @@ test("address renders the lean copy-paste target and layers fill only what the a
   assert.equal(address("E57", 2, "conversation"), "E57 page 2", "the default layer is never spelled out")
   assert.equal(address("E57", undefined, "full"), "E57 layer full")
   assert.equal(address("E57", 2, "tools"), "E57 layer tools page 2")
-  assert.equal(address("call_01HZ2a3bcdef456"), "call_01HZ2a3", "rendered ids are unique 12-character prefixes")
+  assert.equal(address("call_01HZ2a3bcdef456"), "call_01HZ2a3bcdef456", "rendered opaque ids are complete, never colliding fixed-length prefixes")
   const parsed = parseTarget(address("E57", 2, "tools"))
   assert.deepEqual(parsed, { kind: "episode", handle: "E57", layer: "tools", page: 2 })
   const opaque = parseTarget(address("call_01HZ2a3bcdef456", 3))
@@ -556,16 +568,123 @@ test("a document's boost re-ranks equal matches but never rescues a zero match, 
   assert.deepEqual(search("absent", [{ id: "E3", text: "needle", boost: 100 }]), [], "boost cannot create a match")
 })
 
-test("recencyBoost decays linearly to zero over thirty days", () => {
+test("recencyBoost gives fresh notes a small advantage without erasing old relevance", () => {
   const now = Date.now(), day = 24 * 60 * 60 * 1_000
   assert.equal(recencyBoost(now, now), 1)
-  assert.equal(recencyBoost(now - 15 * day, now), 0.5)
-  assert.equal(recencyBoost(now - 30 * day, now), 0)
-  assert.equal(recencyBoost(now - 40 * day, now), 0, "stale notes never go negative")
+  assert.ok(Math.abs(recencyBoost(now - 15 * day, now) - 0.95) < 1e-12)
+  assert.equal(recencyBoost(now - 30 * day, now), 0.9)
+  assert.equal(recencyBoost(now - 40 * day, now), 0.9, "old notes keep a positive floor")
   assert.equal(recencyBoost(now + day, now), 1, "a future end clamps to one")
 })
 
 test("formatGraduated renders the provenance header and the whole note text", () => {
-  const rendered = formatGraduated({ id: "P7", note: "First\nWork: rotated the secret", session: "ses_0123456789abcdef", end: 1_000 }, 61_000)
-  assert.equal(rendered, "Graduated session note P7 (from session ses_01234567, 1m ago)\nFirst\nWork: rotated the secret")
+  const rendered = formatGraduated({ id: "P7", note: "First\nWork: rotated the secret", session: "ses_0123456789abcdef" })
+  assert.equal(rendered, "Graduated session note P7 (from session ses_0123456789abcdef)\nFirst\nWork: rotated the secret")
+})
+
+test("rendered opaque IDs and ambiguity candidates remain distinct after their first twelve characters", () => {
+  const ids = ["msg_019abcde0000000000000001", "msg_019abcde0000000000000002"]
+  assert.notEqual(address(ids[0]), address(ids[1]))
+  const ambiguity = resolveHandle(ids[0].slice(0, 12), ids).error
+  for (const id of ids) {
+    assert.ok(ambiguity.includes(id))
+    assert.deepEqual(resolveHandle(parseTarget(address(id, 2)).handle, ids), { id })
+  }
+})
+
+test("ordinary CJK substrings and mixed identifiers are searchable without whitespace", () => {
+  const documents = [
+    { id: "E1", text: "認証設定を修正しました。src/auth.tsのOAuth設定も確認。" },
+    { id: "E2", text: "데이터베이스연결설정을수정했습니다" },
+    { id: "E3", text: "更新数据库连接设置，确认认证流程。𠀀𠀁𠀂" },
+  ]
+  for (const [query, id] of [["設定", "E1"], ["OAuth", "E1"], ["연결설정", "E2"], ["连接设置", "E3"], ["𠀁𠀂", "E3"]]) {
+    const hits = search(query, documents)
+    assert.equal(hits[0].id, id, query)
+    assert.ok(hits[0].snippet.isWellFormed(), query)
+  }
+})
+
+test("unsafe page integers and huge sparse catalog ranges are rejected before allocation", () => {
+  for (const page of ["9007199254740992", "9".repeat(400)]) {
+    assert.match(parseTarget(`E1 page ${page}`).message, /positive safe integer/)
+    assert.match(parseTarget(`catalog page ${page}`).message, /positive safe integer/)
+  }
+  for (const page of [NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 1.5, 0, -1]) {
+    assert.throws(() => paginate("text", page), /Invalid/)
+    assert.throws(() => recallPage("E1", "text", page), /Invalid/)
+  }
+  const rendered = formatCatalog([{ id: "E1", note: "one" }, { id: `E${Number.MAX_SAFE_INTEGER}`, note: "far away" }])
+  assert.doesNotMatch(rendered, /Missing ids/)
+  assert.ok(rendered.length < 500)
+})
+
+test("old-note ranking still follows relevance rather than ID order after thirty days", () => {
+  const now = 100 * 86_400_000
+  const documents = [
+    { id: "P1", text: "unrelated background needle", boost: recencyBoost(1, now) },
+    { id: "P99", text: "needle needle exact_error", boost: recencyBoost(1, now) },
+  ]
+  const hits = search("needle exact_error", documents)
+  assert.equal(hits[0].id, "P99")
+  assert.ok(hits.every((hit) => hit.score > 0))
+})
+
+test("an exact phrase outranks frequent generic words without hiding broader lexical matches", () => {
+  const documents = [
+    { id: "bag", text: "session this in very ".repeat(80) },
+    { id: "phrase", text: "The user said: In this very session, verify the release." },
+    { id: "partial", text: "this session has a different purpose" },
+  ]
+  for (const query of ["In this very session", '"In this very session"']) {
+    const hits = search(query, documents)
+    assert.equal(hits[0].id, "phrase", query)
+    assert.ok(hits.some((hit) => hit.id === "bag"), "ranking preference is not a silent hard filter")
+    assert.ok(hits.some((hit) => hit.id === "partial"))
+  }
+})
+
+test("compact query coverage outranks scattered equal-frequency words", () => {
+  const filler = "neutral ".repeat(70)
+  const hits = search("capacity gate reserve", [
+    { id: "scattered", text: `capacity ${filler}gate ${filler}reserve` },
+    { id: "near", text: `capacity has a gate with reserve ${filler}${filler}` },
+  ])
+  assert.equal(hits[0].id, "near")
+  assert.ok(hits[0].score > hits[1].score)
+})
+
+test("exact structured identifiers prefer punctuation and whole tokens, not component bags or suffixes", () => {
+  const hits = search("src/auth.ts ERROR_401 requestCompact", [
+    { id: "components", text: "src auth ts ERROR_401 requestCompact ".repeat(50) },
+    { id: "suffix", text: "src/auth.tsx ERROR_4019 requestCompactLater" },
+    { id: "exact", text: "Fixed src/auth.ts after ERROR_401 in requestCompact." },
+  ])
+  assert.equal(hits[0].id, "exact")
+  assert.ok(hits.some((hit) => hit.id === "components"), "component keywords still recall potentially useful evidence")
+  assert.deepEqual(search("ERROR_401", [{ id: "suffix", text: "ERROR_4019" }]), [], "whole identifiers never become substring matches")
+  const path = search("src/auth.ts", [{ id: "spaces", text: "src auth ts" }, { id: "path", text: "src/auth.ts" }])
+  assert.equal(path[0].id, "path")
+})
+
+test("quoted subphrases and normalized Unicode identifiers retain original snippet offsets", () => {
+  const exact = `😀 ${"padding ".repeat(120)}A CAFE\u0301\nreport in src/cafe\u0301.ts fixes the ceiling.`
+  const documents = [
+    { id: "reordered", text: "report café ceiling src café ts ".repeat(40) },
+    { id: "exact", text: exact },
+  ]
+  const [hit] = search('ceiling "café report" src/café.ts', documents)
+  assert.equal(hit.id, "exact")
+  assert.match(hit.snippet, /CAFE\u0301 report/)
+  assert.ok(hit.snippet.isWellFormed())
+  assert.ok(paginate(exact, hit.page).content.includes("src/cafe\u0301.ts"))
+})
+
+test("phrase preference never bridges a recall echo and centers a genuine later phrase", () => {
+  const echoed = "budget gate reserve ".repeat(40)
+  const text = `budget ${echoed}gate reserve\n${"plain ".repeat(170)}budget gate reserve is the genuine conclusion`
+  const [hit] = search('"budget gate reserve"', [{ id: "E1", text, echoes: [[7, 7 + echoed.length]] }])
+  assert.match(hit.snippet, /genuine conclusion/)
+  assert.doesNotMatch(hit.snippet, /budget gate reserve budget gate reserve/)
+  assert.deepEqual(search('"budget gate reserve"', [{ id: "echo", text: echoed, echoes: [[0, echoed.length]] }]), [])
 })

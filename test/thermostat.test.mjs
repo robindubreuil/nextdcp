@@ -1,82 +1,85 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { budgetBounds, closeCycle, effectiveBudget, L_MIN, L_TARGET, overWindow, THERMOSTAT_CEILING, THERMOSTAT_FLOOR, thermostatModels } from "../src/thermostat.ts"
+import { budgetBounds, closeCycle, effectiveBudget, L_MIN, L_TARGET, shortCycles, THERMOSTAT_VERSION, thermostatModels } from "../src/thermostat.ts"
 import { createProjectStore } from "../src/store.ts"
 
-// The pure law first: the growth and span EMAs fold at half weight, the budget
-// takes at most one proportional step per completed cycle unless physics forces
-// it, and every value stays inside the window's bounds.
+const WIDE = budgetBounds(1_050_000, 128_000, 922_000), NARROW = budgetBounds(100_000)
+const entry = (extra = {}) => ({ version: THERMOSTAT_VERSION, growth: 2_500, span: 20, cycles: 1, budget: 160_000, ...extra })
 
-const WIDE = budgetBounds(400_000, 100_000) // start 100k, ceiling 150k, floor 30k
-const NARROW = budgetBounds(100_000, 100_000) // start 50k, ceiling 50k, floor 30k
-
-test("bounds start at the static default, cap at min(half the window, the context-rot ceiling), floor at 30k", () => {
-  assert.deepEqual(budgetBounds(100_000, 100_000), { floor: 30_000, start: 50_000, ceiling: 50_000 })
-  assert.deepEqual(budgetBounds(400_000, 100_000), { floor: THERMOSTAT_FLOOR, start: 100_000, ceiling: THERMOSTAT_CEILING })
-  assert.deepEqual(budgetBounds(1_000_000, 100_000), { floor: THERMOSTAT_FLOOR, start: 100_000, ceiling: THERMOSTAT_CEILING }, "a huge window earns no more than the context-rot ceiling")
-  assert.deepEqual(budgetBounds(40_000, 100_000), { floor: 20_000, start: 20_000, ceiling: 20_000 }, "a small window's own default is its floor")
+test("the overdue safeguard starts at 200k within bounded policy, scaling down for smaller windows", () => {
+  assert.deepEqual(WIDE, { floor: 150_000, start: 200_000, ceiling: 300_000 })
+  assert.deepEqual(NARROW, { floor: 37_500, start: 50_000, ceiling: 75_000 })
+  assert.deepEqual(budgetBounds(400_000), WIDE)
+  assert.deepEqual(budgetBounds(40_000), { floor: 15_000, start: 20_000, ceiling: 30_000 })
+  assert.deepEqual(budgetBounds(8_000, 8_000), { floor: 1, start: 1, ceiling: 1 }, "never a negative bound")
+  assert.deepEqual(budgetBounds(1_000_000, 128_000, 180_000), { floor: 134_232, start: 178_976, ceiling: 178_976 }, "a separate input limit clamps the policy too")
+  assert.equal(budgetBounds(100_001).ceiling, 75_000, "fractional half-window arithmetic cannot round above a bound")
 })
 
-test("the effective budget is the default until a learned entry exists, then clamped", () => {
-  assert.equal(effectiveBudget(undefined, WIDE), 100_000)
-  assert.equal(effectiveBudget({ growth: 2_500, span: 20, cycles: 5, budget: 140_000 }, WIDE), 140_000)
-  assert.equal(effectiveBudget({ growth: 3, span: 20, cycles: 9, budget: 900_000 }, WIDE), 150_000, "never above the context-rot ceiling, let alone half the window")
-  assert.equal(effectiveBudget({ growth: 0, span: 20, cycles: 9, budget: 1_000 }, WIDE), 30_000)
+test("the effective safeguard defaults, then clamps learned state to policy/capacity bounds", () => {
+  assert.equal(effectiveBudget(undefined, WIDE), 200_000)
+  assert.equal(effectiveBudget(entry({ budget: 240_000 }), WIDE), 240_000)
+  assert.equal(effectiveBudget(entry({ budget: 900_000 }), WIDE), WIDE.ceiling)
+  assert.equal(effectiveBudget(entry({ budget: 1_000 }), WIDE), WIDE.floor)
 })
 
-test("the first cycle measures growth and span; later cycles fold both at half weight", () => {
-  assert.deepEqual(closeCycle(undefined, 50_000, 20, WIDE), { growth: 2_500, span: 20, cycles: 1, budget: 80_000 })
-  assert.deepEqual(closeCycle({ growth: 2_500, span: 20, cycles: 1, budget: 80_000 }, 225_000, 30, WIDE),
-    { growth: 5_000, span: 25, cycles: 2, budget: 96_000 }, "growth 2500·0.5+7500·0.5, span 20·0.5+30·0.5, budget one step toward 140k")
+test("cycle EMAs fold durable rate and observed span, not an evidence-demand allowance", () => {
+  const first = closeCycle(undefined, 50_000, 20, WIDE, 0)
+  assert.deepEqual(first, entry())
+  const next = closeCycle(first, 225_000, 30, WIDE, 0)
+  assert.deepEqual(next, entry({ growth: 5_000, span: 25, cycles: 2, budget: 150_000 }))
 })
 
-test("a sustained rate settles at growth times the turn-space setpoint", () => {
-  let entry
-  for (let cycle = 1; cycle <= 3; cycle++) entry = closeCycle(entry, 5_000 * 28, 28, WIDE)
-  assert.deepEqual(entry, { growth: 5_000, span: 28, cycles: 3, budget: 140_000 }, `${5_000}·${L_TARGET} exactly`)
+test("the rate target includes the retained starting summary/tail but cannot prescribe a low routine cadence", () => {
+  let state
+  for (let cycle = 1; cycle <= 3; cycle++) state = closeCycle(state, 5_000 * 28, 28, WIDE, 80_000)
+  assert.equal(state.budget, 80_000 + 5_000 * L_TARGET)
   let small
-  for (let cycle = 1; cycle <= 4; cycle++) small = closeCycle(small, 120 * 30, 30, WIDE)
-  assert.equal(small.budget, 80_000 * 0.8 * 0.8 * 0.8, "a cheap transcript lowers the budget one step per cycle, toward the floor")
+  for (let cycle = 1; cycle <= 12; cycle++) small = closeCycle(small, 3_000, 30, WIDE, 0)
+  assert.equal(small.budget, 150_000)
 })
 
-test("the budget moves at most one rate-limited step per cycle — except physics", () => {
-  const at = { growth: 5_000, span: 28, cycles: 5, budget: 100_000 }
-  assert.equal(closeCycle(at, 140_000, 28, WIDE).budget, 120_000, "one +20% step toward the setpoint")
-  assert.equal(closeCycle(at, 1_400_000, 28, WIDE).budget, 150_000,
-    `a freak cycle half-folds growth yet pushes to the ceiling: below growth·${L_MIN} the budget would cut more often than physics allows`)
-  assert.equal(closeCycle({ growth: 100, span: 30, cycles: 5, budget: 100_000 }, 3_000, 30, WIDE).budget, 80_000, "one −20% step")
-  let cheap = { growth: 100, span: 30, cycles: 9, budget: 100_000 }
-  for (let cycle = 0; cycle < 12; cycle++) cheap = closeCycle(cheap, 3_000, 30, WIDE)
-  assert.equal(cheap.budget, 30_000, "the floor holds")
-  assert.equal(closeCycle({ growth: 5_000, span: 28, cycles: 9, budget: 50_000 }, 140_000, 28, NARROW).budget, 50_000, "a raise on a narrow window clamps to its ceiling")
+test("each adjustment allows at most 50% growth or 20% reduction, with immediate capacity clamps", () => {
+  assert.equal(closeCycle(entry({ budget: 160_000 }), 1_400_000, 28, WIDE, 0).budget, 240_000)
+  assert.equal(closeCycle(entry({ budget: 200_000 }), 1_400_000, 28, WIDE, 0).budget, 300_000)
+  assert.equal(closeCycle(entry({ budget: 200_000 }), 3_000, 30, WIDE, 0).budget, 160_000)
+  assert.equal(closeCycle(entry({ budget: 300_000 }), 140_000, 28, NARROW, 0).budget, NARROW.ceiling, "a smaller live model can force an immediate clamp")
+  assert.equal(closeCycle(entry({ budget: 160_001 }), 1_400_000, 28, WIDE, 0).budget, 240_001, "integer rounding cannot exceed +50%")
+  assert.equal(closeCycle(entry({ budget: 200_001 }), 0, 30, WIDE, 0).budget, 160_001, "integer rounding cannot exceed a 20% reduction")
 })
 
-test("invalid cycle measurements fail loudly", () => {
-  assert.throws(() => closeCycle(undefined, -1, 10, WIDE), /Invalid cycle token count/)
-  assert.throws(() => closeCycle(undefined, Number.NaN, 10, WIDE), /Invalid cycle token count/)
-  assert.throws(() => closeCycle(undefined, 1_000, 0, WIDE), /Invalid cycle turn count/)
-  assert.throws(() => closeCycle(undefined, 1_000, 1.5, WIDE), /Invalid cycle turn count/)
+test("bulk evidence and huge retained baselines cannot lift learning toward the full model window", () => {
+  let state
+  for (let cycle = 0; cycle < 12; cycle++) {
+    state = closeCycle(state, 2_000_000, 20, WIDE, 1_000_000)
+    assert.ok(state.budget <= 300_000)
+  }
+  assert.equal(state.budget, 300_000)
+  assert.ok(state.budget < 920_976 / 2, "the policy ceiling is not the usable input window")
 })
 
-test("overWindow flags only a ceiling-saturated budget whose measured cycles run short", () => {
-  assert.equal(overWindow(undefined, NARROW), false)
-  assert.equal(overWindow({ growth: 10_000, span: 5, cycles: 3, budget: 50_000 }, NARROW), true, "span below L_MIN at the ceiling")
-  assert.equal(overWindow({ growth: 10_000, span: 5, cycles: 3, budget: 40_000 }, NARROW), false, "not yet saturated")
-  assert.equal(overWindow({ growth: 10_000, span: 5 * L_MIN, cycles: 3, budget: 50_000 }, NARROW), false, "long cycles are fine at the ceiling")
-})
-
-test("tolerant model records drop corrupt and pre-turn-space entries, never throw", () => {
+test("invalid measurements fail loudly and corrupt persisted entries are dropped", () => {
+  for (const [tokens, turns, baseline] of [[-1, 10, 0], [NaN, 10, 0], [1_000, 0, 0], [1_000, 1.5, 0], [1_000, 2, -1], [1_000, 2, Infinity]]) {
+    assert.throws(() => closeCycle(undefined, tokens, turns, WIDE, baseline), /Invalid/)
+  }
   assert.deepEqual(thermostatModels(undefined), {})
   assert.deepEqual(thermostatModels("junk"), {})
-  assert.deepEqual(thermostatModels({
-    a: { growth: 2_500, span: 20, cycles: 2, budget: 50_000 },
-    b: { growth: -1, span: 20, cycles: 2, budget: 50_000 },
-    c: { ema: 1, cycles: 2, budget: 50_000 },
-    d: { growth: 2_500 },
-  }), { a: { growth: 2_500, span: 20, cycles: 2, budget: 50_000 } }, "an ema-keyed legacy entry drops whole")
+  assert.deepEqual(thermostatModels({ valid: entry(), bad: entry({ growth: NaN }), fractional: entry({ budget: 200_000.5 }), future: entry({ version: 3 }), obsolete: { growth: 2_500, span: 20, cycles: 2, budget: 50_000 } }), { valid: entry() })
 })
 
-// The project store persists the same law under an exclusive lock and never throws.
+test("old unbounded growth/demand learning reseeds rather than masquerading as a new retained safeguard", () => {
+  const old = { growth: 10_000, generated: 500, demand: 0.8, span: 20, cycles: 10, budget: 429_982 }
+  assert.deepEqual(thermostatModels({ "provider/model": old }), {})
+  assert.equal(effectiveBudget(thermostatModels({ "provider/model": old })["provider/model"], WIDE), 200_000)
+  assert.deepEqual(thermostatModels({ "provider/model": entry({ budget: 250_000 }) }), { "provider/model": entry({ budget: 250_000 }) }, "new learning survives a reload")
+})
+
+test("short-cycle diagnostics refer to the upper policy bound, not physical window exhaustion", () => {
+  assert.equal(shortCycles(undefined, WIDE), false)
+  assert.equal(shortCycles(entry({ budget: WIDE.ceiling, span: 5 }), WIDE), true)
+  assert.equal(shortCycles(entry({ budget: 200_000, span: 5 }), WIDE), false)
+  assert.equal(shortCycles(entry({ budget: WIDE.ceiling, span: L_MIN }), WIDE), false)
+})
 
 class MemoryStorage {
   values = new Map()
@@ -87,32 +90,17 @@ class MemoryStorage {
   async scan() { return { entries: [] } }
 }
 
-const record = async (storage) => JSON.parse((await storage.get("project/thermostat")) ?? "null")
-
-test("the project store folds cycles per model and shares one record", async () => {
-  const storage = new MemoryStorage()
-  const store = createProjectStore(storage, () => {})
-  assert.deepEqual(await store.readThermostat(), {})
-  const entry = await store.closeCycle("provider/model", 50_000, 20, NARROW)
-  assert.deepEqual(entry, { growth: 2_500, span: 20, cycles: 1, budget: 50_000 })
-  assert.deepEqual(await store.closeCycle("provider/other", 24_000, 200, NARROW), { growth: 120, span: 200, cycles: 1, budget: 40_000 })
-  assert.deepEqual(await record(storage), {
-    "provider/model": { growth: 2_500, span: 20, cycles: 1, budget: 50_000 },
-    "provider/other": { growth: 120, span: 200, cycles: 1, budget: 40_000 },
-  })
-  assert.deepEqual(await store.readThermostat(), await record(storage), "reads and writes agree")
-})
-
-test("thermostat storage failures self-heal and never throw", async () => {
-  const storage = new MemoryStorage()
-  const reported = []
-  const store = createProjectStore(storage, (message) => reported.push(message))
-  storage.fail = (key) => key === "project/thermostat"
-  assert.equal(await store.closeCycle("provider/model", 50_000, 20, NARROW), undefined, "a failed write reports and returns nothing")
-  assert.ok(reported.length === 1 && reported[0].includes("provider/model"))
+test("project stores isolate learned models, share concurrent cycles, and self-heal storage failures", async () => {
+  const storage = new MemoryStorage(), reported = []
+  const a = createProjectStore(storage, "a", (message) => reported.push(message)), b = createProjectStore(storage, "b")
+  await Promise.all([a.closeCycle("provider/model", 50_000, 20, WIDE, 0), a.closeCycle("provider/model", 50_000, 20, WIDE, 0)])
+  assert.equal((await a.readThermostat())["provider/model"].cycles, 2)
+  assert.deepEqual(await b.readThermostat(), {})
+  storage.fail = (key) => key === "projects/a/thermostat"
+  assert.equal(await a.closeCycle("provider/model", 50_000, 20, WIDE, 0), undefined)
+  assert.equal(reported.length, 1)
   storage.fail = () => false
-  await storage.set("project/thermostat", "not json{")
-  assert.deepEqual(await store.readThermostat(), {}, "an undecodable record reads as absent")
-  assert.deepEqual(await store.closeCycle("provider/model", 50_000, 20, NARROW), { growth: 2_500, span: 20, cycles: 1, budget: 50_000 }, "the next write self-heals over corruption")
-  assert.deepEqual(await record(storage), { "provider/model": { growth: 2_500, span: 20, cycles: 1, budget: 50_000 } })
+  await storage.set("projects/a/thermostat", "not json{")
+  assert.deepEqual(await a.readThermostat(), {})
+  assert.deepEqual(await a.closeCycle("provider/model", 50_000, 20, WIDE, 0), entry())
 })

@@ -48,11 +48,33 @@ test("duplicate call IDs do not get an ambiguous live-call index", () => {
   assert.equal(calls.has("same"), false)
 })
 
-test("completed tools with no content project as empty text results", () => {
+test("the 2.3.2 host projects empty content while the archive normalizes its empty original to text", () => {
   const rows = [{ id: "a", type: "assistant", content: [
     { type: "tool", id: "empty", name: "read", state: { status: "completed", input: { path: "x" }, content: [] } },
   ] }]
   const { messages, calls } = projectHistory(rows)
   assert.deepEqual(calls.get("empty").result, { type: "text", value: "" })
-  assert.deepEqual(messages[1].content[0].result, { type: "text", value: "" })
+  assert.deepEqual(messages[1].content[0].result, { type: "content", value: [] })
+})
+
+test("current checkpoint wrappers, shell preambles, skills and media deduplication are represented", () => {
+  const image = { mime: "image/png", data: "AAAA", source: { type: "inline" }, mention: { text: "@chart" } }
+  const { messages } = projectHistory([
+    { id: "cp", type: "compaction", status: "completed", summary: "state", metadata: { recent: "recent text" } },
+    { id: "sh", type: "shell", command: "build", output: { output: "result" } },
+    { id: "u", type: "user", text: "question", skills: [{ text: "skill body" }], files: [image, image] },
+  ])
+  assert.match(messages[0].content[0].text, /<conversation-checkpoint>[\s\S]*<summary>\nstate\n<\/summary>[\s\S]*<recent-context>\nrecent text/)
+  assert.match(messages[1].content[0].text, /^The following shell command was executed by the user:/)
+  assert.equal(messages[2].content[0].text, "skill body")
+  assert.equal(messages[2].content.filter((part) => part.type === "media").length, 1)
+})
+
+test("incomplete assistant rows drop unexecuted tool calls and terminal reasoning", () => {
+  const { messages } = projectHistory([{ id: "a", type: "assistant", content: [
+    { type: "text", text: "partial answer" },
+    { type: "tool", id: "pending", name: "write", state: { status: "streaming", input: '{"x":1}' } },
+    { type: "reasoning", text: "not followed by retained content" },
+  ] }])
+  assert.deepEqual(messages[0].content, [{ type: "text", text: "partial answer" }])
 })

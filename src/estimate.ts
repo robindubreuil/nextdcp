@@ -2,12 +2,23 @@ import { mediaTokens, messageTokens, partTokens, tokens, type Message, type Part
 import { modelRef, object, positive } from "./guards.ts"
 import type { Row } from "./memory.ts"
 import { rowCalls } from "./store.ts"
+import type { ProviderUsage } from "./memory-rpc.ts"
 
 // Token estimation over host rows and hook messages. The budget gate, the idle
 // trigger, and the deferral ceiling all meter against these counts, calibrated
 // against provider-reported usage where the host supplies it.
 
 export type ViewMessage = Message & { readonly id?: string; readonly role?: string }
+
+/** Complete outgoing request projection, not the scheduling-growth meter. Hook
+ *  messages already include checkpoint/tail, skills, shell and media. Definitions
+ *  and system parts consume capacity too. This remains an estimate, not a tokenizer. */
+export function requestParts(request: { readonly system: readonly Part[]; readonly messages: readonly Message[]; readonly tools: unknown }) {
+  const system = request.system.reduce((sum, part) => sum + partTokens(part), 0), messages = messageTokens(request.messages)
+  const tools = tokens(JSON.stringify(request.tools) ?? "")
+  return { system, messages, tools, total: system + messages + tools }
+}
+export const requestTokens = (request: Parameters<typeof requestParts>[0]): number => requestParts(request).total
 
 /** Conversation tokens sent after the checkpoint message; undefined when that message is not identifiable. */
 export function growthAfter(messages: readonly ViewMessage[], checkpoint: string | null): number | undefined {
@@ -17,7 +28,8 @@ export function growthAfter(messages: readonly ViewMessage[], checkpoint: string
 }
 
 /** Upper bound on the raw conversation a deferral may hold live, as a share of the window left after the output reserve. */
-export const DEFER_WINDOW_SHARE = 0.8
+export const DEFER_WINDOW_SHARE = 1
+export const REQUEST_MARGIN = 1_024
 
 /** Estimated tokens of a user-row attachment: fixed media rates, decoded text size otherwise. */
 function attachmentTokens(file: unknown): number {
@@ -37,12 +49,22 @@ function assistantTokens(row: Row, reasoning = true): number {
   return text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
 }
 
-/** Estimated tokens of one user row: its text plus attachments. */
+/** Estimated tokens of one user row, including activated skills and attachments. */
 function userTokens(row: Row): number {
   const data = row as Row & Record<string, unknown>
   const text = typeof data.text === "string" ? tokens(data.text) : 0
   const files = Array.isArray(data.files) ? data.files.reduce<number>((n, file) => n + attachmentTokens(file), 0) : 0
-  return text + files
+  const skills = Array.isArray(data.skills) ? data.skills.reduce<number>((n, skill) => n + (object(skill) && typeof skill.text === "string" ? tokens(skill.text) : 0), 0) : 0
+  return text + files + skills
+}
+
+function otherTokens(row: Row): number {
+  const data = row as Row & Record<string, unknown>
+  if (["skill", "system", "synthetic"].includes(row.type)) return typeof data.text === "string" ? tokens(data.text) : 0
+  if (row.type === "shell" && !(object(data.metadata) && data.metadata.background === true)) {
+    return tokens(`${typeof data.command === "string" ? data.command : ""}\n${object(data.output) && typeof data.output.output === "string" ? data.output.output : ""}`)
+  }
+  return 0
 }
 
 /** Estimated tokens of the raw conversation a deferral would hold live,
@@ -50,7 +72,7 @@ function userTokens(row: Row): number {
 export function conversationTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
     if (row.type === "user") return sum + userTokens(row)
-    return sum + (row.type === "assistant" ? assistantTokens(row) : 0)
+    return sum + (row.type === "assistant" ? assistantTokens(row) : otherTokens(row))
   }, 0)
 }
 
@@ -64,8 +86,35 @@ export const RECENT_TURNS = 10
 export function durableTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
     if (row.type === "user") return sum + userTokens(row)
-    return sum + (row.type === "assistant" ? assistantTokens(row, false) : 0)
+    return sum + (row.type === "assistant" ? assistantTokens(row, false) : otherTokens(row))
   }, 0)
+}
+
+/** Returned evidence, not assistant production: successful tool results and
+ *  foreground shell output. Arguments, errors, human answers and checkpoint
+ *  acknowledgements still count toward routine growth. This is a mechanical
+ *  split, not a claim that every successful result is necessary evidence. */
+export function evidenceTokens(rows: readonly Row[]): number {
+  return rows.reduce((sum, row) => {
+    if (row.type === "assistant") return sum + rowCalls(row).reduce((n, call) =>
+      call.result.type === "error" || ["question", "checkpoint_now"].includes(call.name) ? n
+        : n + partTokens({ type: "tool-result", ...call } as Part), 0)
+    const data = row as Row & Record<string, unknown>
+    return sum + (row.type === "shell" && !(object(data.metadata) && data.metadata.background === true) && object(data.output) && typeof data.output.output === "string"
+      ? tokens(data.output.output) : 0)
+  }, 0)
+}
+
+/** Conversation retained after the latest checkpoint: summary + native recent
+ *  tail + NEW durable rows, excluding ephemeral reasoning. System/tool-definition
+ *  overhead and host wrappers belong to the separate complete-request meter. */
+export function retainedTokens(rows: readonly Row[]): number {
+  const index = rows.findLastIndex((row) => row.type === "compaction" && row.status === "completed")
+  const checkpoint = rows[index] as (Row & { readonly metadata?: unknown }) | undefined
+  const metadata = object(checkpoint?.metadata) ? checkpoint.metadata : {}
+  const summary = typeof checkpoint?.summary === "string" ? tokens(checkpoint.summary) : 0
+  const recent = typeof metadata.recent === "string" ? tokens(metadata.recent) : 0
+  return summary + recent + durableTokens(rows.slice(index + 1))
 }
 
 /** Durable tokens over the most recent assistant turns and the user rows
@@ -78,6 +127,7 @@ export function recentDurable(rows: readonly Row[], turns: number): { tokens: nu
     const row = rows[at]
     if (row.type === "assistant") { sum += assistantTokens(row, false); counted++ }
     else if (row.type === "user") sum += userTokens(row)
+    else sum += otherTokens(row)
   }
   return { tokens: sum, turns: counted }
 }
@@ -90,6 +140,19 @@ function billedTokens(row: Row): number {
   if (!object(data.tokens)) return 0
   const usage = data.tokens, cache = object(usage.cache) ? usage.cache : {}
   return positive(usage.input, 0) + positive(usage.cacheRead ?? cache.read, 0) + positive(usage.cacheWrite ?? cache.write, 0)
+}
+
+/** Raw counters from the last usage-bearing assistant row, never a calibrated estimate. */
+export function latestProviderUsage(rows: readonly Row[]): ProviderUsage | undefined {
+  for (let at = rows.length - 1; at >= 0; at--) {
+    const row = rows[at], data = row as Row & { readonly tokens?: unknown }
+    if (row.type !== "assistant" || !object(data.tokens)) continue
+    const usage = data.tokens, cache = object(usage.cache) ? usage.cache : {}
+    const result = { messageID: row.id, input: positive(usage.input, 0), output: positive(usage.output, 0),
+      reasoning: positive(usage.reasoning, 0), cacheRead: positive(usage.cacheRead ?? cache.read, 0), cacheWrite: positive(usage.cacheWrite ?? cache.write, 0) }
+    if (result.input + result.output + result.reasoning + result.cacheRead + result.cacheWrite > 0) return result
+  }
+  return undefined
 }
 
 /** Billed-token correction for estimates that face model window limits: the median ratio

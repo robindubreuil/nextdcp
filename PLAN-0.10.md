@@ -1,5 +1,8 @@
 # 0.10 plan — measured lifetime memory
 
+> Historical proposal, not a description of current behavior or measured quality.
+> See README.md and DESIGN.md for the 0.14 contract and its limitations.
+
 Three changes, one thesis: stop being a per-session garbage collector;
 become a measured, lifetime memory system. Companion to GATE-PLAN.md
 (whose gate/stats machinery this builds on) and DESIGN.md.

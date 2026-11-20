@@ -19,9 +19,16 @@ export type DeferredCompaction = {
   readonly checkpoint: string | null
   readonly after: string
   readonly tokens: number
+  readonly threshold: number
 }
 
-/** A graduated episode note at `project/episodes/P<n>`: the searchable pointer that
+export type SessionOwner = {
+  readonly projectID: string
+  readonly location: { readonly directory: string; readonly workspaceID?: string }
+  readonly subagent: boolean
+}
+
+/** A graduated episode note under `projects/<projectID>/episodes/P<n>`: the pointer that
  *  outlives its session. Notes only — raw transcripts and calls die with the session. */
 export type GraduatedNote = { readonly id: string; readonly note: string; readonly session: string; readonly end: number }
 /** The project archive keeps at most this many graduated notes, most recent first. */
@@ -32,14 +39,14 @@ export type GateStats = {
   gates: number; silent: number; continued: number; repaid: number
   spikeHeld: number
   checkpoints: number
-  precomputes: number; precomputeHits: number; gateAliases: number
+  capacity: number
 }
 
 const ZERO_STATS: GateStats = {
   gates: 0, silent: 0, continued: 0, repaid: 0,
   spikeHeld: 0,
   checkpoints: 0,
-  precomputes: 0, precomputeHits: 0, gateAliases: 0,
+  capacity: 0,
 }
 const statsShape = (value: unknown): value is GateStats =>
   object(value) && Object.keys(ZERO_STATS).every((key) => typeof value[key] === "number" && Number.isFinite(value[key]) && (value[key] as number) >= 0)
@@ -101,9 +108,12 @@ export function rowCalls(row: Row): ArchivedCall[] {
 /** A project-scoped, JSON-only wrapper: records shared by every session of this
  *  project instance. Failure-tolerant by contract — the callers treat these as
  *  advisory and must never let them block a trigger or a cut. */
-export function createProjectStore(storage: Storage, report: Reporter = defaultReport) {
-  const thermostatKey = "project/thermostat"
-  const episodesPrefix = "project/episodes/"
+export function createProjectStore(storage: Storage, projectID: string, report: Reporter = defaultReport) {
+  if (!projectID) throw new Error("Missing project ownership")
+  const root = `projects/${encodeURIComponent(projectID)}/`
+  const thermostatKey = `${root}thermostat`
+  const episodesPrefix = `${root}episodes/`
+  const revisionKey = `${root}episodes-revision`, counterKey = `${root}episode-counter`
   const graduatedKey = (id: string) => `${episodesPrefix}${id}`
   const get = async <T>(name: string) => decode<T>(await storage.get(name), name)
   const put = async (name: string, value: unknown) => storage.set(name, encode(value))
@@ -137,15 +147,16 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
     return found
   }
   return {
+    graduatedRevision: () => storage.get(revisionKey),
     /** The learned thermostat state per model, dropping corrupt entries. */
     readThermostat: () => readModels(),
     /** Fold one completed cycle into a model's entry and persist it. Returns the
      *  new entry, or undefined when storage failed (reported, never thrown). */
-    closeCycle: async (model: string, tokens: number, turns: number, bounds: BudgetBounds): Promise<ThermostatEntry | undefined> => {
+    closeCycle: async (model: string, tokens: number, turns: number, bounds: BudgetBounds, baseline: number): Promise<ThermostatEntry | undefined> => {
       try {
         return await exclusive(thermostatKey, async () => {
           const models = await readModels()
-          const entry = closeCycle(models[model], tokens, turns, bounds)
+          const entry = closeCycle(models[model], tokens, turns, bounds, baseline)
           await put(thermostatKey, { ...models, [model]: entry })
           return entry
         })
@@ -159,6 +170,12 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
       try { return await scanGraduated() }
       catch (error) { report("Unable to read graduated notes", error); return [] }
     },
+    /** Fetch a single original without scanning or decoding the rest of the project. */
+    graduatedNote: async (id: string): Promise<GraduatedNote | undefined> => {
+      if (!/^P[1-9]\d*$/.test(id)) return undefined
+      try { return graduatedRecord(await get<unknown>(graduatedKey(id)), id) }
+      catch (error) { report(`Unable to read graduated note ${id}`, error); return undefined }
+    },
     /** Graduate episode notes into the project archive: notes only, deduplicated by
      *  exact text (fork copies), numbered above the highest existing P<n>, kept to
      *  the 200 most recent. Returns how many notes were added; failures are
@@ -168,19 +185,28 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
         return await exclusive(episodesPrefix, async () => {
           const existing = await scanGraduated()
           const texts = new Set(existing.map((one) => one.note))
-          let next = existing.reduce((highest, one) => Math.max(highest, Number(/^P(\d+)$/.exec(one.id)?.[1] ?? 0)), 0) + 1
+          const previous = await get<number>(counterKey) ?? 0
+          if (!Number.isSafeInteger(previous) || previous < 0) throw new Error("Invalid project episode counter")
+          let next = Math.max(previous, existing.reduce((highest, one) => Math.max(highest, Number(/^P(\d+)$/.exec(one.id)?.[1] ?? 0)), 0))
           const kept = [...existing]
           let added = 0
-          for (const item of notes) {
-            if (!item.note || texts.has(item.note)) continue
-            texts.add(item.note)
-            const record: GraduatedNote = { id: `P${next++}`, note: item.note, session, end: item.end }
-            kept.push(record)
-            await put(graduatedKey(record.id), record)
-            added++
+          try {
+            for (const item of notes) {
+              if (!item.note || texts.has(item.note)) continue
+              if (!Number.isSafeInteger(next + 1)) throw new Error("Project episode counter exhausted")
+              texts.add(item.note)
+              const record: GraduatedNote = { id: `P${++next}`, note: item.note, session, end: item.end }
+              // Reserve before writing so even partial failures cannot recycle an ID.
+              await put(counterKey, next)
+              kept.push(record)
+              await put(graduatedKey(record.id), record)
+              added++
+            }
+            for (const old of kept.sort((a, b) => b.end - a.end).slice(GRADUATE_CAP)) await storage.remove(graduatedKey(old.id))
+          } finally {
+            // Invalidate other instances' caches even after a partially written batch.
+            await storage.set(revisionKey, JSON.stringify(next))
           }
-          // The cap keeps the most recent notes; overflow is removed, oldest first.
-          for (const old of kept.sort((a, b) => b.end - a.end).slice(GRADUATE_CAP)) await storage.remove(graduatedKey(old.id))
           return added
         })
       } catch (error) {
@@ -204,12 +230,22 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     const value = await get<unknown>(deferredKey)
     if (value === undefined) return undefined
     if (!object(value) || (value.checkpoint !== null && typeof value.checkpoint !== "string") ||
-        typeof value.after !== "string" || typeof value.tokens !== "number" || !Number.isFinite(value.tokens) || value.tokens < 0) {
+        typeof value.after !== "string" || typeof value.tokens !== "number" || !Number.isFinite(value.tokens) || value.tokens < 0 ||
+        typeof value.threshold !== "number" || !Number.isFinite(value.threshold) || value.threshold <= 0) {
       throw new Error("Invalid deferred compaction")
     }
     return value as DeferredCompaction
   }
   const saveDeferredCompaction = (value: DeferredCompaction) => put(deferredKey, value)
+  const getOwner = async (): Promise<SessionOwner | undefined> => {
+    const owner = await get<SessionOwner>(`${root}owner`)
+    if (owner === undefined) return undefined
+    if (!object(owner) || typeof owner.projectID !== "string" || !owner.projectID || !object(owner.location) ||
+        typeof owner.location.directory !== "string" || !owner.location.directory || typeof owner.subagent !== "boolean" ||
+        (owner.location.workspaceID !== undefined && typeof owner.location.workspaceID !== "string")) throw new Error("Invalid session ownership")
+    return owner
+  }
+  const saveOwner = (owner: SessionOwner) => put(`${root}owner`, owner)
   /** Count one gate event and return the new totals. Failures are reported, never thrown:
    *  telemetry must not break a trigger. A stored record that no longer matches the
    *  shape — corrupt, or from before a field swap — restarts from zero rather than
@@ -292,7 +328,10 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   const getPending = (id: string) => get<Pending>(key("pending", id))
   const prepareArchive = async (rows: readonly Row[]): Promise<Pending> => {
     const cut = planCut(rows)
-    const pending: Pending = { id: cut.checkpoint, parent: cut.parent, rowIDs: cut.rowIDs, archived: false }
+    const previous = await getPending(cut.checkpoint)
+    if (previous && (previous.parent !== cut.parent || JSON.stringify(previous.rowIDs) !== JSON.stringify(cut.rowIDs))) throw new Error("Compaction boundary changed")
+    const pending: Pending = { id: cut.checkpoint, parent: cut.parent, rowIDs: cut.rowIDs, archived: false,
+      ...(previous?.episode ? { episode: previous.episode } : {}) }
     await put(key("pending", pending.id), pending)
     // Historical rows are immutable. Re-save only this cut and its completed parent
     // (which was still running when the preceding cut was archived).
@@ -343,35 +382,14 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     const stored = await getPending(id)
     if (stored && stored.episode !== episode) await put(key("pending", id), { ...stored, episode })
   }
-  /** Whether any committed checkpoint already carries this episode id: a reservation
-   *  left by an abandoned branch (revert, precompute) must never be reused then. */
-  const episodeCommitted = async (episode: string): Promise<boolean> => {
-    for (const { id, value } of await all("checkpoints")) {
-      try { if (decode<Checkpoint>(value, key("checkpoints", id))?.episode?.id === episode) return true } catch { /* unreadable record */ }
-    }
-    return false
-  }
-  /** The episode id for a cut below this checkpoint. A failed gate-window precompute
-   *  leaves its reservation here; the next cut for the same parent (or the next
-   *  precompute over it) reuses it — unless the id was committed in the meantime by
-   *  a branch that has since been reverted away. */
-  const reservedEpisode = async (parent: string | null): Promise<string> => {
-    if (parent !== null) {
-      const reserved = await get<string>(key("reserved", parent))
-      if (typeof reserved === "string" && reserved && !(await episodeCommitted(reserved))) return reserved
-    }
-    const episode = await nextEpisode()
-    if (parent !== null) await put(key("reserved", parent), episode)
-    return episode
-  }
-  const all = async (kind: string): Promise<{ id: string; value: unknown }[]> => {
-    const prefix = `${root}${kind}/`, result: { id: string; value: unknown }[] = []
+  const all = async (kind: string, handle = ""): Promise<{ id: string; value: unknown }[]> => {
+    const base = `${root}${kind}/`, prefix = `${base}${encodeURIComponent(handle)}`, result: { id: string; value: unknown }[] = []
     let after: string | undefined
     do {
       const page = await storage.scan({ prefix, after, limit: 500 })
       for (const entry of page.entries) {
         if (!entry.key.startsWith(prefix)) throw new Error("Invalid storage scan entry")
-        result.push({ id: decodeURIComponent(entry.key.slice(prefix.length)), value: entry.value })
+        result.push({ id: decodeURIComponent(entry.key.slice(base.length)), value: entry.value })
       }
       if (page.next !== undefined && page.next === after) throw new Error("Storage scan did not advance")
       after = page.next
@@ -489,13 +507,17 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     // Last write is the commit marker; partial imports are safe to retry.
     await put(`${root}fork`, sourceSessionID)
   })
-  const getRows = async (): Promise<{ id: string; text: string }[]> => (await all("rows")).map(({ id, value }) => {
-    if (typeof value !== "string") throw new Error("Invalid archived row")
-    return { id, text: value }
+  const getRows = async (): Promise<{ id: string; text: string }[]> => (await all("rows")).flatMap(({ id, value }) => {
+    if (typeof value !== "string") { report(`Skipping unreadable archived row ${id}`); return [] }
+    return [{ id, text: value }]
   })
-  const getCalls = async (): Promise<ArchivedCall[]> => (await all("calls")).map(({ id, value }) => {
-    return archivedCall(decode<unknown>(value, key("calls", id)), id)
+  const getCalls = async (): Promise<ArchivedCall[]> => (await all("calls")).flatMap(({ id, value }) => {
+    try { return [archivedCall(decode<unknown>(value, key("calls", id)), id)] }
+    catch (error) { report(`Skipping unreadable archived call ${id}`, error); return [] }
   })
+  /** Prefix resolution needs keys, not decoded payloads. An unreadable original
+   *  still participates in ambiguity checks; only fetching it validates its bytes. */
+  const matchingIDs = async (handle: string): Promise<string[]> => (await Promise.all([all("calls", handle), all("rows", handle)])).flatMap((entries) => entries.map(({ id }) => id))
   /** Remove every record of a deleted session, including keys written outside this store. */
   const clear = async () => {
     // A prefix scan of the session root replaces any per-kind list: preferences and
@@ -513,5 +535,5 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     } while (after !== undefined)
     for (const key of keys) await storage.remove(key)
   }
-  return { getRow, getRows, getCall, getCalls, saveCall, archiveRows, prepareArchive, getPending, pendingEpisode, getCheckpoint, saveCheckpoint, chain, nextEpisode, reservedEpisode, episodeNotes, hasInherited, inherit, forkSnapshot, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
+  return { getRow, getRows, getCall, getCalls, matchingIDs, saveCall, archiveRows, prepareArchive, getPending, pendingEpisode, getCheckpoint, saveCheckpoint, chain, nextEpisode, episodeNotes, hasInherited, inherit, forkSnapshot, getOwner, saveOwner, getDeferredCompaction, saveDeferredCompaction, countGate, getGateStats, clear }
 }
