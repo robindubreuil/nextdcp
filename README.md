@@ -2,7 +2,7 @@
 
 Bounded task-focused working memory, on-demand `recall`, a budget gate with
 `checkpoint_now`, an adaptive compaction budget, project-lifetime graduated
-notes, and user-approved round-scoped compaction deferral for
+notes, and an automatic round-scoped spike hold for bulky rounds in
 OpenCode V2 (**v2.2.5+**). The host supplies
 `@opencode/plugin`; the declared
 peer range is `>=2.2.5 <3`. There are no additional runtime dependencies. The
@@ -105,16 +105,19 @@ window, and decides in that reply:
 
 - **Continue (default):** the next step still runs with full raw context; the
   cut lands right after it. Any other tool call or plain text means continue.
-- **`defer_compaction(reason)`:** hold the raw context for one round — see the
-  next section.
 - Delegating the bulky independent part to a subagent with its own window.
+
+A bulky round may never see the notice at all: when the recent turns grow at
+twice the learned rate and the conversation still fits the window, the
+crossing is held for the round automatically — see
+[Automatic spike hold](#automatic-spike-hold).
 
 The evaluation window doubles as the generation window: while the model reads
 the notice, the would-be episode is archived and its handoff is generated
 statelessly in the background. When the gate closes on continue — the common
 case — the cut commits that precomputed handoff with no additional model
-request, so the gate adds no latency at the cut. A granted deferral, an
-explicit `checkpoint_now` keep note, or any boundary that moved past what the
+request, so the gate adds no latency at the cut. A held round, an explicit
+`checkpoint_now` keep note, or any boundary that moved past what the
 window covered discards it, and that cut generates inline exactly as before.
 Calling `checkpoint_now` while a gate is open is an alias for continue — the
 cut lands one step later anyway — with the optional `keep` still riding to the
@@ -127,29 +130,32 @@ The whole regime — gate, recall, checkpoint — is stated once in the `recall`
 tool description, so the notice itself stays a short trigger. A crossing with
 no live round, a staged revert, or compaction already running or cooling down
 compacts silently, as before. A round that ends before its next build repays
-the consumed crossing immediately. Gate, deferral, checkpoint, and precompute
+the consumed crossing immediately. Gate, spike-hold, checkpoint, and precompute
 outcomes are counted per session in plugin storage; deleting the session
 removes them.
 
 ## Adaptive budget
 
-The `budget` threshold is learned per **main model** from how hard the model
-leans on `recall` after cuts. Recall executions are counted per cycle (one
-committed checkpoint to the next) and folded into an exponential moving
-average, persisted per model in plugin storage and shared by every session of
-the project. Once at least four cycles of evidence exist:
+The `budget` threshold is learned per **main model** from the transcript's own
+shape. A cycle spans one committed checkpoint to the next — about one budget
+by construction — so it already integrates the signal; the law works in turn
+space, where token-estimator bias cannot reach. Each completed cycle folds
+two exponential moving averages at half weight — calibrated durable tokens
+per assistant turn (the growth rate) and assistant turns per cycle (the
+measured span) — persisted per model in plugin storage and shared by every
+session of the project.
 
-- EMA ≥ 2 recalls per cycle raises the budget 20% — a model that keeps
-  fetching back what cuts removed earns a larger live budget.
-- EMA ≤ 0.5 lowers it 10% — a model that never recalls pays for less context.
+The budget then takes at most one rate-limited step per cycle — ±20% toward
+a cycle span of 28 turns, and never below growth × 12, so cuts come no faster
+than the transcript's own rate allows — always clamped to
+`[30000, min(50% of the model window, 150000)]`, starting from `min(50% of
+the model window, 100000)`. The 150k ceiling is deliberate: measured quality
+on current frontier models holds to roughly 150k tokens of live context even
+on very large windows, and several providers start premium pricing at 200k.
 
-At most one step per cycle, always clamped to `[30k, window × 0.5]`, starting
-from `min(window × 0.5, 100k)`. An explicit `budget` option wins absolutely
-(evidence still accumulates); subagent sessions and unknown model windows
-never feed the loop; every thermostat failure reports and falls back to the
-static default. The signal is deliberately conservative: only recall pressure
-is measured, and a model that silently redoes elided tool calls instead of
-recalling is invisible to it.
+An explicit `budget` option wins absolutely; subagent sessions and unknown
+model windows never feed the loop; every thermostat failure reports and falls
+back to the static default.
 
 ## Graduated notes
 
@@ -164,32 +170,28 @@ with a 30-day recency boost so fresh experience outranks stale advice on
 equal term matches. Graduated notes never appear in the episode catalog, and
 subagent sessions never graduate.
 
-## Defer compaction for one round
+## Automatic spike hold
 
-For work that genuinely needs unusually large simultaneous context, the model can
-call `defer_compaction` with a concrete reason why checkpointing plus recall would
-impair the current task. The tool is callable only while the budget-gate notice is
-open; anywhere else it refuses without prompting. The tool uses OpenCode's native approval prompt (permission
-`defer_compaction`, default `ask`), including **Always allow**. Configured permission
-rules are respected. Each round still needs its own tool call; a refusal cannot be
-retried in that round.
+Bulk work — wide file reads, verbose builds, data dumps — can cross the budget
+mid-round while still comfortably fitting the model window. Cutting there
+would shred work that `recall` cannot reassemble cheaply. When a live-round
+crossing meets both conditions:
 
-The reason is visible in the tool call and in the GUI's approval card; the terminal's
-generic approval box shows the tool name, with the reason in the tool call above it.
+- the last ten assistant turns grew at **twice** the model's learned per-turn
+  rate — a rate spike, evidence of bulk payload rather than conversation — and
+- the calibrated conversation still fits within 80% of the model's context
+  window after reserving its output limit (an unknown window never holds),
 
-Physics gates the request before the prompt: the conversation, including
-attachments, must fit within 80% of the model's context window after reserving its
-output limit; an unknown window is refused, so no approval is spent on a
-conversation that would overflow anyway.
-
-Approval suspends NextDCP's automatic **mid-round budget trigger** for that round,
-keeping the raw conversation fully live. Manual compaction, native
-overflow handling, and already-queued or in-flight compaction are unaffected. The
-held round writes no deferred idle marker, so the next round starts from the full
-context and either re-affirms or lets the budget trigger catch up in one bounded
-compaction. The exemption expires on completion, failure, interruption, or plugin
-reload and is not inherited by forks or subagents. Native permission choices retain
-OpenCode's usual scope; the exemption itself is never persisted.
+the round's cut is held **automatically**: no notice, no approval prompt, no
+tool call. The raw conversation stays fully live for the rest of that round —
+later crossings of the same round are held too — and the hold expires when
+the round ends, on completion, failure, interruption, or plugin reload. The
+held round writes no deferred idle marker: the next round starts from the
+full context and either re-affirms or lets the budget trigger catch up in one
+bounded compaction. The hold is never persisted and is not inherited by forks
+or subagents; manual compaction, native overflow handling, and in-flight
+compaction are unaffected. Until a model has a learned rate — the first
+cycles — its crossings open the budget gate as usual instead.
 
 ## Options
 
@@ -203,7 +205,7 @@ from recent completed requests; without such usage the raw estimate applies.
 | Option | Default | Meaning |
 |---|---:|---|
 | `idle` | `25000` | After a successful turn with this much new conversation, compact on the **next prompt**, not while idle. Set `false` to disable. Subagent sessions are ignored. |
-| `budget` | adaptive per model (initial `min(50% of model window, 100000)`) | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. The default is learned per main model from recall pressure — see [Adaptive budget](#adaptive-budget); bounds `[30000, 50% of model window]`. A live-round crossing first opens the budget gate. System instructions and tool definitions are excluded. Set `false` to disable. |
+| `budget` | adaptive per model (initial `min(50% of model window, 100000)`) | Compact during a turn when conversation tokens remain above this and new growth reaches `min(idle, budget / 4)`. The default is learned per main model from the transcript's own shape — see [Adaptive budget](#adaptive-budget); bounds `[30000, min(50% of model window, 150000)]`. A live-round crossing first opens the budget gate. System instructions and tool definitions are excluded. Set `false` to disable. |
 | `notice` | `tail` | Placement of the budget-gate notice: `tail` appends it as the final conversation message (no cached-prefix churn); `system` uses a system part for providers that drop trailing messages. |
 | `memory.budget` | `2000` | Maximum estimated tokens for the complete rendered working state, including headings and references. Target is normally about 1000 or less. Independent of conversation age and model window. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |

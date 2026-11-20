@@ -381,13 +381,29 @@ export function formatCatalogEntry(entry: CatalogEntry): string {
   return `${catalogLine(entry)}\n${entry.note}`
 }
 
+/** Ids the counter allocated but no committed checkpoint carries — failed pre-reservation
+ *  cycles or reverted branches — explain themselves instead of reading as corruption.
+ *  Bounded by sanity: a range dwarfing the entry count says non-sequential ids, not gaps. */
+const gapLine = (entries: readonly CatalogEntry[]): string | undefined => {
+  const ids = entries.map((entry) => Number(entry.id.slice(1))).filter((id) => Number.isInteger(id) && id > 0)
+  if (ids.length < 2 || ids.length < entries.length) return undefined
+  const present = new Set(ids)
+  const missing = Array.from({ length: Math.max(...ids) - Math.min(...ids) + 1 }, (_, offset) => Math.min(...ids) + offset)
+    .filter((id) => !present.has(id))
+  if (!missing.length || missing.length > ids.length) return undefined
+  return `${missing.map((id) => `E${id}`).join(", ")} — allocated but never committed (failed cycles before reservations, or reverted branches)`
+}
+
 /** The sole summary surface: episode labels newest-first (numeric ID). Compact by default —
     one line per entry — with `all` as the whole-note view. Both are plain text that
     recallPage pages like any other target; nothing ever drops silently. */
 export function formatCatalog(entries: readonly CatalogEntry[], view: "compact" | "all" = "compact"): string {
   const ordered = [...entries].sort((a, b) => Number(b.id.slice(1)) - Number(a.id.slice(1)) || (a.id < b.id ? -1 : 1))
+  const gaps = gapLine(entries)
   const header = "Archive catalog (newest first) — one entry's note: recall id=catalog E<n>; every note: recall id=catalog all"
-  return [header, ...ordered.map((entry) => (view === "all" ? formatCatalogEntry(entry) : catalogLine(entry)))].join(view === "all" ? "\n\n" : "\n")
+  const lines = ordered.map((entry) => (view === "all" ? formatCatalogEntry(entry) : catalogLine(entry)))
+  return [header, ...(gaps ? [`Missing ids: ${gaps}`] : []), ...lines]
+    .join(view === "all" ? "\n\n" : "\n")
 }
 
 /** A rendered ID is its unique 12-character prefix; recall resolves any unambiguous prefix. */

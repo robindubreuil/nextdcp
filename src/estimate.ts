@@ -29,24 +29,57 @@ function attachmentTokens(file: unknown): number {
   catch { return Math.ceil(file.data.length * 3 / 16) }
 }
 
-/** Estimated tokens of one assistant row: its text and reasoning parts plus its tool calls. */
-function assistantTokens(row: Row): number {
-  const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || part.type === "reasoning") ? partTokens(part as Part) : 0), 0)
+/** Estimated tokens of one assistant row: its text and reasoning parts plus its
+ *  tool calls; reasoning is optional because it is generated per response, not
+ *  conversation the later calls carry. */
+function assistantTokens(row: Row, reasoning = true): number {
+  const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || (reasoning && part.type === "reasoning")) ? partTokens(part as Part) : 0), 0)
   return text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
+}
+
+/** Estimated tokens of one user row: its text plus attachments. */
+function userTokens(row: Row): number {
+  const data = row as Row & Record<string, unknown>
+  const text = typeof data.text === "string" ? tokens(data.text) : 0
+  const files = Array.isArray(data.files) ? data.files.reduce<number>((n, file) => n + attachmentTokens(file), 0) : 0
+  return text + files
 }
 
 /** Estimated tokens of the raw conversation a deferral would hold live,
  *  counting the same text and reasoning parts that responseTokens counts. */
 export function conversationTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
-    if (row.type === "user") {
-      const data = row as Row & Record<string, unknown>
-      const text = typeof data.text === "string" ? tokens(data.text) : 0
-      const files = Array.isArray(data.files) ? data.files.reduce<number>((n, file) => n + attachmentTokens(file), 0) : 0
-      return sum + text + files
-    }
+    if (row.type === "user") return sum + userTokens(row)
     return sum + (row.type === "assistant" ? assistantTokens(row) : 0)
   }, 0)
+}
+
+/** The measurement window for the live growth rate: the most recent assistant
+ *  turns whose durable tokens one backwards walk counts. */
+export const RECENT_TURNS = 10
+
+/** Durable tokens of the rows a compaction cut would archive: user rows plus
+ *  assistant text and tool calls, reasoning excluded — reasoning is regenerated
+ *  per response, so it is not growth the live transcript accumulates. */
+export function durableTokens(rows: readonly Row[]): number {
+  return rows.reduce((sum, row) => {
+    if (row.type === "user") return sum + userTokens(row)
+    return sum + (row.type === "assistant" ? assistantTokens(row, false) : 0)
+  }, 0)
+}
+
+/** Durable tokens over the most recent assistant turns and the user rows
+ *  between them: the live transcript's current growth rate, measured rather
+ *  than predicted. `turns` caps the walk; the result reports how many
+ *  assistant rows actually fit. */
+export function recentDurable(rows: readonly Row[], turns: number): { tokens: number; turns: number } {
+  let counted = 0, sum = 0
+  for (let at = rows.length - 1; at >= 0 && counted < turns; at--) {
+    const row = rows[at]
+    if (row.type === "assistant") { sum += assistantTokens(row, false); counted++ }
+    else if (row.type === "user") sum += userTokens(row)
+  }
+  return { tokens: sum, turns: counted }
 }
 
 /** Provider-reported billed tokens of a completed request: input plus cache traffic,

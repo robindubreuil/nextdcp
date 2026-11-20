@@ -102,6 +102,11 @@ export function createModels(ctx: Plugin.Context) {
     },
     main,
     warning,
+    /** A committed handoff is clean evidence the last fallback no longer describes this
+     *  session's compaction path; the append-only history keeps it auditable. */
+    async clearWarning(sessionID: SessionID) {
+      await ctx.storage.remove(`${root(sessionID)}/warning`).catch(() => undefined)
+    },
     async generate(selected: ModelRef, prompt: string) {
       const model = matching(await choices(), selected)
       if (!model) throw new Error(`${modelLabel(selected)} is unavailable`)

@@ -3,16 +3,16 @@ import type { SessionCompaction, SessionContext, SessionPrompt } from "@opencode
 import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { messageTokens, type ArchivedCall, type Part } from "./tokens.ts"
 import { adoptNative, archiveAnchor, episodeRows, planCut, renderHandoff, resolveMemory, type Checkpoint, type Episode, type Pending, type Row } from "./memory.ts"
-import { budgetGateNotice, CHECKPOINT_NOW_DESCRIPTION, DEFER_COMPACTION_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
+import { budgetGateNotice, CHECKPOINT_NOW_DESCRIPTION, RECALL_DESCRIPTION, workingPrompt } from "./prompts.ts"
 import { budgetFailure, DEFAULT_MEMORY_BUDGET, episodeNote, HandoffError, measureWorking, parseHandoff, parsePatchHandoff, type Handoff } from "./working.ts"
 import { address, formatCall, formatCatalog, formatCatalogEntry, formatGraduated, formatRow, formatTranscript, LAYERS, MAX_SEARCH_HITS, parseTarget, recallPage, resolveHandle, search, SEARCH_PAGE_HITS, shortId, type Layer, type RecallContent, type RecallFile, type SearchDocument } from "./recall.ts"
 import { createStore, createProjectStore, exclusive, type GraduatedNote, type GateStats } from "./store.ts"
-import { budgetBounds, effectiveBudget, type ThermostatEntry } from "./thermostat.ts"
+import { budgetBounds, effectiveBudget, overWindow, SPIKE, type BudgetBounds, type ThermostatEntry } from "./thermostat.ts"
 import { formatDuration, recencyBoost } from "./time.ts"
 import { createModels } from "./models.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 import { object, positive, modelRef } from "./guards.ts"
-import { conversationTokens, growthAfter, responseTokens, usageScale, DEFER_WINDOW_SHARE, type ViewMessage } from "./estimate.ts"
+import { conversationTokens, durableTokens, growthAfter, recentDurable, responseTokens, usageScale, DEFER_WINDOW_SHARE, RECENT_TURNS, type ViewMessage } from "./estimate.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
@@ -59,8 +59,6 @@ type SessionState = {
   boundaries?: Map<string, Pending>
   /** The session's main model as last built; the thermostat's per-model key. */
   model?: ModelRef
-  /** Recall executions since the last committed handoff: one thermostat cycle's evidence. */
-  recalls?: number
   /** Stamped at the first session read: subagent sessions never feed the thermostat
    *  or graduate notes; their findings return via the delegation summary. */
   subagent?: boolean
@@ -119,38 +117,41 @@ export function createController(ctx: Plugin.Context) {
   // Learned entries are read once per model per controller lifetime and refreshed
   // when a cycle closes; the clamp against the live window runs on every use.
   const thermostatEntries = new Map<string, ThermostatEntry>()
-  /** The effective auto budget for a model: today's static default until evidence
-   *  exists, then the learned value, always inside the window's physics. */
-  const learnedBudget = async (model: ModelRef | undefined, window: number): Promise<number> => {
+  /** The model's learned thermostat entry plus the window's physics bounds —
+   *  one accessor shared by the auto budget, the spike guard, and the gate
+   *  notice so all three judge the same state. */
+  const thermostatFor = async (model: ModelRef | undefined, window: number): Promise<{ bounds: BudgetBounds; entry: ThermostatEntry | undefined }> => {
     const bounds = budgetBounds(window, 100_000)
-    if (!model) return bounds.start
+    if (!model) return { bounds, entry: undefined }
     const key = modelLabel(model)
     let entry = thermostatEntries.get(key)
     if (entry === undefined) {
       entry = (await project.readThermostat())[key]
       if (entry) thermostatEntries.set(key, entry)
     }
-    return effectiveBudget(entry, bounds)
+    return { bounds, entry }
   }
-  /** Close one thermostat cycle at a committed handoff: fold the session's recall
-   *  count into the main model's entry. Fire-and-forget — advisory, never blocking. */
-  const closeThermostatCycle = (sessionID: SessionID) => {
-    const entry = sessions.get(sessionID)
-    const model = entry?.model, recalls = entry?.recalls ?? 0
-    if (entry) entry.recalls = 0 // The cycle is consumed whether or not learning persists.
+  /** Close one thermostat cycle at a committed handoff: fold the cycle's durable
+   *  tokens and assistant turns into the main model's entry. Fire-and-forget —
+   *  advisory, never blocking. */
+  const closeThermostatCycle = (sessionID: SessionID, spanRows: readonly Row[]) => {
+    const model = sessions.get(sessionID)?.model
     if (!model) return
+    const turns = spanRows.filter((row) => row.type === "assistant").length
+    if (turns < 1) return
+    const tokens = Math.round(durableTokens(spanRows) * usageScale(spanRows))
+    const key = modelLabel(model)
     void (async () => {
       const info = await ctx.session.get({ sessionID })
       // Subagents share the parent's model but not its cycles; forks are real sessions.
       if (info.parentID && !info.fork) return
       const window = (await windowSize(model))?.context
       if (window === undefined) return
-      const key = modelLabel(model)
-      const learned = await project.closeCycle(key, recalls, budgetBounds(window, 100_000))
+      const learned = await project.closeCycle(key, tokens, turns, budgetBounds(window, 100_000))
       if (!learned) return
       thermostatEntries.set(key, learned)
-      if (debug) console.info(`[nextdcp] thermostat ${key}: cycle ${learned.cycles}, ema ${learned.ema.toFixed(2)} recalls, budget ${learned.budget}`)
-    })().catch((error) => log("thermostat cycle", error))
+      if (debug) console.info(`[nextdcp] thermostat ${key}: cycle ${learned.cycles}, growth ${learned.growth.toFixed(0)} tokens/turn, span ${learned.span.toFixed(1)} turns, budget ${learned.budget}`)
+    })().catch((error) => warn(`thermostat cycle for ${key}`, error))
   }
   const inheritSession = (sessionID: SessionID, rows: readonly Row[], seen = new Set<string>()): Promise<void> => {
     if (seen.has(sessionID)) return Promise.reject(new Error("Cyclic fork ancestry"))
@@ -262,10 +263,12 @@ export function createController(ctx: Plugin.Context) {
       const entry = state(event.sessionID)
       if (growth === undefined) { entry.view = undefined; return }
       entry.view = { checkpoint, tokens: growth, after: rows.at(-1)?.id ?? null, response: responseTokens(rows.slice(-1)) }
-      const window = (await windowSize(event.model))?.context
+      const sizes = await windowSize(event.model)
+      const window = sizes?.context
       // An explicit options.budget wins absolutely; otherwise the thermostat owns
       // the auto budget, adapting per model inside the window's physics.
-      const budget = budgetOption || (window === undefined ? 0 : await learnedBudget(model, window))
+      const thermostat = window === undefined ? undefined : await thermostatFor(model, window)
+      const budget = budgetOption || (thermostat === undefined ? 0 : effectiveBudget(thermostat.entry, thermostat.bounds))
       // An unknown window disables the auto budget instead of assuming a size; surface
       // that state rather than silently never firing. Estimates meeting real window
       // sizes are calibrated against provider-reported usage when the host supplies it.
@@ -291,12 +294,29 @@ export function createController(ctx: Plugin.Context) {
           return void requestCompact(event.sessionID, checkpoint, growth)
         }
       }
+      // Rate-spike guard: the recent turns are growing at multiples of the learned
+      // rate — bulk reads and dumps, not conversation — so a cut here would shred
+      // work recall cannot reassemble cheaply. Hold this round's compaction the way
+      // a granted deferral did, automatically and for one round, while physics says
+      // the raw conversation still fits under the window minus its output reserve.
+      if (info && !info.revert && info.time?.busy !== undefined && !sameRound(current.deferral, info) &&
+          thermostat?.entry && thermostat.entry.growth > 0) {
+        const scale = usageScale(rows), recent = recentDurable(rows, RECENT_TURNS)
+        const reserve = sizes && sizes.output > 0 ? sizes.output : 8_192
+        if (recent.turns > 0 && (recent.tokens * scale) / recent.turns >= SPIKE * thermostat.entry.growth &&
+            conversationTokens(rows) * scale <= Math.floor((sizes!.context - reserve) * DEFER_WINDOW_SHARE)) {
+          current.deferral = { busy: info.time.busy, idle: info.time.idle, approved: true }
+          current.precompute = undefined
+          gateStat(event.sessionID, "spikeHeld")
+          return
+        }
+      }
       // Arm the gate together with its notice. The notice rides the conversation tail
       // — the most salient and the cheapest position: a request-scoped message touches
       // no cached prefix, unlike a system part before the whole history.
       if (info?.time?.busy !== undefined && current.guard === undefined && (current.cooldownUntil ?? 0) <= Date.now() && !sameRound(current.deferral, info) && !recentToolFailure(rows)) {
         current.gate = { busy: info.time.busy, idle: info.time.idle, checkpoint, growth }
-        const text = budgetGateNotice(estimate, budget, window)
+        const text = budgetGateNotice(estimate, budget, window, thermostat !== undefined && overWindow(thermostat.entry, thermostat.bounds))
         if (noticeInSystem) event.system.push({ type: "text", text })
         else messages.push({ role: "user", content: [{ type: "text", text } as Part] })
         gateStat(event.sessionID, "gates")
@@ -312,7 +332,7 @@ export function createController(ctx: Plugin.Context) {
   }
 
   // A saved record is authoritative; anything else with a textual summary is adopted as a native episode.
-  const ensureCheckpoint = async (sessionID: SessionID, id: string, row?: Row, rows?: readonly Row[], seen = new Set<string>()): Promise<void> => {
+  const ensureCheckpoint = async (sessionID: SessionID, id: string, row?: Row, rows?: readonly Row[], seen = new Set<string>(), external = true): Promise<void> => {
     if (seen.has(id)) throw new Error("Cyclic native checkpoint")
     seen.add(id)
     const store = storeFor(sessionID), saved = await store.getCheckpoint(id)
@@ -325,18 +345,26 @@ export function createController(ctx: Plugin.Context) {
     // An encrypted native window cannot be represented by an empty textual episode.
     if (typeof row.summary !== "string" || !row.summary.trim()) throw new Error("Native checkpoint has no textual summary")
     let boundary = await store.getPending(id) ?? sessions.get(sessionID)?.boundaries?.get(id)
+    const pluginCycle = boundary !== undefined
     if (!boundary && rows?.some((item) => item.id === id)) {
       const cut = planCut(rows, id)
       boundary = { id, parent: cut.parent, rowIDs: cut.rowIDs, archived: false }
     }
     const parent = boundary?.parent
-    if (parent) await ensureCheckpoint(sessionID, parent, rows?.find((item) => item.id === parent), rows, seen)
+    if (parent) await ensureCheckpoint(sessionID, parent, rows?.find((item) => item.id === parent), rows, seen, false)
     // Adoption adds an episode to the searchable chain. The parent's working state and
     // a failed cycle's reserved episode id both carry over: patch mode resumes after a
     // native fallback and the catalog shows no hole.
     indexes.delete(sessionID)
     const inherited = parent ? await store.getCheckpoint(parent) : undefined
     await store.saveCheckpoint(adoptNative(row, boundary?.episode ?? await store.nextEpisode(), boundary, inherited))
+    // A native row with no plugin record behind it was applied without this plugin's
+    // hook: experimental.background_compaction, or a host reload that raced it. The
+    // hook's precompute path archives the window it sees, but anything elided outside
+    // that window is gone from recall — the one case where the archive can lie.
+    if (external && !pluginCycle) {
+      await models.warning(sessionID, `Native compaction ${shortId(id)} ran without a nextdcp handoff (experimental.background_compaction, or a host reload raced the plugin); nextdcp archived the window it saw, but anything elided outside that window is not recallable.`)
+    }
     const live = sessions.get(sessionID)
     if (live?.boundaries) live.boundaries.delete(id)
   }
@@ -390,6 +418,11 @@ export function createController(ctx: Plugin.Context) {
   }
 
   const onCompaction = async (event: SessionCompaction) => {
+    // Warnings raised during this cycle describe a live condition — a compaction model
+    // that fell back to the main model will fall back again — so only prior-cycle
+    // warnings go stale when a handoff commits.
+    let warned = false
+    const warnCycle = (message: string) => { warned = true; return models.warning(event.sessionID, message) }
     const store = storeFor(event.sessionID)
     // Archival mutates the searchable set: rows, calls, and possibly the chain.
     indexes.delete(event.sessionID)
@@ -412,7 +445,7 @@ export function createController(ctx: Plugin.Context) {
       boundaries.delete(boundary.id)
     } catch (error) {
       warn("archive before compaction; using native", error)
-      await models.warning(event.sessionID, "Cannot prepare the episode archive; using native OpenCode compaction and its configured model.")
+      await warnCycle("Cannot prepare the episode archive; using native OpenCode compaction and its configured model.")
       return
     }
     // Do not replace a result already supplied by another plugin; the archive remains useful.
@@ -445,10 +478,10 @@ export function createController(ctx: Plugin.Context) {
         users: users.map((user) => ({ id: user.id, start: user.text.slice(0, 160) })), ...(queued ? { queued } : {}) }
       let target: ModelRef | undefined
       try { target = await models.select(event.sessionID) } catch {
-        await models.warning(event.sessionID, "Cannot read compaction-model policy; using the main model for this compaction.")
+        await warnCycle("Cannot read compaction-model policy; using the main model for this compaction.")
       }
       const fallback = async (prompt: string, reason: string) => {
-        await models.warning(event.sessionID, `${reason}; using the main model for this request. No transcript was truncated.`)
+        await warnCycle(`${reason}; using the main model for this request. No transcript was truncated.`)
         return (await ctx.session.generate({ sessionID: event.sessionID, prompt })).text.trim()
       }
       // The exact episode record the handoff will commit; its anchor must be part of every
@@ -542,7 +575,7 @@ export function createController(ctx: Plugin.Context) {
       if (!chosen) {
         if (!candidates.length) throw new Error("No bounded handoff")
         const best = candidates.reduce((shortest, item) => (item.size < shortest.size ? item : shortest))
-        await models.warning(event.sessionID, `Working state exceeded its budget (${best.size} > ${memoryBudget} estimated tokens); accepted the shortest valid handoff rather than falling back to unbounded native compaction.`)
+        await warnCycle(`Working state exceeded its budget (${best.size} > ${memoryBudget} estimated tokens); accepted the shortest valid handoff rather than falling back to unbounded native compaction.`)
         chosen = { handoff: best.handoff, summary: best.rendered }
       }
       const { handoff, summary } = chosen
@@ -550,13 +583,17 @@ export function createController(ctx: Plugin.Context) {
       const record: Checkpoint = { id: boundary.id, parent: boundary.parent, episode, working: handoff.working,
         ...(handoff.retiredConstraints.length ? { retiredConstraints: handoff.retiredConstraints } : {}) }
       await store.saveCheckpoint(record)
-      closeThermostatCycle(event.sessionID)
+      if (!warned) await models.clearWarning(event.sessionID)
+      // The closing cycle spans the rows this cut archived: everything after the
+      // previous checkpoint. Measured in durable tokens and assistant turns.
+      const parentIndex = boundary.parent === null ? -1 : rows.findIndex((row) => row.id === boundary.parent)
+      closeThermostatCycle(event.sessionID, rows.slice(parentIndex + 1))
       const live = sessions.get(event.sessionID)
       if (live) live.hint = undefined // The committed handoff is the signal's only consumer.
       event.result = { summary, metadata: { nextdcp: { version: 2 } } }
     } catch (error) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
-      await models.warning(event.sessionID, `Working-state compaction failed (${detail}); using native OpenCode compaction and its configured model. This safety fallback is not size-bounded; no active constraints were silently truncated.`)
+      await warnCycle(`Working-state compaction failed (${detail}); using native OpenCode compaction and its configured model. This safety fallback is not size-bounded; no active constraints were silently truncated.`)
     }
   }
 
@@ -705,9 +742,6 @@ export function createController(ctx: Plugin.Context) {
       if (query.length > 2_000) return "Use a query of at most 2,000 characters; prefer exact identifiers and a few task keywords."
       if (id.length > 2_000) return "Use an id of at most 2,000 characters; addresses are short handles like E57, call_01HZ2a3 or catalog."
       if (page !== undefined && (!Number.isSafeInteger(page) || page < 1)) return "Page must be a positive integer."
-      // Every dispatched recall is thermostat evidence: pressure on the current cycle.
-      const counted = state(sessionID)
-      counted.recalls = (counted.recalls ?? 0) + 1
       const store = storeFor(sessionID)
       const target = id ? parseTarget(id) : undefined
       if (target?.kind === "error") return target.message
@@ -829,75 +863,6 @@ export function createController(ctx: Plugin.Context) {
       return `Historical evidence, page ${at} of ${Math.ceil(hits.length / SEARCH_PAGE_HITS)} (${hits.length} hit${hits.length === 1 ? "" : "s"})${hits.length === MAX_SEARCH_HITS ? `; top ${MAX_SEARCH_HITS} matches only—narrow the query for other evidence` : ""}\n${lines.join("\n")}`
     } catch (error) { log("recall", error); return `Recall unavailable: ${error instanceof Error ? error.message : "unexpected error"}` }
   }
-  const deferredNotice = "Compaction is deferred for this round only. Manual compaction and native overflow handling remain enabled. Already-queued compaction is not canceled. The next round starts from this full context and re-evaluates on its own."
-  const deferCompaction = async (input: { reason: string }, context: ToolContext) => {
-    const { sessionID } = context
-    // Gate first: outside the open budget gate's evaluation window there is nothing to
-    // defer, and no permission is ever spent on a call the notice did not invite.
-    let info: SessionInfo, rows: readonly Row[]
-    try {
-      [info, rows] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.context({ sessionID })])
-    } catch (error) {
-      log("deferral gate", error)
-      return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
-    }
-    const gate = sessions.get(sessionID)?.gate
-    if (!gate || !sameRound(gate, info) || gate.checkpoint !== activeCheckpoint(rows))
-      return "Compaction deferral is only available at an open budget gate; this request is outside one. Normal compaction and recall remain enabled."
-    const reason = input.reason.trim()
-    if (!reason || reason.length > 2_000) return "Provide a concrete current need of 1 to 2,000 characters and explain why checkpointing plus recall would materially impair the task."
-    if (info.revert || info.time.busy === undefined) return "Compaction deferral is only available during an active round, without a staged revert."
-    const entry = state(sessionID)
-    const previous = entry.deferral
-    if (previous && sameRound(previous, info)) return previous.approved ? deferredNotice : "Compaction deferral has already been requested for this round. Do not ask again; continue with normal compaction and recall."
-
-    // Physics before consent: a grant must fit the window, so no approval is spent on a
-    // conversation that overflows anyway. Nothing is recorded on denial; recomputing is
-    // cheap and never prompts.
-    let window: { context: number; output: number } | undefined
-    try {
-      window = await windowSize(info.model)
-    } catch (error) {
-      log("deferral physics", error)
-      return "Compaction deferral is unavailable right now: the conversation could not be read. Normal compaction remains enabled."
-    }
-    if (window === undefined) {
-      gateStat(sessionID, "deferPhysicsRefused")
-      return `Compaction deferral is denied: the model's context window is unknown, so a live whole-context round cannot be guaranteed.${budgetOption === 0 ? " The automatic mid-round budget trigger is likewise disabled while the window is unknown; set options.budget to an explicit token count to enable it." : ""} Recall selectively instead.`
-    }
-    // The output limit and a 20% share of the rest stay unspent: system instructions,
-    // tool definitions, and the round's own output must still fit nextdcp's estimate.
-    const reserve = window.output > 0 ? window.output : 8_192
-    const windowTokens = window.context
-    const estimate = Math.round(conversationTokens(rows) * usageScale(rows)), ceiling = Math.floor((windowTokens - reserve) * DEFER_WINDOW_SHARE)
-    if (estimate > ceiling) {
-      gateStat(sessionID, "deferPhysicsRefused")
-      return `Compaction deferral is denied: this conversation already totals about ${estimate} estimated tokens, above the grant ceiling of ${ceiling} of the ${windowTokens}-token window. Recall selectively instead of holding everything live.`
-    }
-
-    // An unapproved record also prevents concurrent requests and retries after refusal.
-    const decision: Deferral = { busy: info.time.busy, idle: info.time.idle, approved: false }
-    entry.deferral = decision
-    // Preserve native rejection/interruption errors; returning them would change host control flow.
-    gateStat(sessionID, "deferPrompted")
-    try {
-      await ctx.permission.assert({
-        sessionID, agent: context.agent, action: "defer_compaction", resources: [reason], save: ["*"],
-        source: { type: "tool", messageID: context.messageID, id: context.id },
-      })
-    } catch (error) {
-      gateStat(sessionID, "deferUserRefused")
-      throw error
-    }
-    const current = await ctx.session.get({ sessionID })
-    if (sessions.get(sessionID)?.deferral !== decision || !sameRound(decision, current)) return "That round ended before deferral could take effect; normal compaction remains enabled."
-    decision.approved = true
-    // A granted deferral discards the gate-window precompute: the held round keeps
-    // accumulating raw context, so a handoff generated before it must never be applied.
-    entry.precompute = undefined
-    gateStat(sessionID, "deferGranted")
-    return deferredNotice
-  }
   // The model-facing early checkpoint: the same compaction the trigger would run,
   // just earlier and model-steered. Approval-free by design — it releases context,
   // never holds it — and once per round.
@@ -942,7 +907,7 @@ export function createController(ctx: Plugin.Context) {
     gateStat(sessionID, "checkpoints")
     return `Checkpointing now${keep ? " (keep note attached)" : ""}: the conversation is archived and you continue from the small working state. Everything returns with recall.`
   }
-  return { onPrompt, onContext, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, deferCompaction, checkpointNow, registerModels: models.register }
+  return { onPrompt, onContext, onCompaction, onIdle, onRoundEnded, onCompactionFinished, onDeleted, onFork, recall, checkpointNow, registerModels: models.register }
 }
 
 /** Register the documented v2 hooks and tools. */
@@ -965,32 +930,8 @@ export async function install(ctx: Plugin.Context) {
       execute: async (input, context) => ({ content: await controller.checkpointNow(input as { keep?: string }, context) }),
     })
   })
-  // The deferral gate is the only consumer of the experimental permission surface.
-  // Feature-detect and register it defensively: a V2.3 shape change warns once and
-  // leaves recall and archival alive instead of failing plugin setup.
-  if (typeof ctx.agent?.transform === "function" && typeof ctx.permission?.assert === "function") {
-    try {
-      await ctx.agent.transform((editor) => {
-        for (const item of editor.list()) editor.update(item.id, (agent) => {
-          // Insert after the host's default allow, before configured rules. Native saved
-          // approvals still win; forcing ask in an evaluate hook would override them.
-          const first = agent.permissions[0]
-          const index = first?.action === "*" && first.resource === "*" && first.effect === "allow" ? 1 : 0
-          agent.permissions.splice(index, 0, { action: "defer_compaction", resource: "*", effect: "ask" })
-        })
-      })
-      await ctx.tool.transform((editor) => {
-        editor.add({
-          name: "defer_compaction", description: DEFER_COMPACTION_DESCRIPTION,
-          input: { type: "object", properties: { reason: { type: "string", minLength: 1, maxLength: 2_000, description: "Concrete present need for simultaneous context and why checkpointing plus recall is insufficient." } }, required: ["reason"], additionalProperties: false },
-          options: { permission: "defer_compaction", codemode: false },
-          execute: async (input, context) => ({ content: await controller.deferCompaction(input as { reason: string }, context) }),
-        })
-      })
-    } catch (error) {
-      console.warn(`[nextdcp] defer_compaction registration failed; deferral is unavailable${error instanceof Error ? `: ${error.message}` : ""}`)
-    }
-  } else console.warn("[nextdcp] this OpenCode build lacks the permission surface; defer_compaction is unavailable")
+  // Compaction outcomes arrive on the shared event subscription in setup(), which
+  // owns the reconnect backoff; install only registers tools and hooks.
   await ctx.session.hook("prompt", controller.onPrompt)
   await ctx.session.hook("context", controller.onContext)
   await ctx.session.hook("compaction", controller.onCompaction)

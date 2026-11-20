@@ -30,14 +30,14 @@ export const GRADUATE_CAP = 200
 /** Per-session counts of budget-gate outcomes. Telemetry only: never a trigger input. */
 export type GateStats = {
   gates: number; silent: number; continued: number; repaid: number
-  deferPrompted: number; deferGranted: number; deferUserRefused: number; deferPhysicsRefused: number
+  spikeHeld: number
   checkpoints: number
   precomputes: number; precomputeHits: number; gateAliases: number
 }
 
 const ZERO_STATS: GateStats = {
   gates: 0, silent: 0, continued: 0, repaid: 0,
-  deferPrompted: 0, deferGranted: 0, deferUserRefused: 0, deferPhysicsRefused: 0,
+  spikeHeld: 0,
   checkpoints: 0,
   precomputes: 0, precomputeHits: 0, gateAliases: 0,
 }
@@ -141,11 +141,11 @@ export function createProjectStore(storage: Storage, report: Reporter = defaultR
     readThermostat: () => readModels(),
     /** Fold one completed cycle into a model's entry and persist it. Returns the
      *  new entry, or undefined when storage failed (reported, never thrown). */
-    closeCycle: async (model: string, recalls: number, bounds: BudgetBounds): Promise<ThermostatEntry | undefined> => {
+    closeCycle: async (model: string, tokens: number, turns: number, bounds: BudgetBounds): Promise<ThermostatEntry | undefined> => {
       try {
         return await exclusive(thermostatKey, async () => {
           const models = await readModels()
-          const entry = closeCycle(models[model], recalls, bounds)
+          const entry = closeCycle(models[model], tokens, turns, bounds)
           await put(thermostatKey, { ...models, [model]: entry })
           return entry
         })
@@ -211,13 +211,14 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   }
   const saveDeferredCompaction = (value: DeferredCompaction) => put(deferredKey, value)
   /** Count one gate event and return the new totals. Failures are reported, never thrown:
-   *  telemetry must not break a trigger. */
+   *  telemetry must not break a trigger. A stored record that no longer matches the
+   *  shape — corrupt, or from before a field swap — restarts from zero rather than
+   *  poisoning or blocking telemetry; the next count overwrites it well-formed. */
   const countGate = async (field: keyof GateStats): Promise<GateStats | undefined> => {
     try {
       return await exclusive(statsKey, async () => {
         const stored = await get<unknown>(statsKey)
-        if (stored !== undefined && !statsShape(stored)) throw new Error(`Invalid gate stats record: ${statsKey}`)
-        const stats: GateStats = stored === undefined ? { ...ZERO_STATS } : stored
+        const stats: GateStats = statsShape(stored) ? stored : { ...ZERO_STATS }
         const next = { ...stats, [field]: stats[field] + 1 }
         await put(statsKey, next)
         return next
@@ -229,8 +230,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
   }
   const getGateStats = async (): Promise<GateStats> => {
     const stored = await get<unknown>(statsKey)
-    if (stored !== undefined && !statsShape(stored)) throw new Error(`Invalid gate stats record: ${statsKey}`)
-    return stored === undefined ? { ...ZERO_STATS } : stored as GateStats
+    return statsShape(stored) ? stored : { ...ZERO_STATS }
   }
   const hasInherited = async () => {
     const source = await get<unknown>(`${root}fork`)

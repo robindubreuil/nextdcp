@@ -444,6 +444,17 @@ test("formatCatalog is a compact index by default, whole notes on the all view, 
   assert.equal(formatCatalog(many).split("\n").length, 41, "every entry gets its line; paging replaces the old drop-oldest tail")
 })
 
+test("formatCatalog names allocated-but-never-committed ids as gaps, not corruption", () => {
+  const note = (id) => ({ id, note: "body" })
+  const gap = (ids) => `Missing ids: ${ids} — allocated but never committed (failed cycles before reservations, or reverted branches)`
+  assert.equal(formatCatalog([note("E1"), note("E3")]).split("\n")[1], gap("E2"), "a hole between committed ids names the missing id")
+  assert.equal(formatCatalog([note("E1"), note("E3")], "all").split("\n\n")[1], gap("E2"), "the all view carries the same labeled line")
+  assert.equal(formatCatalog([note("E1"), note("E3"), note("E5")]).split("\n")[1], gap("E2, E4"), "every hole in range is named")
+  assert.equal(formatCatalog([note("E1"), note("E2")]).split("\n")[1], "E2 — (native summary)", "contiguous ids add no line")
+  assert.equal(formatCatalog([note("E1")]).split("\n")[1], "E1 — (native summary)", "a single entry cannot show a gap")
+  assert.equal(formatCatalog([note("E1"), note("E9")]).split("\n")[1], "E9 — (native summary)", "a range dwarfing the entries reads as non-sequential ids, not gaps")
+})
+
 test("parseTarget reads every rendered address and rejects what it cannot mean", () => {
   assert.deepEqual(parseTarget("catalog"), { kind: "catalog" })
   assert.deepEqual(parseTarget("catalog all"), { kind: "catalog", all: true })
