@@ -23,6 +23,8 @@ export function parseCheckpoint(input: CheckpointInput, previous: WorkingMemory 
     if (!object(item) || Object.keys(item).some((key) => !["constraint", "quote"].includes(key)) ||
         typeof item.constraint !== "string" || typeof item.quote !== "string" || !item.quote.trim()) throw new HandoffError("Invalid constraint retirement")
   }
+  if (typeof input.archive !== "string" || !input.archive.trim())
+    throw new HandoffError("Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation")
   const raw = JSON.stringify({ archive: input.archive, working: input.working === undefined ? {} : input.working, retiredConstraints: input.retire ?? [] })
   if (!previous && !input.working) throw new HandoffError("No structured working state yet; supply all working fields or call with {} to let the compactor seed it")
   return previous ? parsePatchHandoff(raw, previous, users, ids) : parseHandoff(raw, { constraints }, users, ids, priorSummary)
@@ -74,7 +76,7 @@ const text = { type: "string", minLength: 1 } as const
 const list = { type: "array", items: text } as const
 export const CHECKPOINT_INPUT = {
   type: "object", additionalProperties: false, properties: {
-    archive: { ...text, description: "Direct edit: 'Title: <name>' then 1–3 short outcome/search-cue sentences. Cold note, not live state." },
+    archive: { ...text, description: "Required on a direct edit: 'Title: <name>' then 1–3 short outcome/search-cue sentences. Cold note, not live state." },
     working: { type: "object", additionalProperties: false, properties: {
       objective: text, constraints: { ...list, description: "Standing user rules: short self-contained exact quotes from new user text. Not host/AGENTS.md rules, plans or task requirements. Remove old rules only via retire." }, state: list, next: list,
       references: { type: "array", maxItems: 3, items: { type: "object", additionalProperties: false, required: ["id", "why"], properties: { id: text, why: text } } },

@@ -20,10 +20,19 @@ const text = (value: unknown): value is string => typeof value === "string" && !
 const list = (value: unknown): value is string[] => Array.isArray(value) && value.every(text)
 const keys = (value: Record<string, unknown>, expected: readonly string[]) => Object.keys(value).every((key) => expected.includes(key))
 
+const FIELDS = ["objective", "constraints", "state", "next", "references"] as const
+
 export function validWorking(value: unknown): value is WorkingMemory {
-  return object(value) && keys(value, ["objective", "constraints", "state", "next", "references"]) && text(value.objective) &&
+  return object(value) && keys(value, FIELDS) && text(value.objective) &&
     list(value.constraints) && list(value.state) && list(value.next) && Array.isArray(value.references) && value.references.length <= 3 &&
     value.references.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why))
+}
+
+/** The schema failure, named: a complete state carries every field, and the
+ *  omission itself is the repair a model needs instead of a generic rejection. */
+const workingProblem = (value: unknown): string => {
+  const missing = FIELDS.filter((key) => !(key in (object(value) ? value : {})))
+  return `Handoff has an invalid handoff schema: ${missing.length ? `working is missing ${missing.join(", ")}, a complete state needs all five fields (use [] for empty lists)` : "objective is text, constraints/state/next are string lists, references are {id, why} pairs"}`
 }
 
 /** Only the author's explicit Title line names an episode; the note body stays archived. */
@@ -146,7 +155,7 @@ const mergeConstraints = (previous: readonly string[], retired: ReadonlySet<stri
 /** Validate before committing. Never repair malformed JSON by silently discarding fields. */
 export function parseHandoff(raw: string, previous: PriorConstraints | undefined, rows: readonly SourceRow[], ids: ReadonlySet<string>, priorSummary?: string): Handoff {
   const value = parseShell(raw)
-  if (!validWorking(value.working)) throw new HandoffError("Handoff has an invalid handoff schema")
+  if (!validWorking(value.working)) throw new HandoffError(workingProblem(value.working))
   const users = userSources(rows)
   // An inherited native summary supplies language only, never retirement proof.
   const archive = shellArchive(value, users, previous, priorSummary)

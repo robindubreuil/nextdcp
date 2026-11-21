@@ -30,6 +30,13 @@ test("a main author can seed a full state, but cannot apply a partial edit to an
   assert.deepEqual(protectedSeed.working.constraints, working.constraints, "native fallback's surviving constraints remain protected")
 })
 
+test("rejections name the defect and the repair so a model recovers in one call", () => {
+  assert.throws(() => parseCheckpoint(edit({ objective: "Ship", constraints: [], state: ["Sealed"], next: [] }), undefined, [], [], ids),
+    /working is missing references, a complete state needs all five fields \(use \[\] for empty lists\)/)
+  assert.throws(() => parseCheckpoint({ working: { state: ["Sealed"] } }, working, working.constraints, [], ids),
+    /Archive note is required on a direct edit.*use \{\} for compactor generation/)
+})
+
 test("main-authored seeds may inherit native-summary language but not its authority to retire constraints", () => {
   const input = { archive: "Title: 验证修复\n继续验证修复结果。", working: { ...working, objective: "调查并修复对话层污染问题" } }
   const quote = "You may now discard my local changes."
