@@ -5,7 +5,7 @@ import { rowCalls } from "./store.ts"
 import type { ProviderUsage } from "./memory-rpc.ts"
 
 // Token estimation over host rows and hook messages. The budget gate, the idle
-// trigger, and the deferral ceiling all meter against these counts, calibrated
+// trigger, and the capacity ceiling all meter against these counts, calibrated
 // against provider-reported usage where the host supplies it.
 
 export type ViewMessage = Message & { readonly id?: string; readonly role?: string }
@@ -20,16 +20,9 @@ export function requestParts(request: { readonly system: readonly Part[]; readon
 }
 export const requestTokens = (request: Parameters<typeof requestParts>[0]): number => requestParts(request).total
 
-/** Conversation tokens sent after the checkpoint message; undefined when that message is not identifiable. */
-export function growthAfter(messages: readonly ViewMessage[], checkpoint: string | null): number | undefined {
-  const start = checkpoint === null ? 0 : messages.findIndex((message) => message.id === checkpoint) + 1
-  if (start === 0 && checkpoint !== null) return undefined
-  return messageTokens(messages.slice(start).filter((message) => message.role !== "system"))
-}
-
-/** Upper bound on the raw conversation a deferral may hold live, as a share of the window left after the output reserve. */
-export const DEFER_WINDOW_SHARE = 1
 export const REQUEST_MARGIN = 1_024
+/** Fallback output reserve when a model advertises none. */
+export const DEFAULT_OUTPUT_RESERVE = 8_192
 
 /** Estimated tokens of a user-row attachment: fixed media rates, decoded text size otherwise. */
 function attachmentTokens(file: unknown): number {
@@ -65,19 +58,6 @@ function otherTokens(row: Row): number {
   }
   return 0
 }
-
-/** Estimated tokens of the raw conversation a deferral would hold live,
- *  counting the same text and reasoning parts that responseTokens counts. */
-export function conversationTokens(rows: readonly Row[]): number {
-  return rows.reduce((sum, row) => {
-    if (row.type === "user") return sum + userTokens(row)
-    return sum + (row.type === "assistant" ? assistantTokens(row) : otherTokens(row))
-  }, 0)
-}
-
-/** The measurement window for the live growth rate: the most recent assistant
- *  turns whose durable tokens one backwards walk counts. */
-export const RECENT_TURNS = 10
 
 /** Durable tokens of the rows a compaction cut would archive: user rows plus
  *  assistant text, reasoning and tool calls. Reasoning counts because replaying
@@ -176,7 +156,7 @@ export function usageScale(rows: readonly Row[]): number {
       // The earlier row's own output lands in the later request; a span holding a
       // checkpoint or a model change cannot attribute billed growth to its rows.
       const span = rows.slice(at, later.at), growth = later.billed - billed
-      const estimate = conversationTokens(span)
+      const estimate = durableTokens(span)
       const usable = growth > 0 && estimate >= 256 && key(row) === later.model &&
         !span.some((entry) => entry.type === "compaction" || entry.type === "model-switched")
       const ratio = growth / estimate
@@ -187,9 +167,4 @@ export function usageScale(rows: readonly Row[]): number {
   if (!samples.length) return 1
   const sorted = [...samples].sort((a, b) => a - b)
   return sorted[Math.floor(sorted.length / 2)]
-}
-
-/** Only newly generated assistant rows, not a second projection of the history. */
-export function responseTokens(rows: readonly Row[]): number {
-  return rows.reduce((sum, row) => sum + (row.type === "assistant" ? assistantTokens(row) : 0), 0)
 }

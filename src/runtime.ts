@@ -14,7 +14,7 @@ import { createLifecycle } from "./lifecycle.ts"
 import { modelLabel, type ModelRef } from "./model-rpc.ts"
 import { memoryRpc, type BudgetScope, type MemoryDecision, type MemoryRequest, type MemoryStatus } from "./memory-rpc.ts"
 import { object, positive, modelRef } from "./guards.ts"
-import { durableTokens, evidenceTokens, latestProviderUsage, recentDurable, requestParts, retainedTokens, usageScale, REQUEST_MARGIN, RECENT_TURNS, type ViewMessage } from "./estimate.ts"
+import { DEFAULT_OUTPUT_RESERVE, durableTokens, evidenceTokens, latestProviderUsage, recentDurable, requestParts, retainedTokens, usageScale, REQUEST_MARGIN, type ViewMessage } from "./estimate.ts"
 import { captureEvidence, changedEvidence, CHECKPOINT_INPUT, parseCheckpoint, type CheckpointInput, type Evidence, type Publication } from "./checkpoint.ts"
 import { freshEvidence, liveBudget, NEAR_SHARE, pause, reminderFor, type Reminder } from "./safeguard.ts"
 import { commandsIn, createNudge, renderNudge } from "./recurring.ts"
@@ -83,6 +83,10 @@ const activeCheckpoint = (rows: readonly Row[]) => rows.findLast((row) => row.ty
 const running = (rows: readonly Row[]) => rows.some((row) => row.type === "compaction" && row.status === "running")
 const GUARD_TIMEOUT = 3 * 60_000
 const TRANSCRIPT_CACHE_CHARS = 8_000_000
+const INDEX_CACHE_CHARS = 8_000_000
+/** The measurement window for the live growth rate: the most recent assistant
+ *  turns whose durable tokens one backwards walk counts. */
+const RECENT_TURNS = 10
 
 /** Controller is independent of hook registration so fallback and concurrency can be tested. */
 export function createController(context: Plugin.Context) {
@@ -107,9 +111,29 @@ export function createController(context: Plugin.Context) {
   let transcriptChars = 0
   // Search documents are immutable per id (rows and calls are write-once, transcripts
   // never change), but the searchable set follows the archive and the active episode
-  // chain. The corpus is cached per session, keyed on the checkpoint, and dropped at
-  // every archive mutation; the next query rebuilds it from the cached transcripts.
-  const indexes = new Map<string, { checkpoint: string | null; documents: SearchDocument[] }>()
+  // chain. The corpus is cached per session, keyed on the checkpoint, dropped at
+  // every archive mutation, and LRU-evicted under the same ceiling as transcripts;
+  // the next query rebuilds it from the cached transcripts.
+  const indexes = new Map<string, { checkpoint: string | null; documents: SearchDocument[]; chars: number }>()
+  let indexChars = 0
+  const dropIndex = (sessionID: string) => {
+    const cached = indexes.get(sessionID)
+    if (cached === undefined) return
+    indexes.delete(sessionID)
+    indexChars -= cached.chars
+  }
+  /** Record a session's corpus, evicting least-recently-used entries so the cache
+   *  stays bounded the way transcripts are. */
+  const keepIndex = (sessionID: string, entry: { checkpoint: string | null; documents: SearchDocument[]; chars: number }) => {
+    dropIndex(sessionID)
+    indexes.set(sessionID, entry)
+    indexChars += entry.chars
+    for (const [oldest, value] of indexes) {
+      if (indexChars <= INDEX_CACHE_CHARS || oldest === sessionID) break
+      indexes.delete(oldest)
+      indexChars -= value.chars
+    }
+  }
   const keyFor = (sessionID: string, id: string) => `${sessionID}\0${id}`
   const warn = (where: string, error?: unknown) => {
     const detail = error instanceof Error ? `: ${error.message}` : error === undefined ? "" : `: ${String(error)}`
@@ -163,12 +187,18 @@ export function createController(context: Plugin.Context) {
    *  one accessor shared by the auto budget, the spike guard, and the gate
    *  notice so all three judge the same state. */
   const thermostatFor = async (sessionID: SessionID, model: ModelRef | undefined, window: number, output: number, input?: number): Promise<Thermostat> => {
-    const bounds = budgetBounds(window, output || 8_192, input)
+    const bounds = budgetBounds(window, output || DEFAULT_OUTPUT_RESERVE, input)
     if (!model) return { bounds, entry: undefined }
     const entry = (await projectFor((await ownerFor(sessionID)).projectID).readThermostat())[modelLabel(model)]
     return { bounds, entry }
   }
   const softBudget = (thermostat?: Thermostat) => budgetOption || (thermostat === undefined ? 0 : effectiveBudget(thermostat.entry, thermostat.bounds))
+  /** The live-budget triple every consumer must agree on: fresh cycle evidence
+   *  buys temporary room within `room` — safe capacity less fixed overhead. */
+  const liveFor = (baseline: number, cycleRows: readonly Row[], scale: number, room: number) => {
+    const evidence = automatic && baseline > 0 && Number.isFinite(baseline) ? freshEvidence(cycleRows, scale) : { tokens: 0, weighted: 0 }
+    return automatic ? liveBudget(baseline, evidence, room) : { baseline, allowance: 0, budget: baseline }
+  }
   const decide = (entry: SessionState, action: string, reason: string) => { entry.decision = { at: Date.now(), action, reason } }
   /** Close one thermostat cycle at a committed handoff: fold the cycle's durable
    *  tokens and assistant turns into the main model's entry. Fire-and-forget —
@@ -188,7 +218,7 @@ export function createController(context: Plugin.Context) {
       if (info.parentID && !info.fork) return
       const sizes = await windowSize(model)
       if (sizes === undefined) return
-      const learned = await projectFor(info.projectID).closeCycle(key, tokens, turns, budgetBounds(sizes.context, sizes.output || 8_192, sizes.input), baseline)
+      const learned = await projectFor(info.projectID).closeCycle(key, tokens, turns, budgetBounds(sizes.context, sizes.output || DEFAULT_OUTPUT_RESERVE, sizes.input), baseline)
       if (!learned) return
       if (debug) console.info(`[nextdcp] thermostat ${key}: cycle ${learned.cycles}, growth ${learned.growth.toFixed(0)} tokens/turn, span ${learned.span.toFixed(1)} turns, budget ${learned.budget}`)
     }, undefined).catch((error) => warn(`thermostat cycle for ${key}`, error))
@@ -206,7 +236,7 @@ export function createController(context: Plugin.Context) {
       const ancestry = new Set(seen).add(sessionID)
       await inheritSession(info.fork.sessionID, snapshot, ancestry)
       // The import adds searchable rows, calls, and checkpoints to this archive.
-      indexes.delete(sessionID)
+      dropIndex(sessionID)
       await storeFor(sessionID).inherit(info.fork.sessionID, rows, snapshot)
     })()
     const entry = state(sessionID)
@@ -329,7 +359,6 @@ export function createController(context: Plugin.Context) {
       return
     }
     const checkpoint = activeCheckpoint(rows)
-    state(event.sessionID).evidence = { checkpoint, value: captureEvidence(rows) }
     // Stamp the main model per build: it is the thermostat's per-model key when
     // this session's cycle closes at its next committed handoff.
     const model = modelRef(event.model)
@@ -349,10 +378,14 @@ export function createController(context: Plugin.Context) {
       // Automatic fallback meters the whole retained conversation. Explicit budget
       // and idle overrides keep their historical NEW-durable-growth semantics.
       const scale = usageScale(rows), cycleRows = rows.slice(start), growth = durableTokens(cycleRows) * scale
+      // A main-authored edit's evidence is observed over the cycle only: rows before
+      // the checkpoint are pinned by the checkpoint-id comparison and immutable while
+      // it is active, so re-hashing them proves nothing.
+      state(event.sessionID).evidence = { checkpoint, value: captureEvidence(cycleRows) }
       const measured = automatic ? retainedTokens(rows) * scale : growth
       const sizes = await windowSize(event.model)
       const window = sizes?.context
-      const reserve = positive(event.options?.maxTokens, sizes?.output || 8_192)
+      const reserve = positive(event.options?.maxTokens, sizes?.output || DEFAULT_OUTPUT_RESERVE)
       const thermostat = window === undefined ? undefined : await thermostatFor(event.sessionID, model, window, reserve, sizes?.input)
       const baseline = softBudget(thermostat)
       entry.view = { checkpoint, after: rows.at(-1)?.id ?? null, threshold: idleOption || baseline || Infinity,
@@ -360,7 +393,7 @@ export function createController(context: Plugin.Context) {
       // Capacity is rechecked on EVERY build, before any held-round or growth return.
       // All assembled instructions, tool definitions and projected history count.
       const parts = requestParts(event), projected = parts.total * scale
-      const ceiling = sizes ? Math.max(0, Math.min(sizes.context - reserve, sizes.input ?? Infinity) - REQUEST_MARGIN) : Infinity
+      const ceiling = safeCeiling(sizes, reserve)
       entry.request = { at: Date.now(), checkpoint, model: model ? modelLabel(model) : "unknown", scale,
         messages: parts.messages * scale, system: parts.system * scale, tools: parts.tools * scale, total: projected,
         outputReserve: reserve, margin: REQUEST_MARGIN,
@@ -368,8 +401,7 @@ export function createController(context: Plugin.Context) {
       // Fresh tool evidence buys temporary room on the very build carrying
       // it; fixed overhead, output reserve and margin stay out of reach.
       const overhead = Math.max(0, projected - measured)
-      const evidence = automatic && baseline > 0 && Number.isFinite(baseline) ? freshEvidence(cycleRows, scale) : { tokens: 0, weighted: 0 }
-      const live = automatic ? liveBudget(baseline, evidence, ceiling - overhead) : { baseline, allowance: 0, budget: baseline }
+      const live = liveFor(baseline, cycleRows, scale, ceiling - overhead)
       const budget = live.budget
       entry.live = automatic && sizes ? { checkpoint, model: entry.request.model, overhead } : undefined
       // Our own notices count toward capacity too. Optional guidance is omitted
@@ -504,7 +536,7 @@ export function createController(context: Plugin.Context) {
     const parent = boundary?.parent
     if (parent) await ensureCheckpoint(sessionID, parent, rows?.find((item) => item.id === parent), rows, seen, false)
     // Native summaries invalidate patch state; only standing constraints carry over.
-    indexes.delete(sessionID)
+    dropIndex(sessionID)
     const inherited = parent ? await store.getCheckpoint(parent) : undefined
     await store.saveCheckpoint(adoptNative(row, boundary?.episode ?? await store.nextEpisode(), boundary, inherited))
     if (external && !pluginCycle) {
@@ -532,7 +564,7 @@ export function createController(context: Plugin.Context) {
     const warnCycle = (message: string) => { warned = true; return models.warning(event.sessionID, message) }
     const store = storeFor(event.sessionID)
     // Archival mutates the searchable set: rows, calls, and possibly the chain.
-    indexes.delete(event.sessionID)
+    dropIndex(event.sessionID)
     let rows: readonly Row[], boundary: Pending
     try {
       rows = await ctx.session.context({ sessionID: event.sessionID }, { signal: lifecycle.signal(event.sessionID) })
@@ -563,17 +595,16 @@ export function createController(context: Plugin.Context) {
       gateStat(event.sessionID, "checkpoints")
       if (entry.cut) entry.cut.reason = "The model's staged checkpoint applied at its call-time boundary."
     }
-    let cut: ReturnType<typeof planCut>, keep: string | undefined
+    let cut: ReturnType<typeof planCut>, keep: string | undefined, parentIndex: number
     try {
-      const planned = planCut(rows)
-      if (staged) {
-        // The staged boundary is the model's own cut: the episode ends there — after the
-        // planned parent, at the call itself — and any newer work rides live, not archived.
-        const parentIndex = planned.parent === null ? -1 : rows.findIndex((row) => row.id === planned.parent)
-        const at = rows.findIndex((row) => row.id === staged.boundary)
-        cut = at > parentIndex ? { ...planned, rowIDs: rows.slice(parentIndex + 1, at + 1).map((row) => row.id) } : planned
-      } else cut = planned
+      cut = planCut(rows)
+      parentIndex = cut.parent === null ? -1 : rows.findIndex((row) => row.id === cut.parent)
       const at = staged ? rows.findIndex((row) => row.id === staged.boundary) : -1
+      if (staged && at > parentIndex) {
+        // The staged boundary is the model's own cut: the episode ends there — after
+        // the planned parent, at the call itself — and any newer work rides live.
+        cut = { ...cut, rowIDs: rows.slice(parentIndex + 1, at + 1).map((row) => row.id) }
+      }
       // The running cut row is the host's container, not model work: never keep it live.
       keep = at >= 0 && rows[at + 1]?.id !== cutID ? rows[at + 1]?.id : undefined
       const saved = await store.getCheckpoint(cut.checkpoint)
@@ -634,10 +665,12 @@ export function createController(context: Plugin.Context) {
       entry.proposal = undefined
       if (proposal) {
         // A staged cut covers only its own span: rows outside it (the parent's tail, later
-        // work riding live) are not the edit's evidence and must not invalidate it.
+        // work riding live) are not the edit's evidence and must not invalidate it. An
+        // unstaged edit's evidence was observed over one checkpoint cycle, so that same
+        // cycle — the rows after the parent — is its comparison scope.
         const within = staged ? new Set(cut.rowIDs) : undefined
         const before = within ? proposal.evidence.filter(([id]) => within.has(id)) : proposal.evidence
-        const scope = within ? rows.filter((row) => within.has(row.id)) : rows
+        const scope = within ? rows.filter((row) => within.has(row.id)) : rows.slice(parentIndex + 1)
         const stale = proposal.stale ?? (proposal.checkpoint !== boundary.parent ? "The base checkpoint changed."
           : changedEvidence(before, scope, proposal.publication, true))
         try {
@@ -704,7 +737,6 @@ export function createController(context: Plugin.Context) {
       if (!warned) await models.clearWarning(event.sessionID)
       // The closing cycle spans the rows this cut archived: everything after the
       // previous checkpoint. Measured in durable tokens and assistant turns.
-      const parentIndex = boundary.parent === null ? -1 : rows.findIndex((row) => row.id === boundary.parent)
       const scale = usageScale(rows)
       closeThermostatCycle(event.sessionID, rows.slice(parentIndex + 1), retainedTokens(rows.slice(0, parentIndex + 1)) * scale, scale)
       const live = sessions.get(event.sessionID)
@@ -717,6 +749,19 @@ export function createController(context: Plugin.Context) {
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
       await warnCycle(`Working-state compaction failed (${detail}); using native OpenCode compaction and its configured model. This safety fallback is not size-bounded; no active constraints were silently truncated.`)
     }
+  }
+
+  /** An open gate's evaluation window closed with the round. With next-prompt
+   *  scheduling live, repay the crossing as a deferred marker so the cut lands
+   *  steered by the next message; otherwise request the compaction now. */
+  const repayGate = async (sessionID: SessionID, gate: Gate, after: string | undefined) => {
+    gateStat(sessionID, "repaid")
+    if (after === undefined) {
+      void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
+      return
+    }
+    await storeFor(sessionID).saveDeferredCompaction({ checkpoint: gate.checkpoint, after, tokens: gate.growth, threshold: 0 })
+    decide(state(sessionID), "deferred", "The round ended before its budget gate could close; the crossing is repaid at the next prompt, steered by it.")
   }
 
   const onRoundEnded = async (sessionID: SessionID) => {
@@ -740,17 +785,11 @@ export function createController(context: Plugin.Context) {
       } catch (error) { log("round end", error) }
     }
     if (gate && !deferral?.approved) {
-      gateStat(sessionID, "repaid")
       let after: string | undefined
       if (!state(sessionID).owner?.subagent && idleOption !== Infinity) try {
         after = (await rows()).at(-1)?.id
       } catch (error) { log("round end", error) }
-      if (after) {
-        await storeFor(sessionID).saveDeferredCompaction({ checkpoint: gate.checkpoint, after, tokens: gate.growth, threshold: 0 })
-        decide(state(sessionID), "deferred", "The round ended before its budget gate could close; the crossing is repaid at the next prompt, steered by it.")
-      } else {
-        void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
-      }
+      await repayGate(sessionID, gate, after)
     }
   }
   const onIdle = async (sessionID: SessionID) => {
@@ -775,16 +814,7 @@ export function createController(context: Plugin.Context) {
       const gate = entry?.gate
       if (gate) {
         if (entry) entry.gate = undefined
-        if (!held && gate.checkpoint === activeCheckpoint(rows)) {
-          gateStat(sessionID, "repaid")
-          const repay = scheduled ? rows.at(-1)?.id : undefined
-          if (repay) {
-            await storeFor(sessionID).saveDeferredCompaction({ checkpoint: gate.checkpoint, after: repay, tokens: gate.growth, threshold: 0 })
-            decide(state(sessionID), "deferred", "The round ended before its budget gate could close; the crossing is repaid at the next prompt, steered by it.")
-          } else {
-            void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
-          }
-        }
+        if (!held && gate.checkpoint === activeCheckpoint(rows)) await repayGate(sessionID, gate, scheduled ? rows.at(-1)?.id : undefined)
       }
       // The round ended with a staged cut: a final reply's round end belongs to next-prompt
       // scheduling. The context stays intact — nothing is evicted — and the cut is re-made
@@ -903,7 +933,7 @@ export function createController(context: Plugin.Context) {
       })
     } finally {
       sessions.delete(sessionID)
-      indexes.delete(sessionID)
+      dropIndex(sessionID)
       for (const key of [...transcripts.keys()]) if (key.startsWith(`${sessionID}\0`)) {
         transcriptChars -= transcripts.get(key)!.size
         transcripts.delete(key)
@@ -1051,6 +1081,10 @@ export function createController(context: Plugin.Context) {
       // tool output in its call original, shell output in its row; summaries surface only as
       // labeled pointer hits. Every search page therefore lands on fetchable text.
       const cached = indexes.get(sessionID)
+      if (cached !== undefined) { // refresh the LRU position, as transcripts do
+        indexes.delete(sessionID)
+        indexes.set(sessionID, cached)
+      }
       let documents = cached?.checkpoint === checkpoint ? cached.documents : undefined
       if (documents === undefined) {
         documents = []
@@ -1087,7 +1121,7 @@ export function createController(context: Plugin.Context) {
             }
           } catch { /* unreadable row */ }
         }
-        indexes.set(sessionID, { checkpoint, documents })
+        keepIndex(sessionID, { checkpoint, documents, chars: documents.reduce((sum, document) => sum + document.text.length, 0) })
       }
       // Graduated notes join only unfiltered queries: they have no layer home, and at
       // the full layer the note itself is the fetchable original. The cached documents
@@ -1152,7 +1186,7 @@ export function createController(context: Plugin.Context) {
       const observed = entry.evidence
       regenerate = !observed ? "No current main-model evidence observation is available."
         : observed.checkpoint !== checkpoint ? "The base checkpoint changed."
-        : changedEvidence(observed.value, rows, context)
+        : changedEvidence(observed.value, index < 0 ? rows : rows.slice(index + 1), context)
       if (!regenerate) proposal = { checkpoint, evidence: observed!.value, publication: { messageID: context.messageID, id: context.id }, handoff }
     } catch (error) {
       entry.hold = undefined
@@ -1175,15 +1209,14 @@ export function createController(context: Plugin.Context) {
     const index = checkpoint === null ? -1 : rows.findIndex((row) => row.id === checkpoint), current = rows[index]
     const cycle = rows.slice(index + 1), scale = usageScale(rows), growth = durableTokens(cycle) * scale
     const model = modelRef(info.model) ?? entry?.model, sizes = await windowSize(model)
-    const reserve = model && entry?.request?.model === modelLabel(model) ? entry.request.outputReserve : sizes?.output || 8_192
+    const reserve = model && entry?.request?.model === modelLabel(model) ? entry.request.outputReserve : sizes?.output || DEFAULT_OUTPUT_RESERVE
     const thermostat: Thermostat | undefined = sizes ? { bounds: budgetBounds(sizes.context, reserve, sizes.input),
       entry: model && info.projectID ? (await projectFor(info.projectID).readThermostat())[modelLabel(model)] : undefined } : undefined
     const baseline = softBudget(thermostat)
     const liveRequest = entry?.live, sameModel = model && liveRequest?.model === modelLabel(model)
-    const evidence = automatic && baseline > 0 && Number.isFinite(baseline) ? freshEvidence(cycle, scale) : { tokens: 0, weighted: 0 }
-    const ceiling = sizes ? Math.max(0, Math.min(sizes.context - reserve, sizes.input ?? Infinity) - REQUEST_MARGIN) : Infinity
+    const ceiling = safeCeiling(sizes, reserve)
     const overhead = sameModel && liveRequest?.checkpoint === checkpoint ? liveRequest.overhead : 0
-    const live = automatic ? liveBudget(baseline, evidence, ceiling - overhead) : { baseline, allowance: 0, budget: baseline }
+    const live = liveFor(baseline, cycle, scale, ceiling - overhead)
     const budget = live.budget
     const saved = checkpoint ? await storeFor(sessionID).getCheckpoint(checkpoint) : undefined
     const metadata = object(current?.metadata) ? current.metadata : {}
@@ -1274,7 +1307,7 @@ export function createController(context: Plugin.Context) {
       for (const id of sessions.keys()) clearGuard(id)
       await lifecycle.dispose()
       await Promise.allSettled([...deletions])
-      sessions.clear(); indexes.clear(); transcripts.clear(); graduatedCache.clear()
+      sessions.clear(); transcripts.clear(); transcriptChars = 0; graduatedCache.clear(); indexes.clear(); indexChars = 0
     },
   }
 }
@@ -1307,6 +1340,13 @@ export async function install(ctx: Plugin.Context) {
   await ctx.session.hook("compaction", controller.onCompaction)
   await ctx.session.hook("fork", ({ sessionID }) => controller.onFork(sessionID))
   return controller
+}
+
+/** Safe input capacity of one request: the context window less the output reserve,
+ *  the input limit and the request margin, never negative. An unknown window
+ *  imposes no ceiling. */
+function safeCeiling(sizes: { readonly context: number; readonly output: number; readonly input?: number } | undefined, reserve: number): number {
+  return sizes ? Math.max(0, Math.min(sizes.context - reserve, sizes.input ?? Infinity) - REQUEST_MARGIN) : Infinity
 }
 
 /** A tool failure in the last two minutes means the model is mid-diagnosis; cutting

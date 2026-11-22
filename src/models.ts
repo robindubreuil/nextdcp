@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin"
 import { tokens } from "./tokens.ts"
 import { modelRpc, modelLabel, type ModelPreference, type ModelRef, type ModelState } from "./model-rpc.ts"
 import { object } from "./guards.ts"
+import { DEFAULT_OUTPUT_RESERVE, REQUEST_MARGIN } from "./estimate.ts"
 import type { createLifecycle } from "./lifecycle.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
@@ -23,9 +24,9 @@ const root = (id: string) => `sessions/${encodeURIComponent(id)}/model`
 // Unknown windows are deliberately not assumed safe for cross-model generation.
 export function assertFits(model: Pick<ModelInfo, "limit">, prompt: string) {
   const { context, input, output } = model.limit
-  const reserve = output > 0 ? output : 8_192
+  const reserve = output > 0 ? output : DEFAULT_OUTPUT_RESERVE
   const available = Math.min(context > 0 ? context - reserve : 0, input && input > 0 ? input : Infinity)
-  const estimate = Math.ceil(tokens(prompt) * 1.2) + 1_024
+  const estimate = Math.ceil(tokens(prompt) * 1.2) + REQUEST_MARGIN
   if (estimate > available) throw new Error(`transcript needs about ${estimate} input tokens including safety margin; safe capacity is ${Math.max(0, available)}`)
 }
 

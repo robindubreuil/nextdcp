@@ -10,16 +10,9 @@
 
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
 import { object } from "./guards.ts"
+import { defaultDatabase } from "./host.ts"
 import type { Row } from "./memory.ts"
-
-/** Default host database location, mirroring OpenCode's own resolution. */
-export function defaultDatabase(): string {
-  if (process.env.XDG_DATA_HOME) return join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
-  const base = process.platform === "darwin" ? join(homedir(), "Library", "Application Support") : join(homedir(), ".local", "share")
-  return join(base, "opencode", "opencode.db")
-}
 
 // --- shape normalization ---------------------------------------------------------
 // The masking core of scripts/recurring.mjs (the offline audit lab), reduced to
@@ -185,7 +178,12 @@ export const codeWrapper = (wrapper: string) =>
 // --- families --------------------------------------------------------------------
 
 const MIN_SESSIONS = 3, PAYLOAD_MIN = 8, SIM_THRESHOLD = 0.4
-const WINDOW_MS = 90 * 86_400_000, TTL_MS = 6 * 3_600_000
+const WINDOW_MS = 90 * 86_400_000
+/** Rescan interval after a successful scan. */
+const TTL_MS = 6 * 3_600_000
+/** A failed scan retries sooner: a transient lock or startup race must not blind
+ *  the nudge for a full TTL. */
+const RETRY_MS = 10 * 60_000
 // A nudge pays for itself only when the observed retyping clearly outruns its
 // costs: the notice itself, the one-time script write, and the per-invocation
 // wrapper that remains after the payload moves to a file.
@@ -303,24 +301,29 @@ export type Nudge = {
 
 /** The nudge's database view: a background scan at start and every TTL after,
  *  over assistant messages of sessions touched inside the window. A missing
- *  database is a fresh host — disabled silently, rechecked per refresh. An
- *  unreadable one is abnormal: one warning per process, retried at the TTL. */
+ *  database is a fresh host — disabled silently, rechecked per refresh. So is a
+ *  host without node:sqlite (Node 20–22): a known-incompatible environment, not
+ *  an abnormal condition worth a warning. An unreadable database is abnormal:
+ *  one warning per process, retried shortly rather than after a full TTL. */
 export function createNudge(report: (where: string, error?: unknown) => void, dbPath = defaultDatabase()): Nudge {
   let current: Family[] | undefined
   let loading: Promise<void> | undefined
   let scannedAt = 0
   let warned = false
+  let unsupported = false
   const load = async (): Promise<void> => {
+    const sqlite = await import("node:sqlite").catch(() => undefined)
+    if (sqlite === undefined) { unsupported = true; return }
     try {
-      const { DatabaseSync } = await import("node:sqlite")
-      const db = new DatabaseSync(dbPath, { readOnly: true })
+      const db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
       const poolRows: PoolRow[] = []
       try {
+        // iterate() streams; a 90-day window can hold every assistant row at once.
         const found = db.prepare(`
           SELECT m.session_id AS session, s.directory AS directory, m.data AS data
           FROM session_message m JOIN session_v2 s ON s.id = m.session_id
           WHERE m.type = 'assistant' AND s.time_updated >= ?
-          ORDER BY m.session_id, m.seq`).all(Date.now() - WINDOW_MS)
+          ORDER BY m.session_id, m.seq`).iterate(Date.now() - WINDOW_MS)
         for (const row of found) {
           if (!object(row) || typeof row.session !== "string" || typeof row.data !== "string") continue
           let data: unknown
@@ -334,14 +337,15 @@ export function createNudge(report: (where: string, error?: unknown) => void, db
         }
       } finally { db.close() }
       current = buildFamilies(poolRows)
+      scannedAt = Date.now() // stamped on success only: a failure must retry sooner
     } catch (error) {
-      if (!warned) { warned = true; report("recurring payload nudge scan failed; retrying later", error) }
+      if (!warned) { warned = true; report("recurring payload nudge scan failed; retrying sooner", error) }
+      scannedAt = Date.now() - (TTL_MS - RETRY_MS)
     }
   }
   const refresh = (): void => {
-    if (loading !== undefined || Date.now() - scannedAt < TTL_MS) return
+    if (unsupported || loading !== undefined || Date.now() - scannedAt < TTL_MS) return
     if (!existsSync(dbPath)) return
-    scannedAt = Date.now()
     loading = load()
     void loading.then(() => { loading = undefined }, () => { loading = undefined })
   }

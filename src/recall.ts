@@ -95,6 +95,31 @@ function snippet(text: string, index: number): string {
   return `${start ? "…" : ""}${text.slice(start, end).replace(/\s+/gu, " ").trim()}${end < text.length ? "…" : ""}`
 }
 
+/** A document's words, page-assigned and echo-filtered, cached per immutable
+ *  document object: lexing and normalizing megabytes is the costly step of a
+ *  search, and the runtime serves documents stable per checkpoint, so repeat
+ *  queries reuse the cached lexicon. */
+type LexedPages = readonly (readonly Word[])[]
+const lexed = new WeakMap<SearchDocument, LexedPages>()
+function pagesOf(document: SearchDocument): LexedPages {
+  const cached = lexed.get(document)
+  if (cached) return cached
+  const bounds = pageBounds(document.text, RECALL_PAGE_CHARS)
+  const echoes = document.echoes ?? []
+  const pages: Word[][] = bounds.slice(1).map(() => [])
+  let page = 0, echo = 0
+  for (const word of words(document.text)) {
+    while (page + 1 < pages.length && word.index >= bounds[page + 1]) page++
+    while (echo < echoes.length && echoes[echo][1] <= word.index) echo++
+    // Echoes of recall output are excluded from scoring only: pages and snippets stay
+    // byte-aligned with the fetchable text, so hit pages always fetch what they name.
+    if (echo < echoes.length && word.index >= echoes[echo][0]) continue
+    pages[page].push(word)
+  }
+  lexed.set(document, pages)
+  return pages
+}
+
 /** Rank small passages, not whole histories. Prefer a cluster covering the query over its first word.
  *  `layer` selects which fact homes a search covers; `full` (default) covers every home plus notes. */
 export function search(query: string, documents: readonly SearchDocument[], limit = 10, layer: Layer = "full"): SearchHit[] {
@@ -109,20 +134,8 @@ export function search(query: string, documents: readonly SearchDocument[], limi
   if (!terms.length || !homes.length) return []
   const termSet = new Set(terms)
   const corpus = homes.flatMap((document) => {
-    const bounds = pageBounds(document.text, RECALL_PAGE_CHARS)
-    const pages = bounds.slice(1).map((_, index) => ({ id: document.id, page: index + 1, text: document.text,
-      parsed: [] as Word[], counts: new Map<string, number>(), note: !!document.note, boost: document.boost ?? 1, graduated: document.graduated, outsideChain: document.outsideChain, echoes: document.echoes ?? [] }))
-    let page = 0
-    const echoes = document.echoes ?? []
-    let echo = 0
-    for (const word of words(document.text)) {
-      while (page + 1 < pages.length && word.index >= bounds[page + 1]) page++
-      while (echo < echoes.length && echoes[echo][1] <= word.index) echo++
-      // Echoes of recall output are excluded from scoring only: pages and snippets stay
-      // byte-aligned with the fetchable text, so hit pages always fetch what they name.
-      if (echo < echoes.length && word.index >= echoes[echo][0]) continue
-      pages[page].parsed.push(word)
-    }
+    const pages = pagesOf(document).map((parsed, index) => ({ id: document.id, page: index + 1, text: document.text,
+      parsed, counts: new Map<string, number>(), note: !!document.note, boost: document.boost ?? 1, graduated: document.graduated, outsideChain: document.outsideChain, echoes: document.echoes ?? [] }))
     for (const item of pages) for (const word of item.parsed) if (termSet.has(word.text)) item.counts.set(word.text, (item.counts.get(word.text) ?? 0) + 1)
     return pages
   })

@@ -9,8 +9,8 @@ test("the bundles keep only the host SDK, host renderer and Node built-ins exter
   assert.equal(manifest.exports["./tui"], "./dist/tui.js")
   assert.equal(manifest.dependencies, undefined)
   const source = await readFile(new URL("../dist/index.js", import.meta.url), "utf8")
-  assert.deepEqual([...source.matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((match) => match[1]),
-    ["@opencode/plugin", "node:crypto", "node:fs", "node:os", "node:path"])
+  assert.deepEqual(new Set([...source.matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((match) => match[1])),
+    new Set(["@opencode/plugin", "node:crypto", "node:fs", "node:os", "node:path"]))
   assert.equal(plugin.id, "nextdcp")
   assert.equal(typeof plugin.setup, "function")
   const tui = await readFile(new URL("../dist/tui.js", import.meta.url), "utf8")

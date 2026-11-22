@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
-import { buildFamilies, commandsIn, createNudge, defaultDatabase, normalizeCommand, occurrences, renderNudge } from "../src/recurring.ts"
+import { buildFamilies, commandsIn, createNudge, normalizeCommand, occurrences, renderNudge } from "../src/recurring.ts"
+import { defaultDatabase } from "../src/host.ts"
 import { tokens } from "../src/tokens.ts"
 import { csvSorter, fixtureDatabase, jsonSummary, jsonSummaryVariant, liveJsonSummary, pooledSessions } from "./support/pool.ts"
 
@@ -123,7 +124,7 @@ A python3 -c payload like this has been re-created from scratch in 4 sessions (~
   assert.ok(tokens(notice) <= 130, `the notice stays small (${tokens(notice)} tokens)`)
 })
 
-test("an unreadable database warns once and backs off to the TTL", requireSqlite, async (t) => {
+test("an unreadable database warns once and backs off before retrying", requireSqlite, async (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "nextdcp-recurring-"))
   t.after(() => rmSync(tmp, { recursive: true, force: true }))
   writeFileSync(join(tmp, "opencode.db"), "definitely not a sqlite database")
@@ -132,6 +133,6 @@ test("an unreadable database warns once and backs off to the TTL", requireSqlite
   await nudge.settle()
   nudge.refresh()
   await nudge.settle()
-  assert.deepEqual(reports, ["recurring payload nudge scan failed; retrying later"])
+  assert.deepEqual(reports, ["recurring payload nudge scan failed; retrying sooner"])
   assert.deepEqual(nudge.families(), [])
 })

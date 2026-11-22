@@ -1,4 +1,5 @@
 import { object } from "./guards.ts"
+import { DEFAULT_OUTPUT_RESERVE, REQUEST_MARGIN } from "./estimate.ts"
 
 // Bounded fallback for overdue model-directed checkpoints, not a recommended
 // checkpoint cadence or a measured context-rot boundary. Capacity is independent.
@@ -34,8 +35,8 @@ const clamp = (value: number, low: number, high: number): number => Math.min(hig
 /** Retained-conversation policy bounds: normally 150k–300k, starting at 200k.
  *  Smaller windows/input limits scale or clamp them down. Fixed overhead still
  *  belongs to the separate, authoritative complete-request capacity check. */
-export function budgetBounds(window: number, outputReserve = 8_192, inputLimit = Infinity): BudgetBounds {
-  const capacity = Math.max(1, Math.floor(Math.min(window - outputReserve, inputLimit) - 1_024))
+export function budgetBounds(window: number, outputReserve = DEFAULT_OUTPUT_RESERVE, inputLimit = Infinity): BudgetBounds {
+  const capacity = Math.max(1, Math.floor(Math.min(window - outputReserve, inputLimit) - REQUEST_MARGIN))
   const start = Math.max(1, Math.floor(Math.min(capacity, window * 0.5, SAFEGUARD_START)))
   return { floor: Math.max(1, Math.ceil(start * 0.75)), start, ceiling: Math.min(capacity, Math.floor(start * 1.5)) }
 }

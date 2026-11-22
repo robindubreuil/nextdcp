@@ -1,6 +1,6 @@
 {
   "name": "nextdcp",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "description": "Bounded task-focused working memory and archived recall for OpenCode V2",
   "type": "module",
   "bin": {

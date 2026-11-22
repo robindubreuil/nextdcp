@@ -563,7 +563,9 @@ Media returns as native file content on the page containing its label, including
 direct row/call fetches, not JSON/base64 expansion. The current model must support
 that media, and URI-only files must still exist. Archived inline text is decoded
 for search. Immutable transcript rendering uses a bounded 8-million-character LRU;
-the corpus is cached by checkpoint and invalidated by local archive/chain changes.
+the search corpus is cached by checkpoint, invalidated by local archive/chain
+changes, and LRU-capped under the same ceiling. Lexing a document is cached with
+it, so repeat queries never re-tokenize the corpus.
 Graduated-note caches additionally check the project's durable revision.
 
 ## Forks, lifecycle, and privacy
@@ -652,6 +654,7 @@ src/
   estimate.ts    retained/growth/evidence/request meters and calibration
   thermostat.ts  versioned adaptive baseline bounds and +50%/−20% updates
   safeguard.ts   fresh-evidence allowance, pause detection and reminder spacing
+  host.ts        host-database location, shared by CLI and the nudge pool
   recurring.ts   cross-session one-shot pool, families and the nudge notice
   recall.ts      readable originals, media, pagination, addresses and BM25
   tokens.ts      text/media estimates

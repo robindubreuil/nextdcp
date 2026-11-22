@@ -11,9 +11,9 @@
 
 import { existsSync } from "node:fs"
 import { object } from "./guards.ts"
-import { conversationTokens } from "./estimate.ts"
+import { durableTokens } from "./estimate.ts"
 import { tokens } from "./tokens.ts"
-import { defaultDatabase } from "./recurring.ts"
+import { defaultDatabase } from "./host.ts"
 import type { Row } from "./memory.ts"
 
 const PROGRAM = "ocq"
@@ -274,7 +274,7 @@ function modelLabel(model: MessageData["model"]): string | null {
 function estimate(type: string, raw: unknown): number {
   const source = rawJson(raw)
   const data = parseData(source)
-  let total = conversationTokens([{ type, content: data.content, text: data.text } as unknown as Row])
+  let total = durableTokens([{ type, content: data.content, text: data.text } as unknown as Row])
   if (type === "compaction" && object(source)) {
     if (typeof source.summary === "string") total += tokens(source.summary)
     const metadata = object(source.metadata) && typeof source.metadata.recent === "string" ? source.metadata.recent : undefined
