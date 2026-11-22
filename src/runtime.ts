@@ -31,7 +31,7 @@ type Thermostat = { readonly bounds: BudgetBounds; readonly entry: ThermostatEnt
 type Proposal = { readonly checkpoint: string | null; readonly evidence: Evidence; readonly publication: Publication; readonly handoff: Handoff; stale?: string }
 // The working state covers the whole cut and originals stay recallable, so no
 // verbatim host tail rides beside it: a non-ID keepID tells OpenCode to keep none.
-const handoffMetadata = (author?: Checkpoint["author"]) => ({ keepID: null, nextdcp: { version: 2, ...(author ? { author } : {}) } })
+const handoffMetadata = (author?: Checkpoint["author"], keep?: string) => ({ keepID: keep ?? null, nextdcp: { version: 2, ...(author ? { author } : {}) } })
 
 // All per-session runtime state in one record, so a session's lifecycle — above all
 // deletion — touches a single entry instead of a dozen maps keyed in parallel.
@@ -52,6 +52,10 @@ type SessionState = {
   /** Semantic evidence at the last main-model build, and its admitted working-state edit. */
   evidence?: { checkpoint: string | null; value: Evidence }
   proposal?: Proposal
+  /** A checkpoint call held at its call-time boundary: its cut waits for the model's
+   *  next action. Tool work continues the round and applies the staged cut; a final
+   *  reply's round end discards it and next-prompt scheduling re-cuts steered. */
+  hold?: { readonly boundary: string; readonly proposal?: Proposal; readonly at: number }
   /** The queued message that triggered a deferred-marker compaction; evidence for the
    *  working state, consumed only by whichever generation commits its handoff. Failed
    *  generations keep the signal for their retry; the round's end clears what never ran. */
@@ -284,6 +288,29 @@ export function createController(context: Plugin.Context) {
     return admission
   }
 
+  /** A held cut waits for the model's next action. Non-question tool work continues the
+   *  round — a pause, so the staged cut applies at its call-time boundary and the new
+   *  work rides live beside the summary. A question's ask or a final reply ends the
+   *  round: that boundary belongs to next-prompt scheduling, steered by the user. */
+  const continuesWork = (rows: readonly Row[], boundary: string): boolean => {
+    const at = rows.findIndex((row) => row.id === boundary)
+    return at >= 0 && rows.slice(at + 1)
+      .some((row) => row.type === "assistant" && rowCalls(row).some((call) => call.name !== "question"))
+  }
+
+  /** Apply a staged cut: request the compaction carrying the staged proposal, and keep the
+   *  hold alive for onCompaction — it is the staged boundary the cut must honor. A refused
+   *  apply spends the staging instead of leaving a dead hold that blocks future calls: say
+   *  so explicitly. Nothing was evicted, so a fresh call re-stages the same boundary. */
+  const applyStaged = (sessionID: SessionID, held: NonNullable<SessionState["hold"]>, checkpoint: string | null, growth: number, reason: string): void => {
+    void requestCompact(sessionID, checkpoint, growth, reason, held.proposal).then((result) => {
+      if (result.status !== "failed" && result.status !== "not-admitted") return
+      const entry = sessions.get(sessionID)
+      if (entry?.hold === held) entry.hold = undefined
+      void models.warning(sessionID, `A staged checkpoint could not be applied (${result.reason}) The conversation is unchanged; call checkpoint_now again to re-stage the cut.`)
+    })
+  }
+
   const onContext = async (event: SessionContext) => {
     let rows: readonly Row[], info: SessionInfo
     try {
@@ -303,6 +330,14 @@ export function createController(context: Plugin.Context) {
     try {
       const messages = event.messages as unknown as ViewMessage[]
       const entry = state(event.sessionID)
+      // The model continued with tool work after a staged checkpoint: apply the held cut
+      // at its call-time boundary. The new work rides live beside the summary (keepID).
+      const held = entry.hold
+      if (held && continuesWork(rows, held.boundary)) {
+        const heldStart = checkpoint === null ? 0 : rows.findIndex((row) => row.id === checkpoint) + 1
+        applyStaged(event.sessionID, held, checkpoint, durableTokens(rows.slice(heldStart)) * usageScale(rows),
+          "The model continued working after a staged checkpoint; the cut lands at its staged boundary.")
+      }
       const start = checkpoint === null ? 0 : rows.findIndex((row) => row.id === checkpoint) + 1
       // Automatic fallback meters the whole retained conversation. Explicit budget
       // and idle overrides keep their historical NEW-durable-growth semantics.
@@ -361,7 +396,7 @@ export function createController(context: Plugin.Context) {
       }
       if (budget === Infinity) { decide(entry, "held", "Soft budget scheduling is disabled."); return }
       // A large unchanged native tail/summary cannot be improved by another cut
-      // with no new durable rows. In particular, reasoning-only builds must not loop.
+      // with no new durable rows; reasoning counts as such a row on replaying hosts.
       if (growth <= 0) { decide(entry, "held", "No new durable growth; unchanged summary/tail is not re-compacted."); return }
       if (measured <= budget) {
         // Fresh evidence may have bought room on this very build: a gate whose
@@ -503,14 +538,36 @@ export function createController(context: Plugin.Context) {
     }
     const entry = state(event.sessionID), cutID = rows.findLast((row) => row.type === "compaction" && row.status === "running")!.id
     if (entry.cut?.id !== cutID) entry.cut = { id: cutID, reason: entry.guard === undefined ? "Host compaction; no local request trigger recorded." : entry.attempt?.reason ?? "Host compaction." }
+    // A staged cut carries the model's own call-time boundary: its episode ends there
+    // and any newer work rides live beside the summary instead of joining the cut.
+    const staged = entry.hold
+    entry.hold = undefined
+    if (staged) {
+      // The gate outcome is counted where the checkpoint actually lands, not at the call:
+      // a staging the model withdrew by finishing its reply never became a checkpoint.
+      gateStat(event.sessionID, "checkpoints")
+      if (entry.cut) entry.cut.reason = "The model's staged checkpoint applied at its call-time boundary."
+    }
+    let cut: ReturnType<typeof planCut>, keep: string | undefined
     try {
-      const cut = planCut(rows), saved = await store.getCheckpoint(cut.checkpoint)
+      const planned = planCut(rows)
+      if (staged) {
+        // The staged boundary is the model's own cut: the episode ends there — after the
+        // planned parent, at the call itself — and any newer work rides live, not archived.
+        const parentIndex = planned.parent === null ? -1 : rows.findIndex((row) => row.id === planned.parent)
+        const at = rows.findIndex((row) => row.id === staged.boundary)
+        cut = at > parentIndex ? { ...planned, rowIDs: rows.slice(parentIndex + 1, at + 1).map((row) => row.id) } : planned
+      } else cut = planned
+      const at = staged ? rows.findIndex((row) => row.id === staged.boundary) : -1
+      // The running cut row is the host's container, not model work: never keep it live.
+      keep = at >= 0 && rows[at + 1]?.id !== cutID ? rows[at + 1]?.id : undefined
+      const saved = await store.getCheckpoint(cut.checkpoint)
       if (saved?.working && !saved.episode.native) {
         if (saved.parent !== cut.parent || JSON.stringify(saved.episode.rowIDs) !== JSON.stringify(cut.rowIDs)) throw new Error("Committed compaction boundary changed")
         if (!event.result) {
           const summary = renderHandoff(resolveMemory(saved.id, await store.chain(saved.id)))
           await lifecycle.assertOpen(event.sessionID)
-          event.result = { summary, metadata: handoffMetadata(saved.author) }
+          event.result = { summary, metadata: handoffMetadata(saved.author, keep) }
         }
         if (entry.cut) entry.cut.author = saved.author
         entry.proposal = undefined
@@ -519,7 +576,7 @@ export function createController(context: Plugin.Context) {
       boundary = { id: cut.checkpoint, parent: cut.parent, rowIDs: cut.rowIDs, archived: false }
       const boundaries = state(event.sessionID).boundaries ??= new Map()
       boundaries.set(boundary.id, boundary)
-      boundary = await store.prepareArchive(rows)
+      boundary = await store.prepareArchive(rows, cut.rowIDs)
       boundaries.delete(boundary.id)
     } catch (error) {
       warn("archive before compaction; using native", error)
@@ -558,11 +615,16 @@ export function createController(context: Plugin.Context) {
       const prior = existing.working ?? { constraints: existing.constraints }
       const priorSummary = existing.working ? undefined : existing.episodes.at(-1)?.summary
       let author: Checkpoint["author"] = "compactor"
-      const proposal = entry.proposal
+      const proposal = entry.proposal ?? staged?.proposal
       entry.proposal = undefined
       if (proposal) {
+        // A staged cut covers only its own span: rows outside it (the parent's tail, later
+        // work riding live) are not the edit's evidence and must not invalidate it.
+        const within = staged ? new Set(cut.rowIDs) : undefined
+        const before = within ? proposal.evidence.filter(([id]) => within.has(id)) : proposal.evidence
+        const scope = within ? rows.filter((row) => within.has(row.id)) : rows
         const stale = proposal.stale ?? (proposal.checkpoint !== boundary.parent ? "The base checkpoint changed."
-          : changedEvidence(proposal.evidence, rows, proposal.publication, true))
+          : changedEvidence(before, scope, proposal.publication, true))
         try {
           if (stale) throw new HandoffError(stale)
           const handoff = parseHandoff(JSON.stringify(proposal.handoff), prior, transcriptRows, ids, priorSummary)
@@ -634,7 +696,7 @@ export function createController(context: Plugin.Context) {
       if (live) live.hint = undefined // The committed handoff is the signal's only consumer.
       if (entry.cut) entry.cut.author = author
       await lifecycle.assertOpen(event.sessionID)
-      event.result = { summary, metadata: handoffMetadata(author) }
+      event.result = { summary, metadata: handoffMetadata(author, keep) }
     } catch (error) {
       await lifecycle.assertOpen(event.sessionID)
       const detail = error instanceof HandoffError ? error.message : "generation or checkpoint storage failed"
@@ -642,16 +704,38 @@ export function createController(context: Plugin.Context) {
     }
   }
 
-  const onRoundEnded = (sessionID: SessionID) => {
+  const onRoundEnded = async (sessionID: SessionID) => {
     const entry = sessions.get(sessionID)
     if (entry === undefined) return
-    const { gate, deferral } = entry
+    const { gate, deferral, hold } = entry
     entry.gate = entry.deferral = entry.hint = entry.evidence = undefined
-    // A failed or interrupted round has no later build to close its gate; the crossing it
-    // consumed is repaid here unless a grant held the round.
+    // A failed or interrupted round continues the same work, so a staged cut applies at
+    // its boundary — later steering only resumes this task. An open gate's crossing is
+    // repaid here too: at the next prompt when the machinery is live, so even a failed
+    // round's cut lands steered by the steering/continuation message.
+    let read: Promise<readonly Row[]> | undefined
+    const rows = () => (read ??= ctx.session.context({ sessionID }, { signal: lifecycle.signal(sessionID) }))
+    if (hold) {
+      try {
+        const live = await rows()
+        const checkpoint = activeCheckpoint(live)
+        const start = checkpoint === null ? 0 : live.findIndex((row) => row.id === checkpoint) + 1
+        applyStaged(sessionID, hold, checkpoint, durableTokens(live.slice(start)) * usageScale(live),
+          "A staged checkpoint closed a failed or interrupted round; applying it at its staged boundary.")
+      } catch (error) { log("round end", error) }
+    }
     if (gate && !deferral?.approved) {
       gateStat(sessionID, "repaid")
-      void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
+      let after: string | undefined
+      if (!state(sessionID).owner?.subagent && idleOption !== Infinity) try {
+        after = (await rows()).at(-1)?.id
+      } catch (error) { log("round end", error) }
+      if (after) {
+        await storeFor(sessionID).saveDeferredCompaction({ checkpoint: gate.checkpoint, after, tokens: gate.growth, threshold: 0 })
+        decide(state(sessionID), "deferred", "The round ended before its budget gate could close; the crossing is repaid at the next prompt, steered by it.")
+      } else {
+        void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
+      }
     }
   }
   const onIdle = async (sessionID: SessionID) => {
@@ -670,15 +754,46 @@ export function createController(context: Plugin.Context) {
       if (entry?.guard !== undefined && !running(rows)) clearGuard(sessionID)
       // The round ended with an open gate: its evaluation window is over, so the crossing
       // it consumed is repaid unless a grant held the round or the boundary already moved.
+      // A round end belongs to next-prompt scheduling: with the machinery live the crossing
+      // is repaid as a deferred marker, so its cut lands steered by the user's next message.
+      const scheduled = !state(sessionID).owner?.subagent && idleOption !== Infinity
       const gate = entry?.gate
       if (gate) {
         if (entry) entry.gate = undefined
         if (!held && gate.checkpoint === activeCheckpoint(rows)) {
           gateStat(sessionID, "repaid")
-          void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
+          const repay = scheduled ? rows.at(-1)?.id : undefined
+          if (repay) {
+            await storeFor(sessionID).saveDeferredCompaction({ checkpoint: gate.checkpoint, after: repay, tokens: gate.growth, threshold: 0 })
+            decide(state(sessionID), "deferred", "The round ended before its budget gate could close; the crossing is repaid at the next prompt, steered by it.")
+          } else {
+            void requestCompact(sessionID, gate.checkpoint, gate.growth, "The round ended before its budget gate could close.")
+          }
         }
       }
-      if (state(sessionID).owner?.subagent || idleOption === Infinity) return
+      // The round ended with a staged cut: a final reply's round end belongs to next-prompt
+      // scheduling. The context stays intact — nothing is evicted — and the cut is re-made
+      // at the user's next message, steered by it, covering everything from the last
+      // checkpoint through the staged call itself. Without live scheduling machinery the
+      // staged cut applies immediately rather than being lost.
+      const stagedHold = entry?.hold
+      if (stagedHold) {
+        const checkpoint = activeCheckpoint(rows), after = rows.at(-1)?.id
+        const start = checkpoint === null ? 0 : rows.findIndex((row) => row.id === checkpoint) + 1
+        const growth = durableTokens(rows.slice(start)) * usageScale(rows)
+        if (scheduled && after && growth > 0) {
+          entry.hold = undefined // The staging dissolves into the marker: the classic post-round cut covers the call itself.
+          await storeFor(sessionID).saveDeferredCompaction({ checkpoint, after, tokens: growth, threshold: 0 })
+          decide(state(sessionID), "deferred", "A staged checkpoint closed the round; its cut waits for the next prompt, steered by the user's message.")
+          return
+        }
+        if (growth > 0) applyStaged(sessionID, stagedHold, checkpoint, growth, "A staged checkpoint closed a round without next-prompt scheduling; applying it now.")
+        else {
+          entry.hold = undefined
+          decide(state(sessionID), "held", "A staged checkpoint closed a round without new durable work; there is nothing to cut.")
+        }
+      }
+      if (!scheduled) return
       // Add output produced after the last request, including an updated retry row.
       // Never reuse a view whose raw boundary disappeared or admitted another prompt.
       const view = entry?.view, checkpoint = activeCheckpoint(rows)
@@ -704,7 +819,11 @@ export function createController(context: Plugin.Context) {
     const entry = sessions.get(event.sessionID)
     if (entry) {
       entry.evidence = undefined
-      if (entry.proposal) entry.proposal.stale = "New user input arrived after the model authored the edit."
+      const stale = "New user input arrived after the model authored the edit."
+      if (entry.proposal) entry.proposal.stale = stale
+      // A hold that outlived its round (a missed idle event) keeps its boundary for any
+      // later compaction, but its edit was authored before this input and must regenerate.
+      if (entry.hold?.proposal) entry.hold = { ...entry.hold, proposal: { ...entry.hold.proposal, stale } }
     }
     if (idleOption === Infinity) return
     try {
@@ -965,7 +1084,7 @@ export function createController(context: Plugin.Context) {
       const hits = search(query, corpus, MAX_SEARCH_HITS, layer), at = page ?? 1, start = (at - 1) * SEARCH_PAGE_HITS
       if (start >= hits.length) return at === 1 ? "No matching snippets. Try broader keywords or exact identifiers." : "No more search results."
       const lines = hits.slice(start, start + SEARCH_PAGE_HITS).map((hit) => {
-        const target = `recall ${hit.note ? `catalog ${hit.id.split("#")[0]} page ${hit.page}` : address(hit.id, hit.page)}`
+        const target = `recall id=${hit.note ? `catalog ${hit.id.split("#")[0]} page ${hit.page}` : address(hit.id, hit.page)}`
         const also = hit.also?.length ? ` (also ${hit.also.map((location) => (hit.note ? `catalog ${location.id.split("#")[0]} page ${location.page}` : address(location.id, location.page))).join(", ")})` : ""
         const label = hit.note ? " (archive note, not original evidence)"
           : hit.graduated ? ` (graduated session note, ${shortId(hit.graduated.session)}, ${formatDuration(Math.max(0, Date.now() - hit.graduated.end))} ago)`
@@ -992,7 +1111,22 @@ export function createController(context: Plugin.Context) {
     if (running(rows)) return "Already pending: a compaction is running. No additional checkpoint was requested."
     if (info.revert || info.time.busy === undefined) return "Not admitted: checkpointing needs an active round without a staged revert."
     const entry = state(sessionID), checkpoint = activeCheckpoint(rows)
-    const index = checkpoint === null ? -1 : rows.findIndex((row) => row.id === checkpoint)
+    if (entry.hold) return "Already pending: a staged checkpoint is waiting for your next action."
+    // The refusals admission itself would make, made here: never stage a cut the
+    // machinery could not apply at the very next step. The wording matches admission.
+    const scale = usageScale(rows), index = checkpoint === null ? -1 : rows.findIndex((row) => row.id === checkpoint)
+    const growth = durableTokens(index < 0 ? rows : rows.slice(index + 1)) * scale
+    const key = `${checkpoint ?? ""}:${growth}`
+    if (entry.guard !== undefined) return "Already pending: A compaction request is guarded as pending; completion is not confirmed."
+    if ((entry.cooldownUntil ?? 0) > Date.now()) return "Not admitted: A failed cut is cooling down; retry after three minutes."
+    if (entry.attempt?.key === key && Date.now() - entry.attempt.time < GUARD_TIMEOUT) return "Not admitted: A recent request covered this same boundary and growth; wait for its outcome or the retry timeout."
+    // Hold the cut at this step boundary and let the model's next action decide: tool
+    // work continues the round and applies the staged cut; a final reply's round end
+    // keeps the context intact and next-prompt scheduling re-cuts it, steered by the
+    // user's message. Nothing is generated or evicted before that choice — the staged
+    // boundary preserves this exact context either way. The claim is synchronous, so a
+    // concurrent call cannot overwrite this staging's edit with its own.
+    entry.hold = { boundary: context.messageID, at: Date.now() }
     let proposal: Proposal | undefined, regenerate: string | undefined, warning = ""
     if (edited) try {
       const existing = await memoryAt(sessionID, rows, checkpoint)
@@ -1006,19 +1140,15 @@ export function createController(context: Plugin.Context) {
         : changedEvidence(observed.value, rows, context)
       if (!regenerate) proposal = { checkpoint, evidence: observed!.value, publication: { messageID: context.messageID, id: context.id }, handoff }
     } catch (error) {
+      entry.hold = undefined
       log("checkpoint edit", error)
       return error instanceof HandoffError ? `Not admitted: ${error.message}. Nothing was truncated or requested.`
         : "Failed: the working-state edit could not be validated, so no checkpoint was requested."
     }
-    const growth = durableTokens(index < 0 ? rows : rows.slice(index + 1)) * usageScale(rows)
-    const result = await requestCompact(sessionID, checkpoint, growth, "The model requested an early checkpoint.", proposal)
-    if (result.status === "requested") {
-      entry.gate = undefined // An open gate is a schedule, not admission; this request now owns the cut.
-      gateStat(sessionID, "checkpoints")
-      return `Requested: compaction was admitted for the next step boundary. ${proposal ? "Validated working-state edit staged; no compaction generation if the evidence still matches at the cut."
-        : regenerate ? `Edit not staged: ${regenerate} The compactor will regenerate from the actual cut.` : "The compactor will generate the working state from the actual cut."}${proposal ? warning : ""} Completion is not confirmed; archived evidence becomes recallable after the cut.`
-    }
-    return `${result.status === "already-pending" ? "Already pending" : result.status === "not-admitted" ? "Not admitted" : "Failed"}: ${result.reason}${edited ? " No new edit was staged." : ""}`
+    if (proposal) entry.hold = { ...entry.hold, proposal }
+    entry.gate = undefined // An open gate is a schedule; this call answers it with a staged cut.
+    return `Prepared: the compact state is staged at this step boundary. ${proposal ? "Validated working-state edit staged; no compaction generation if the evidence still matches at the cut."
+      : regenerate ? `Edit not staged: ${regenerate} The compactor will generate from the staged boundary.` : "The compactor will generate the working state at the staged boundary."}${proposal ? warning : ""} The cut lands when your next step continues the work; if it closes the task, finish your reply — the cut then waits for the user's next message, steered by it. Completion is not confirmed; archived evidence becomes recallable after the cut.`
   }
 
   /** Observation only: do not inherit/adopt, save ownership, update the thermostat,
@@ -1054,7 +1184,7 @@ export function createController(context: Plugin.Context) {
       budgetScope: automatic ? "retained" : "growth",
       ...(budget > 0 && Number.isFinite(budget) ? { budget } : {}),
       ...(automatic && thermostat ? { budgetBounds: thermostat.bounds, budgetBaseline: baseline, liveAllowance: live.allowance } : {}),
-      compaction: running(rows) ? "running" : entry?.guard !== undefined || entry?.admission ? "pending" : "idle",
+      compaction: running(rows) ? "running" : entry?.hold !== undefined || entry?.guard !== undefined || entry?.admission ? "pending" : "idle",
       ...(entry?.request ? { request: entry.request } : {}), ...(usage ? { usage } : {}),
       ...(entry?.decision ? { decision: entry.decision } : {}),
       ...(entry?.lastCut ? { lastCut: entry.lastCut } : latestCut ? { lastCut: { action: latestCut.status!, reason: "Host record; trigger unavailable since plugin load.", id: latestCut.id,

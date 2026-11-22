@@ -292,7 +292,7 @@ function attachmentPart(value: unknown, layer: Layer, pointer?: string): Fragmen
   if (data && INLINE_TEXT_MIMES.includes(mime)) {
     try {
       const decoded = new TextDecoder().decode(Uint8Array.from(atob(data), (char) => char.charCodeAt(0)))
-      if (layer === "conversation" && pointer) return { text: `[Attached ${mime}: ${name} (${decoded.length} chars) → recall ${pointer}]` }
+      if (layer === "conversation" && pointer) return { text: `[Attached ${mime}: ${name} (${decoded.length} chars) → recall id=${pointer}]` }
       return { text: `[Attached ${mime}: ${name}]\n${text(value.description)}\n${decoded}` }
     } catch { /* Preserve malformed text as a native attachment rather than lose bytes. */ }
   }
@@ -305,7 +305,7 @@ function attachmentPart(value: unknown, layer: Layer, pointer?: string): Fragmen
  *  tag naming it; the row original is the skill text's home. */
 function skillText(name: string, body: string, layer: Layer, pointer: string): string {
   if (!body) return `[Skill activated: ${name}]`
-  if (layer === "conversation" && pointer) return `[Skill activated: ${name} (${body.length} chars) → recall ${pointer}]`
+  if (layer === "conversation" && pointer) return `[Skill activated: ${name} (${body.length} chars) → recall id=${pointer}]`
   return `[Skill activated: ${name}]\n${body}`
 }
 
@@ -329,7 +329,7 @@ function toolPart(part: Record<string, unknown>, layer: Layer, resolve: Resolve 
   const input = JSON.stringify(state.input) ?? "null"
   // In the conversation layer a call is only a runnable tag: its output — and, when heavy,
   // its input — is one hop away, never inline.
-  if (layer === "conversation") return { text: `[Tool ${name} ${tagBody(input)} → recall ${shortId(id)}]` }
+  if (layer === "conversation") return { text: `[Tool ${name} ${tagBody(input)} → recall id=${shortId(id)}]` }
   const outputFiles: RecallFile[] = []
   const original = resolve?.(id)
   let body: string
@@ -371,7 +371,7 @@ function transcriptRow(row: unknown, layer: Layer, resolve: Resolve | undefined,
   }
   if (row.type === "shell") {
     const output = object(row.output) ? text(row.output.output) : ""
-    if (layer === "conversation") return `[Shell ${tagBody(text(row.command))} → recall ${shortId(text(row.id))}]`
+    if (layer === "conversation") return `[Shell ${tagBody(text(row.command))} → recall id=${shortId(text(row.id))}]`
     return `[Shell]: ${text(row.command)}\n${output}`
   }
   if (row.type === "synthetic") return dialogue ? `[Synthetic]: ${text(row.text)}` : ""
@@ -488,9 +488,11 @@ export type ParsedTarget =
   | { readonly kind: "error"; readonly message: string }
 
 /** Parse a lean target address: a handle plus optional `layer <L>` and `page <n>` pairs.
-    `catalog` instead takes an optional view: `all` or one exact entry label (E<n>). */
+    `catalog` instead takes an optional view: `all` or one exact entry label (E<n>).
+    A copied `recall id=…` suggestion may carry its own field marker or command word;
+    no real handle starts with either, so both are tolerated and stripped. */
 export function parseTarget(input: string): ParsedTarget {
-  const tokens = input.trim().split(/\s+/).filter(Boolean)
+  const tokens = input.trim().replace(/^(recall\s+)?id=/, "").split(/\s+/).filter(Boolean)
   if (!tokens.length) return { kind: "error", message: "Provide a target: catalog, an episode (E57), a tool call, or an archived row." }
   const handle = tokens[0]
   if (handle === "catalog") {
@@ -551,15 +553,15 @@ export function recallPage(base: string, text: string, page?: number, files: rea
     // The label reports the call that was made; paging advice stays in the parenthetical,
     // and originals beyond the cap point at query-first retrieval before raw paging.
     const label = shown < pages
-      ? `recall ${base} (whole output too large: first ${end} of ${text.length} characters; use a query to locate the relevant page first, or continue at page ${shown + 1})`
-      : `recall ${base} (whole output)`
+      ? `recall id=${base} (whole output too large: first ${end} of ${text.length} characters; use a query to locate the relevant page first, or continue at page ${shown + 1})`
+      : `recall id=${base} (whole output)`
     const whole = `${label}\n${text.slice(0, end)}`
     return attached.length ? [{ type: "text", text: whole }, ...attached] : whole
   }
   if (!Number.isSafeInteger(page) || page < 1) throw new RangeError("Invalid page")
-  if (page > pages) return `recall ${base} page ${page} is out of range: this original has ${pages} page${pages === 1 ? "" : "s"}; the last page is ${pages}.`
+  if (page > pages) return `recall id=${base} page ${page} is out of range: this original has ${pages} page${pages === 1 ? "" : "s"}; the last page is ${pages}.`
   const attached = attach(bounds[page - 1], bounds[page])
   const result = paginate(text, page)
-  const content = `recall ${base} page ${page} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
+  const content = `recall id=${base} page ${page} (page ${page} of ${result.pages}${result.nextPage ? `; next page: ${result.nextPage}` : ""})\n${result.content}`
   return attached.length ? [{ type: "text", text: content }, ...attached] : content
 }

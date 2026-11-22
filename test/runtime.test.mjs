@@ -202,7 +202,7 @@ test("compaction archives every original before generation and recall retrieves 
   h.state.rows = [completed("c1", compact.result), user("live", "currentcontextneedle")]
   assert.match(await h.controller.recall("s", { id: "E1" }), /exact user wording with archiveneedle/)
   assert.match(await h.controller.recall("s", { id: "tool-1" }), /file\.ts[\s\S]*complete output/)
-  assert.match(await h.controller.recall("s", { query: "archiveneedle" }), /recall E1 page 1/)
+  assert.match(await h.controller.recall("s", { query: "archiveneedle" }), /recall id=E1 page 1/)
   assert.match(await h.controller.recall("s", { query: "currentcontextneedle" }), /No matching/)
   assert.match(await h.controller.recall("s", { id: "E1", query: "x" }), /either id or query/)
   assert.match(await h.controller.recall("s", { id: "E1", page: 0 }), /positive safe integer/)
@@ -228,17 +228,17 @@ test("episode-scoped queries include only that episode's dialogue, notes, call a
 
   const conversation = await h.controller.recall("s", { query: "episcope", episode: "E1" })
   assert.match(conversation, /Historical evidence in E1, page 1 of 1 \(1 hit\)/)
-  assert.match(conversation, /- recall E1 page 1:/)
+  assert.match(conversation, /- recall id=E1 page 1:/)
   const tools = await h.controller.recall("s", { query: "episcope", episode: "E1", layer: "tools" })
-  for (const id of ["call-first", "u-first", "shell-first"]) assert.ok(tools.includes(`recall ${id} page 1`))
+  for (const id of ["call-first", "u-first", "shell-first"]) assert.ok(tools.includes(`recall id=${id} page 1`))
   assert.doesNotMatch(tools, /call-second|shell-second|outside-only|recall P\d/)
   const full = (await Promise.all([1, 2].map((page) => h.controller.recall("s", { query: "episcope", episode: "E1", layer: "full", page })))).join("\n")
-  assert.match(full, /recall catalog E1 page 1 \(archive note/)
-  assert.doesNotMatch(full, /call-second|shell-second|outside-only|recall P\d|recall E2/)
+  assert.match(full, /recall id=catalog E1 page 1 \(archive note/)
+  assert.doesNotMatch(full, /call-second|shell-second|outside-only|(recall id=)?P\d page|(recall id=)?E2 page/)
   assert.ok(!h.storage.reads.some((key) => key.startsWith("projects/test/episodes")), "an episode-scoped query never loads project-wide graduated notes")
-  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY", episode: "E2" }), /recall E2 page 1/)
+  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY", episode: "E2" }), /recall id=E2 page 1/)
   assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY", episode: "E1" }), /No matching snippets/, "a scoped miss never widens silently")
-  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY" }), /recall E2 page 1/, "scoping never mutates the shared corpus")
+  assert.match(await h.controller.recall("s", { query: "SECOND_SCOPE_ONLY" }), /recall id=E2 page 1/, "scoping never mutates the shared corpus")
 
   assert.match(await h.controller.recall("s", { id: "E1", episode: "E1" }), /episode applies only to a query/)
   for (const episode of ["", "E", "E0", "E-1", "E1 layer tools", 1]) assert.match(await h.controller.recall("s", { query: "episcope", episode }), /exact episode label/)
@@ -260,7 +260,7 @@ test("catalog listings are compact and paged on demand; an entry note fetches wh
   h.state.rows = [completed("c1", first.result), user("u2", "second work"), completed("c2", second.result)]
 
   const compact = await h.controller.recall("s", { id: "catalog" })
-  assert.match(compact, /recall catalog page 1 \(page 1 of 1\)/, "listings return one page per call, never a whole dump")
+  assert.match(compact, /recall id=catalog page 1 \(page 1 of 1\)/, "listings return one page per call, never a whole dump")
   assert.ok(compact.includes("\nE2 — Beta title") && compact.includes("\nE1 — Alpha title"), "one labeled line per entry")
   assert.ok(compact.indexOf("\nE2") < compact.indexOf("\nE1"), "newest first")
   assert.doesNotMatch(compact, /archive note/, "compact lines carry no note bodies")
@@ -268,7 +268,7 @@ test("catalog listings are compact and paged on demand; an entry note fetches wh
   assert.match(all, /alpha archive note/, "the all view carries every note")
   assert.match(all, /beta archive note/)
   const entry = await h.controller.recall("s", { id: "catalog E1" })
-  assert.match(entry, /recall catalog E1 \(whole output\)/)
+  assert.match(entry, /recall id=catalog E1 \(whole output\)/)
   assert.match(entry, /alpha archive note/)
   assert.doesNotMatch(entry, /beta archive note/, "an entry label is exact")
   assert.match(await h.controller.recall("s", { id: "catalog E9" }), /No catalog entry "E9"/)
@@ -318,7 +318,7 @@ test("archive-note hits show the note itself, not a fetch call that cannot repro
   const first = await compactRows(h, [user("u1", "some context"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   const found = await h.controller.recall("s", { query: "notekeyword", layer: "full" })
-  assert.match(found, /- recall catalog E1 page 1 \(archive note, not original evidence\):/)
+  assert.match(found, /- recall id=catalog E1 page 1 \(archive note, not original evidence\):/)
   assert.doesNotMatch(found, /- recall \{/, "no call that would fetch different content")
   assert.match(found, /page 1 of 1 \(1 hit\)/)
   assert.match(await h.controller.recall("s", { id: "catalog E1 page 1" }), /notekeyword recorded in the cold archive note/, "the rendered target fetches the note, not a different transcript")
@@ -334,7 +334,7 @@ test("injected content homes in row originals and stays out of conversation sear
   h.state.rows = [completed("c1", first), user("live", "x")]
   assert.match(await h.controller.recall("s", { query: "directive bench camera", layer: "conversation" }), /No matching snippets/, "the dialogue home carries only the tag")
   const hit = await h.controller.recall("s", { query: "directive bench camera", layer: "tools" })
-  assert.match(hit.split("\n")[1], /^- recall u1 page 1:/, "the skill body's search home is its row original")
+  assert.match(hit.split("\n")[1], /^- recall id=u1 page 1:/, "the skill body's search home is its row original")
   const fetched = await h.controller.recall("s", { id: "u1" })
   assert.match(fetched, /\[Skill activated: companion\]\ncompanion directive 0 /)
   assert.match(fetched, /companion directive 42/)
@@ -347,9 +347,9 @@ test("a corrupt archived row and an out-of-range page return plain content, neve
   const first = await compactRows(h, [user("u1", "episode wording"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
   await h.storage.set("sessions/s/rows/u1", "corrupt not json {")
-  assert.equal(await h.controller.recall("s", { id: "u1" }), "recall u1 (whole output)\n[Invalid archived row; recall gap]")
+  assert.equal(await h.controller.recall("s", { id: "u1" }), "recall id=u1 (whole output)\n[Invalid archived row; recall gap]")
   assert.match(await h.controller.recall("s", { id: "E1" }), /Invalid archived row; recall gap/, "the episode transcript discloses the gap the same way")
-  assert.equal(await h.controller.recall("s", { id: "E1", page: 99 }), "recall E1 page 99 is out of range: this original has 1 page; the last page is 1.")
+  assert.equal(await h.controller.recall("s", { id: "E1", page: 99 }), "recall id=E1 page 99 is out of range: this original has 1 page; the last page is 1.")
   assert.match(await h.controller.recall("s", { query: "wording" }), /No matching snippets/, "search skips the unreadable row without failing")
 })
 
@@ -394,7 +394,7 @@ test("corrupt calls do not poison exact, prefix, episode, query or graduated-not
     assert.match(await reloaded.recall("s", { id: "call-bad" }), /Recall unavailable: Invalid/)
     assert.match(await reloaded.recall("s", { id: "E1" }), /intact_conversation_needle/)
     assert.match(await reloaded.recall("s", { id: "E1", layer: "tools" }), /intact_tool_needle/)
-    assert.match(await reloaded.recall("s", { query: "intact_tool_needle", layer: "tools" }), /recall call-good page 1/)
+    assert.match(await reloaded.recall("s", { query: "intact_tool_needle", layer: "tools" }), /recall id=call-good page 1/)
     assert.match(await reloaded.recall("s", { id: "P1" }), /intact_project_needle/)
   }
 })
@@ -406,14 +406,14 @@ test("the search corpus is cached per checkpoint: warm queries rescan nothing, a
   h.storage.scan = async (options) => { scans++; return scan(options) }
   const first = await compactRows(h, [user("u1", "firstcacheneedle wording"), running("c1")])
   h.state.rows = [completed("c1", first), user("live", "x")]
-  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall E1 page 1/)
+  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall id=E1 page 1/)
   const cold = scans
   assert.ok(cold > 0, "the cold query scans calls and rows")
-  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall E1 page 1/, "the warm query still answers")
+  assert.match(await h.controller.recall("s", { query: "firstcacheneedle" }), /recall id=E1 page 1/, "the warm query still answers")
   assert.equal(scans, cold, "a warm query at the same checkpoint rescans nothing")
   const second = await compactRows(h, [completed("c1", first), user("u2", "secondcacheneedle wording"), running("c2")])
   h.state.rows = [completed("c1", first), user("u2", "secondcacheneedle wording"), completed("c2", second)]
-  assert.match(await h.controller.recall("s", { query: "secondcacheneedle" }), /recall E2 page 1/, "the rebuilt corpus sees the new episode")
+  assert.match(await h.controller.recall("s", { query: "secondcacheneedle" }), /recall id=E2 page 1/, "the rebuilt corpus sees the new episode")
   assert.ok(scans > cold, "a new checkpoint invalidates the cache and rebuilds the corpus")
 })
 
@@ -428,7 +428,7 @@ test("deleted sessions graduate their episode notes into the project archive; a 
 
   const fresh = harness({}, h.storage)
   assert.match(await fresh.controller.recall("fresh", { query: "preserve the exact request", layer: "full" }),
-    /- recall P1 page 1 \(graduated session note, s, 0s ago\): /, "the full layer surfaces the graduated note as a fetchable hit")
+    /- recall id=P1 page 1 \(graduated session note, s, 0s ago\): /, "the full layer surfaces the graduated note as a fetchable hit")
   assert.match(await fresh.controller.recall("fresh", { query: "preserve the exact request" }),
     /Nothing is archived to search yet/, "layer-scoped queries never load graduated notes: they have no home")
   const fetched = await fresh.controller.recall("fresh", { id: "P1" })
@@ -442,7 +442,7 @@ test("graduated-note search addresses fetch the same page across a changing rela
   const h = harness()
   await createProjectStore(h.storage, "test").graduate([{ note: `${"filler ".repeat(854)} boundary_note_needle ${"tail ".repeat(1_500)}`, end: 1_000 }], "origin")
   const hits = await h.controller.recall("s", { query: "boundary_note_needle", layer: "full" })
-  const target = /- recall (P1 page \d+)/.exec(hits)?.[1]
+  const target = /- recall id=(P1 page \d+)/.exec(hits)?.[1]
   assert.ok(target)
   const before = await h.controller.recall("s", { id: target })
   assert.match(before, /boundary_note_needle/, "the search result lands on the page containing the match")
@@ -462,9 +462,9 @@ test("graduation ranks a recent note above an equally matching stale one", async
   await h.controller.onDeleted("s")
   const fresh = harness({}, h.storage)
   const hits = await fresh.controller.recall("fresh", { query: "gauge needle", layer: "full" })
-  assert.match(hits, /- recall P2 page 1 \(graduated session note, s, 0s ago\)/, "the recent note outranks the equal term match")
-  assert.match(hits, /- recall P1 page 1 \(graduated session note, s, /, "the stale note still matches, just below")
-  assert.ok(hits.indexOf("recall P2") < hits.indexOf("recall P1"), "recency ordering is strict")
+  assert.match(hits, /- recall id=P2 page 1 \(graduated session note, s, 0s ago\)/, "the recent note outranks the equal term match")
+  assert.match(hits, /- recall id=P1 page 1 \(graduated session note, s, /, "the stale note still matches, just below")
+  assert.ok(hits.indexOf("recall id=P2") < hits.indexOf("recall id=P1"), "recency ordering is strict")
 })
 
 test("subagent sessions never graduate their notes into the project archive", async () => {
@@ -715,7 +715,7 @@ test("revert follows only the active working-state chain; old evidence remains r
   h.state.rows = [completed("c3", third)]
   assert.match(await h.controller.recall("s", { query: "abandonedbranchneedle" }), /No matching snippets/)
   assert.match(await h.controller.recall("s", { id: "E2" }), /No matching episode/)
-  assert.match(await h.controller.recall("s", { query: "activebranchneedle" }), /recall E3 page 1/)
+  assert.match(await h.controller.recall("s", { query: "activebranchneedle" }), /recall id=E3 page 1/)
 })
 
 const cheap = { providerID: "memory-provider", id: "cheap/model", variant: "light" }
@@ -764,7 +764,7 @@ test("a CJK task continues through generated and main-authored checkpoints with 
   assert.equal(h.state.prompts.length, 2, "the inherited-language patch succeeds on its first attempt")
   h.state.rows = [completed("c2", second), assistant("a3", "测试已通过。")]
   const input = { archive: "Title: 测试通过\n所有测试已通过。", working: { next: ["提交修复"] } }
-  assert.match((await publishCheckpoint(h, input)).output, /^Requested:/)
+  assert.match((await publishCheckpoint(h, input)).output, /Prepared:/)
   h.state.rows.push(running("c3"))
   const cut = event()
   await h.controller.onCompaction(cut)
@@ -781,7 +781,7 @@ test("native CJK summaries support generated and main-authored full checkpoints 
       objective: "调查并修复对话层污染问题", constraints: [], state: ["已验证问题"], next: ["继续测试"], references: [],
     }, retiredConstraints: [] }
     h.state.rows = [native("prior", "调查并修复对话层污染问题。"), assistant("a1", "继续验证修复结果。")]
-    if (author === "main") assert.match((await publishCheckpoint(h, { archive: h.state.handoff.archive, working: h.state.handoff.working })).output, /^Requested:/)
+    if (author === "main") assert.match((await publishCheckpoint(h, { archive: h.state.handoff.archive, working: h.state.handoff.working })).output, /Prepared:/)
     h.state.rows.push(running("c1"))
     const cut = event()
     await h.controller.onCompaction(cut)
@@ -1455,6 +1455,76 @@ test("the queued hint survives the one repair attempt", async () => {
   }
 })
 
+const continuation = (id) => ({ id, type: "assistant", content: [
+  { type: "tool", id: `${id}-call`, name: "read", state: { status: "completed", input: { path: "x" }, content: [{ type: "text", text: "r" }] } },
+] })
+const finish = (id) => ({ id, type: "assistant", content: [{ type: "text", text: "All done." }] })
+
+test("a staged checkpoint waits for the model's next action: tool work applies it, a final reply defers it", async () => {
+  const applies = harness({ idle: 1 })
+  applies.state.rows = [user("u1", "work behind a staged checkpoint")]
+  const staged = await publishCheckpoint(applies, {}, false)
+  assert.match(staged.output, /^Prepared:/)
+  assert.equal(applies.state.compact, 0, "nothing is admitted or generated before the model's next action")
+  applies.state.rows.push(continuation("step-next"))
+  await applies.controller.onContext({ ...event(), messages: projectHistory(applies.state.rows).messages })
+  await setImmediate()
+  assert.equal(applies.state.compact, 1, "tool work continues the round: the staged cut applies at its boundary")
+
+  const defers = harness({ idle: 1 })
+  defers.state.rows = [user("u1", "finished work behind a staged checkpoint")]
+  await publishCheckpoint(defers, {}, false)
+  defers.state.rows.push(finish("step-final"))
+  await idle(defers)
+  assert.equal(defers.state.compact, 0, "a final reply's round end applies nothing")
+  const marker = await defers.store.getDeferredCompaction()
+  assert.equal(marker.threshold, 0, "the staged cut is queued unconditionally")
+  assert.equal(marker.after, "step-final")
+  await defers.controller.onPrompt({ ...prompt(), prompt: { text: "Now start the next task", files: [] } })
+  assert.equal(defers.state.compact, 1, "the cut lands at the next prompt")
+  defers.state.rows.push(running("c1"))
+  await compactRows(defers, defers.state.rows)
+  assert.equal(generationData(defers.state.prompts.at(-1)).queued, "Now start the next task", "steered by the user's message")
+})
+
+test("the staged cut ends at the call: newer work rides live beside the summary", async () => {
+  const h = harness()
+  h.state.rows = [user("u1", "work before the staged boundary")]
+  await publishCheckpoint(h, {}, false)
+  h.state.rows.push(continuation("step-next"))
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  h.state.rows.push(running("c1"))
+  const result = await compactRows(h, h.state.rows)
+  assert.equal(result.metadata.keepID, "step-next", "the continuation rides live beside the summary")
+  assert.deepEqual((await h.store.getCheckpoint("c1")).episode.rowIDs, ["u1", "assistant"], "the episode ends at the staged boundary, the call itself included")
+})
+
+test("a staged edit survives the hold: work after its boundary cannot invalidate it", async () => {
+  const h = harness()
+  h.state.rows = [user("u1", "work behind the main edit")]
+  await publishCheckpoint(h, edit({ ...h.state.handoff.working, next: ["Verify the staged edit"] }), true)
+  h.state.rows.push(continuation("step-next"))
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  h.state.rows.push(running("c1"))
+  const result = await compactRows(h, h.state.rows)
+  assert.ok(result)
+  assert.equal(result.metadata.nextdcp.author, "main", "the edit was staged for its boundary; later work lives outside it")
+})
+
+test("a staged checkpoint on a failed or interrupted round applies at its boundary", async () => {
+  const h = harness({ idle: 1 })
+  h.state.rows = [user("u1", "work behind a staged checkpoint")]
+  await publishCheckpoint(h, {}, false)
+  await h.controller.onRoundEnded("s")
+  await setImmediate()
+  assert.equal(h.state.compact, 1, "interruptions continue the same work: the staged cut applies")
+  h.state.rows.push(running("c1"))
+  await compactRows(h, h.state.rows)
+  assert.deepEqual((await h.store.getCheckpoint("c1")).episode.rowIDs, ["u1", "assistant"], "the cut lands at the staged boundary, the call itself included")
+})
+
 test("a failed compaction keeps the hint for its next attempt; committing consumes it", async (t) => {
   t.mock.method(console, "warn", () => {})
   const h = harness({ idle: 1 })
@@ -1477,7 +1547,7 @@ test("a failed compaction keeps the hint for its next attempt; committing consum
   assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "committing consumed the hint")
 })
 
-test("final retained output can cross the soft threshold; ephemeral reasoning never counts as durable growth", async () => {
+test("final retained output can cross the soft threshold; reasoning counts as durable growth", async () => {
   const h = harness({ idle: 100, budget: 1_000_000 })
   h.state.rows = [user("u1", "x".repeat(320))]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
@@ -1485,9 +1555,9 @@ test("final retained output can cross the soft threshold; ephemeral reasoning ne
     { type: "reasoning", text: "r".repeat(40) }, { type: "text", text: "a".repeat(80) },
   ] }, { id: "idle", type: "idle", outcome: "succeeded" })
   await h.controller.onIdle("s")
-  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "idle", tokens: 100, threshold: 100 })
+  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "idle", tokens: 110, threshold: 100 })
   await h.controller.onIdle("s")
-  assert.equal((await h.store.getDeferredCompaction()).tokens, 100)
+  assert.equal((await h.store.getDeferredCompaction()).tokens, 110)
   assert.equal(h.state.compact, 0, "the final answer must not start a summary while idle")
   await h.controller.onPrompt(prompt())
   assert.equal(h.state.compact, 1)
@@ -1658,12 +1728,12 @@ test("an open gate admits checkpoint_now normally, including a direct working-st
     await h.controller.onCompactionFinished("s")
     h.state.rows = [completed("c1", seed), user("u", "x".repeat(800))]
     await armGate(h)
-    const { output } = await publishCheckpoint(h, direct ? edit({ next: ["Verify the new direct checkpoint"] }) : {}, false)
-    assert.match(output, /^Requested:/, "a gate is not an already admitted cut")
-    assert.equal(h.state.compact, 1)
+    const { output } = await publishCheckpoint(h, direct ? edit({ ...h.state.handoff.working, next: ["Verify the new direct checkpoint"] }) : {}, false)
+    assert.match(output, /Prepared:/, "a gate is not an already admitted cut")
+    assert.equal(h.state.compact, 0, "staging holds the cut for the model's next action")
     await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
     await setImmediate()
-    assert.equal(h.state.compact, 1, "the consumed gate cannot request a second cut")
+    assert.equal(h.state.compact, 0, "the consumed gate cannot request a second cut")
     const result = await compactRows(h, [...h.state.rows, running("c2")])
     assert.equal(h.state.stateless.length, 0)
     assert.equal(h.state.prompts.length, direct ? 1 : 2, "only an empty call asks the compactor to generate")
@@ -1725,7 +1795,7 @@ test("successive main edits update the latest canonical state in the same round 
   h.state.rows = [completed("c0", seed), user("u2", "continue")]
   h.state.failGenerate = h.state.failStateless = true
   const first = edit({ state: ["First verified main-model update"], next: ["First next action"] })
-  assert.match((await publishCheckpoint(h, first)).output, /^Requested:.*Validated working-state edit staged/)
+  assert.match((await publishCheckpoint(h, first)).output, /Prepared:.*Validated working-state edit staged/)
   assert.equal(await h.store.getCheckpoint("c1"), undefined, "admission is not a committed handoff")
   const result = await compactRows(h, [...h.state.rows, running("c1")])
   assert.equal(result.metadata.nextdcp.author, "main")
@@ -1739,10 +1809,10 @@ test("successive main edits update the latest canonical state in the same round 
   await h.controller.onCompactionFinished("s")
   h.state.rows = [completed("c1", result)]
   const second = edit({ next: ["Second next action"] })
-  assert.match((await publishCheckpoint(h, second, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /^Requested:/)
+  assert.match((await publishCheckpoint(h, second, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /Prepared:/)
   const next = await compactRows(h, [...h.state.rows, running("c2")])
   assert.deepEqual((await h.store.getCheckpoint("c2")).working, { ...saved.working, next: ["Second next action"] }, "the base includes the first main edit, not just the last compactor output")
-  assert.equal(h.state.compact, 2, "a moved boundary permits another checkpoint in the same round")
+  assert.equal(h.state.compact, 0, "both checkpoints applied through their staged cuts, not host admissions")
   assert.equal(h.state.prompts.length, 1, "only the original seed generated")
   assert.equal(h.state.stateless.length, 0)
   const repeated = event(), reloaded = event()
@@ -1778,15 +1848,21 @@ test("checkpoint_now registers approval-free beside recall, and model-facing cop
 test("failed checkpoint admission is explicit, retryable, and cannot leak an unadmitted edit", async () => {
   const h = harness({ idle: false, budget: false })
   h.state.rows = [user("u1", "work so far")]
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   h.state.failAdmission = true
-  const failed = (await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "UNADMITTED_EDIT_MUST_NOT_COMMIT" }))).output
-  assert.match(failed, /^Failed: Compaction admission failed; no checkpoint was confirmed/)
-  assert.doesNotMatch(failed, /conversation is archived|Checkpointing now|edit staged/)
-  assert.equal((await h.store.getGateStats()).checkpoints, 0)
+  const staged = (await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "UNADMITTED_EDIT_MUST_NOT_COMMIT" }), false)).output
+  assert.match(staged, /^Prepared:/)
+  assert.doesNotMatch(staged, /conversation is archived|Checkpointing now/)
+  assert.equal(h.state.compact, 0, "staging admits nothing; the failure surfaces at the apply")
+  h.state.rows.push(continuation("step-next"))
+  await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+  await setImmediate()
+  assert.equal(h.state.compact, 1)
+  assert.equal((await h.store.getGateStats()).checkpoints, 0, "a staged cut that never landed is not counted")
+  assert.match(await h.storage.get("sessions/s/model/warning"), /staged checkpoint could not be applied/, "the refused apply is explicit")
   h.state.failAdmission = false
   const retry = await h.controller.checkpointNow({}, toolContext)
-  assert.match(retry, /^Requested:.*Completion is not confirmed/)
-  assert.equal(h.state.compact, 2, "failed admission permits a retry")
+  assert.match(retry, /Prepared:.*Completion is not confirmed/, "a refused apply permits re-staging")
   h.state.rows.push(running("c1"))
   const cut = event()
   await h.controller.onCompaction(cut)
@@ -1794,10 +1870,10 @@ test("failed checkpoint admission is explicit, retryable, and cannot leak an una
   assert.doesNotMatch(cut.result.summary, /UNADMITTED_EDIT_MUST_NOT_COMMIT/)
   assert.ok(!("queued" in generationData(h.state.prompts.at(-1))), "a refused edit is not attached as a later relevance signal")
   await setImmediate()
-  assert.equal((await h.store.getGateStats()).checkpoints, 1, "only the actually admitted early checkpoint is counted")
+  assert.equal((await h.store.getGateStats()).checkpoints, 1, "only the checkpoint that actually landed is counted")
 })
 
-test("concurrent checkpoint calls share admission and cannot turn rejection into success", async () => {
+test("concurrent checkpoint calls share one staging; a rejected apply is explicit and retryable", async () => {
   for (const fail of [false, true]) {
     const h = harness({ idle: false, budget: false }), entered = deferred(), release = deferred()
     h.state.rows = [user("u1", "work so far")]
@@ -1808,18 +1884,29 @@ test("concurrent checkpoint calls share admission and cannot turn rejection into
       if (fail) throw new Error("SECRET host rejection")
     }
     const first = h.controller.checkpointNow({}, toolContext)
-    await entered.promise
     const second = h.controller.checkpointNow({}, toolContext)
-    await setImmediate()
-    assert.equal(h.state.compact, 1)
-    release.resolve()
     const outputs = await Promise.all([first, second])
-    if (fail) assert.ok(outputs.every((text) => text.startsWith("Failed:")))
-    else {
-      assert.match(outputs[0], /^Requested:/)
-      assert.match(outputs[1], /^Already pending:/)
-    }
+    assert.match(outputs[0], /Prepared:/)
+    assert.match(outputs[1], /^Already pending: a staged checkpoint is waiting for your next action./)
     assert.ok(outputs.every((text) => !text.includes("SECRET")))
+    assert.equal(h.state.compact, 0, "staging admits nothing")
+    // The host records the assistant message that carried the call; the model's next
+    // tool steps apply the staged cut once, and concurrent peeks share its admission.
+    const boundary = publication({}, toolContext)
+    boundary.content[0].state = { status: "completed", input: {}, content: [{ type: "text", text: outputs[0] }] }
+    h.state.rows.push(boundary, continuation("step-a"), continuation("step-b"))
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    await entered.promise
+    await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
+    await setImmediate()
+    assert.equal(h.state.compact, 1, "the shared admission never double-cuts")
+    release.resolve()
+    await setImmediate()
+    if (fail) {
+      assert.match(await h.storage.get("sessions/s/model/warning"), /staged checkpoint could not be applied/, "rejection is explicit, never silent")
+      assert.match(await h.controller.checkpointNow({}, toolContext), /^Prepared:/, "a rejected apply permits re-staging")
+    } else assert.equal(await h.storage.get("sessions/s/model/warning"), undefined, "a clean apply warns nothing")
+    assert.ok(!(await h.storage.get("sessions/s/model/warning") ?? "").includes("SECRET"), "host errors never leak verbatim")
   }
 })
 
@@ -1842,7 +1929,7 @@ test("main edits have no payload cap and oversized merged state commits unchange
   h.state.rows = [user("u1", "work")]
   const input = { archive: `Title: Large edit\n${"coldnote ".repeat(600)}`, working: { ...h.state.handoff.working, state: [`${"😀".repeat(2_100)}${"verified state ".repeat(3_000)}END`] } }
   const { output } = await publishCheckpoint(h, input)
-  assert.match(output, /^Requested:.*soft target 100; no truncation or size-only rewrite/)
+  assert.match(output, /Prepared:.*soft target 100; no truncation or size-only rewrite/)
   const result = await compactRows(h, [...h.state.rows, running("c1")])
   assert.equal(result.metadata.nextdcp.author, "main")
   assert.deepEqual((await h.store.getCheckpoint("c1")).working, input.working)
@@ -1869,7 +1956,7 @@ test("malformed edits are refused before admission and partial seeds explicitly 
     assert.match(await h.controller.checkpointNow(input, toolContext), /^Not admitted:/)
     assert.equal(h.state.compact, 0)
   }
-  assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:.*compactor will generate/)
+  assert.match(await h.controller.checkpointNow({}, toolContext), /Prepared:.*compactor will generate/)
   assert.equal((await compactRows(h, [...h.state.rows, running("c1")])).metadata.nextdcp.author, "compactor")
 })
 
@@ -1884,7 +1971,7 @@ test("direct edits preserve standing constraints and retire only quotes from the
   assert.match(await h.controller.checkpointNow(input, toolContext), /^Not admitted:.*new user message/, "an archived user quote is not new retirement evidence")
   assert.equal(h.state.compact, 0)
   h.state.rows.push(user("new-user", quote))
-  assert.match((await publishCheckpoint(h, input)).output, /^Requested:.*edit staged/)
+  assert.match((await publishCheckpoint(h, input)).output, /Prepared:.*edit staged/)
   await compactRows(h, [...h.state.rows, running("c1")])
   const saved = await h.store.getCheckpoint("c1")
   assert.deepEqual(saved.working.constraints, [])
@@ -1894,6 +1981,9 @@ test("direct edits preserve standing constraints and retire only quotes from the
 })
 
 test("new or changed evidence at the actual cut regenerates instead of committing a stale main edit", async () => {
+  // Changes inside the staged span or to the publication itself invalidate the edit;
+  // work after the staged boundary rides live beside the summary instead (the hold
+  // design: later work cannot invalidate a staged authoring).
   for (const change of ["user", "tool-result", "changed-result", "parallel", "base", "publication-error", "queued-user"]) {
     const h = harness({ idle: false, budget: false })
     const read = { id: "read", type: "assistant", content: [{ type: "tool", id: "read-1", name: "read", state: {
@@ -1901,7 +1991,7 @@ test("new or changed evidence at the actual cut regenerates instead of committin
     } }] }
     h.state.rows = [user("u1", "work"), read]
     const { row, output } = await publishCheckpoint(h, edit({ ...h.state.handoff.working, objective: "STALE_MAIN_EDIT" }))
-    assert.match(output, /^Requested:.*edit staged/, change)
+    assert.match(output, /Prepared:.*edit staged/, change)
     if (change === "user") h.state.rows.push(user("late-user", "LATE_USER_CONSTRAINT"))
     if (change === "tool-result") h.state.rows.push(assistant("late-result", "LATE_TOOL_FINDING"))
     if (change === "changed-result") read.content[0].state.content[0].text = "CHANGED_TOOL_FINDING"
@@ -1910,11 +2000,17 @@ test("new or changed evidence at the actual cut regenerates instead of committin
     if (change === "publication-error") row.content[0].state = { ...row.content[0].state, status: "error", error: { type: "interrupted", message: "stopped" } }
     if (change === "queued-user") await h.controller.onPrompt(prompt())
     const result = await compactRows(h, [...h.state.rows, running("c1")])
-    assert.equal(result.metadata.nextdcp.author, "compactor", change)
-    assert.equal(h.state.prompts.length, 1, change)
-    assert.doesNotMatch(result.summary, /STALE_MAIN_EDIT/, change)
-    assert.match(await h.storage.get("sessions/s/model/warning"), /compactor will regenerate from the actual cut/, change)
-    if (change === "user") assert.match(await h.store.getRow("late-user"), /LATE_USER_CONSTRAINT/, "late evidence is archived at the same actual boundary")
+    const rides = change === "user" || change === "tool-result"
+    if (rides) {
+      assert.equal(result.metadata.nextdcp.author, "main", `${change}: the staged edit survives; later work rides live`)
+      assert.equal(h.state.prompts.length, 0, change)
+      if (change === "user") assert.equal(result.metadata.keepID, "late-user", "the late user row rides live beside the summary")
+    } else {
+      assert.equal(result.metadata.nextdcp.author, "compactor", change)
+      assert.equal(h.state.prompts.length, 1, change)
+      assert.doesNotMatch(result.summary, /STALE_MAIN_EDIT/, change)
+      assert.match(await h.storage.get("sessions/s/model/warning"), /compactor will regenerate from the actual cut/, change)
+    }
     if (change === "changed-result") assert.match(await h.store.getRow("read"), /CHANGED_TOOL_FINDING/)
   }
 })
@@ -1929,7 +2025,7 @@ test("stale, parallel or missing authoring evidence at admission selects explici
     if (kind === "parallel") row.content.push({ type: "tool", id: "read-parallel", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "NEW_RESULT" }] } })
     h.state.rows.push(row)
     const output = await h.controller.checkpointNow(input, toolContext)
-    assert.match(output, /^Requested:.*Edit not staged:.*compactor will regenerate/, kind)
+    assert.match(output, /Prepared:.*Edit not staged:.*compactor will generate/, kind)
     row.content[0].state = { status: "completed", input, content: [{ type: "text", text: output }] }
     const result = await compactRows(h, [...h.state.rows, running("c1")])
     assert.equal(result.metadata.nextdcp.author, "compactor", kind)
@@ -1950,26 +2046,22 @@ test("a reload before the cut loses the uncommitted proposal and safely regenera
 })
 
 test("a concurrent duplicate cannot overwrite the proposal that owns admission", async () => {
-  const h = harness({ idle: false, budget: false }), entered = deferred(), release = deferred()
+  const h = harness({ idle: false, budget: false })
   h.state.rows = [user("u1", "work")]
   await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
   const input = edit({ ...h.state.handoff.working, objective: "FIRST_EDIT_OWNS_ADMISSION" }), row = publication(input)
   h.state.rows.push(row)
-  h.ctx.session.compact = async () => { h.state.compact++; entered.resolve(); await release.promise }
   const first = h.controller.checkpointNow(input, toolContext)
-  await entered.promise
   const second = h.controller.checkpointNow(edit({ ...h.state.handoff.working, objective: "DUPLICATE_MUST_NOT_OVERWRITE" }), toolContext)
-  await setImmediate()
-  release.resolve()
   const outputs = await Promise.all([first, second])
-  assert.match(outputs[0], /^Requested:.*edit staged/)
-  assert.match(outputs[1], /^Already pending:.*No new edit was staged/)
+  assert.match(outputs[0], /Prepared:.*edit staged/)
+  assert.match(outputs[1], /^Already pending: a staged checkpoint is waiting for your next action./)
   row.content[0].state = { status: "completed", input, content: [{ type: "text", text: outputs[0] }] }
   const result = await compactRows(h, [...h.state.rows, running("c1")])
   assert.match(result.summary, /FIRST_EDIT_OWNS_ADMISSION/)
   assert.doesNotMatch(result.summary, /DUPLICATE_MUST_NOT_OVERWRITE/)
   assert.equal(h.state.prompts.length, 0)
-  assert.equal(h.state.compact, 1)
+  assert.equal(h.state.compact, 0)
 })
 
 test("unreadable context, inactive rounds and staged reverts admit no checkpoint", async () => {
@@ -2066,9 +2158,9 @@ test("memory accounts for the gate notice without consuming the gate or queuing 
 test("memory reports cut completion separately from admission and a prepared handoff", async () => {
   const h = harness({ idle: false, budget: false })
   h.state.rows = [user("u1", "work so far")]
-  assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:/)
+  assert.match(await h.controller.checkpointNow({}, toolContext), /Prepared:/)
   let status = await h.controller.memoryStatus("s")
-  assert.equal(status.compaction, "pending")
+  assert.equal(status.compaction, "pending", "a staged cut is pending: it lands with the model's next action")
   assert.equal(status.lastCut, undefined, "an admitted inbox item is not a completed cut")
   h.state.rows.push(running("c1"))
   const cut = event()
@@ -2082,7 +2174,7 @@ test("memory reports cut completion separately from admission and a prepared han
   assert.deepEqual(status.checkpoint, { id: "c1", episode: "E1", native: false, author: "compactor" })
   assert.equal(status.lastCut.action, "completed")
   assert.equal(status.lastCut.id, "c1")
-  assert.match(status.lastCut.reason, /model requested an early checkpoint/)
+  assert.match(status.lastCut.reason, /staged checkpoint applied at its call-time boundary/)
   assert.equal(status.compaction, "idle")
   assert.equal(status.growth.tokens, 0)
 })
@@ -2345,9 +2437,12 @@ test("setup registers success-only idle events and clears the subscription", asy
   push("session.execution.succeeded")
   await setImmediate()
   await setImmediate()
-  assert.equal(h.state.compact, 1, "a successful round repays the armed gate with one bounded compaction")
+  assert.equal(h.state.compact, 0, "a successful round repays the armed gate as a marker, never an unsteered immediate cut")
+  assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: null, after: "u", tokens: 200, threshold: 1 })
   await h.state.hooks.get("prompt")(prompt())
-  assert.equal(h.state.compact, 1, "the direct repayment leaves no marker to admit at the next prompt")
+  assert.equal(h.state.compact, 1, "the repayment marker admits at the next prompt, steered by it")
+  await h.state.hooks.get("prompt")(prompt())
+  assert.equal(h.state.compact, 1, "one prompt admits one cut; the marker never re-arms while the boundary holds")
   h.state.rows = [native("checkpoint")]
   push("session.compaction.ended")
   push("session.execution.succeeded")
@@ -2641,17 +2736,17 @@ test("graduated notes never cross actual project ownership even when plugin stor
   b.ctx.location = { directory: "C:/project-b", project: { id: "project-b" } }
   b.state.info = { ...b.state.info, projectID: "project-b", location: { directory: "C:/project-b" } }
   b.controller = createController(b.ctx)
-  assert.doesNotMatch(await b.controller.recall("session-b", { query: "alpha_private_project_needle", layer: "full" }), /recall P1/)
+  assert.doesNotMatch(await b.controller.recall("session-b", { query: "alpha_private_project_needle", layer: "full" }), /(recall id=)?P1 page/)
   assert.match(await b.controller.recall("session-b", { id: "P1" }), /No matching/)
   const same = harness({}, a.storage)
-  assert.match(await same.controller.recall("new-a", { query: "alpha_private_project_needle", layer: "full" }), /recall P1/)
+  assert.match(await same.controller.recall("new-a", { query: "alpha_private_project_needle", layer: "full" }), /(recall id=)?P1 page/)
 })
 
 test("warm project-note caches observe another instance's graduation without a checkpoint change", async () => {
   const h = harness()
   assert.match(await h.controller.recall("observer", { query: "fresh_graduation_needle", layer: "full" }), /Nothing is archived/)
   await createProjectStore(h.storage, "test").graduate([{ note: "fresh_graduation_needle", end: Date.now() }], "deleted-writer")
-  assert.match(await h.controller.recall("observer", { query: "fresh_graduation_needle", layer: "full" }), /recall P1/)
+  assert.match(await h.controller.recall("observer", { query: "fresh_graduation_needle", layer: "full" }), /(recall id=)?P1 page/)
   assert.match(await h.controller.recall("observer", { id: "P1" }), /fresh_graduation_needle/)
 })
 
@@ -2748,7 +2843,7 @@ test("the first checkpoint recognizes a real question reply without repair or na
     const reply = questionRow([[`It seems you're acting in quite a generic way, ${quote}`]], "call_human_reply")
     reply.content[0].state.content = [{ type: "text", text: `User answered: ${quote}` }]
     h.state.rows = [user("u1", "Investigate the model-list mismatch."), reply]
-    assert.match(await h.controller.checkpointNow({}, toolContext), /^Requested:/)
+    assert.match(await h.controller.checkpointNow({}, toolContext), /Prepared:/)
     const result = await compactRows(h, [...h.state.rows, running("c1")])
     assert.equal(result.metadata.nextdcp.author, "compactor")
     assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [quote])
@@ -2767,7 +2862,7 @@ test("main-authored seeds and later retirements share structured human-answer pr
   h.state.rows = [user("u1", "Investigate the model list."), questionRow([[quote]])]
   h.state.failGenerate = h.state.failStateless = true
   const input = edit({ ...h.state.handoff.working, constraints: [quote] })
-  assert.match((await publishCheckpoint(h, input)).output, /^Requested:.*edit staged/)
+  assert.match((await publishCheckpoint(h, input)).output, /Prepared:.*edit staged/)
   const first = await compactRows(h, [...h.state.rows, running("c1")])
   assert.equal(first.metadata.nextdcp.author, "main")
   assert.deepEqual((await h.store.getCheckpoint("c1")).working.constraints, [quote])
@@ -2775,7 +2870,7 @@ test("main-authored seeds and later retirements share structured human-answer pr
   const withdrawal = "You may stop remembering my web-search preference."
   h.state.rows = [completed("c1", first), questionRow([[withdrawal]], "call_withdrawal")]
   const next = { ...edit({ constraints: [] }), retire: [{ constraint: quote, quote: withdrawal }] }
-  assert.match((await publishCheckpoint(h, next, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /^Requested:.*edit staged/)
+  assert.match((await publishCheckpoint(h, next, true, { ...toolContext, messageID: "assistant-2", id: "checkpoint-2" })).output, /Prepared:.*edit staged/)
   const result = await compactRows(h, [...h.state.rows, running("c2")])
   const saved = await h.store.getCheckpoint("c2")
   assert.equal(result.metadata.nextdcp.author, "main")
@@ -2812,7 +2907,7 @@ test("a metadata-only human-answer change selects regeneration, both before admi
     if (timing === "admission") change()
     const input = edit({ ...h.state.handoff.working, objective: "STALE_QUESTION_EDIT" })
     const { output } = await publishCheckpoint(h, input, false)
-    assert.match(output, timing === "admission" ? /^Requested:.*Edit not staged:.*evidence changed/ : /^Requested:.*edit staged/)
+    assert.match(output, timing === "admission" ? /Prepared:.*Edit not staged:.*evidence changed/ : /Prepared:.*edit staged/)
     if (timing === "cut") change()
     const result = await compactRows(h, [...h.state.rows, running("c1")])
     assert.equal(result.metadata.nextdcp.author, "compactor")
@@ -3133,23 +3228,34 @@ test("neither learned rate spikes nor recent tool errors postpone an overdue aut
   }
 })
 
-test("unchanged over-threshold summary/tail and ephemeral reasoning never cause a zero-growth recompact loop", async () => {
+test("unchanged over-threshold summary/tail never recompacts alone; a reasoning-only row is durable growth once", async () => {
+  const bare = wideHarness()
+  bare.state.rows = [{ ...native("c1", "s".repeat(40_000)), metadata: { recent: "t".repeat(1_200_000) } }]
+  for (let build = 0; build < 3; build++) {
+    await bare.controller.onContext({ ...event(), messages: projectHistory(bare.state.rows).messages })
+    await bare.controller.onIdle("s")
+  }
+  assert.equal((await bare.controller.memoryStatus("s")).growth.tokens, 0, "no rows after the checkpoint means no growth, however large the tail")
+  assert.equal(await bare.store.getDeferredCompaction(), undefined)
+  assert.equal((await bare.store.getGateStats()).gates, 0)
+  assert.equal(bare.state.compact, 0)
+
   const h = wideHarness()
   h.state.rows = [{ ...native("c1", "s".repeat(40_000)), metadata: { recent: "t".repeat(1_200_000) } },
     { ...assistant("reasoning-only"), content: [{ type: "reasoning", text: "r".repeat(40_000) }] }]
   for (let build = 0; build < 3; build++) {
     await h.controller.onContext({ ...event(), messages: projectHistory(h.state.rows).messages })
     await h.controller.onIdle("s")
+    // Repeated builds of unchanged rows must not compound: the marker keeps the
+    // same values, and no compaction is ever requested without a prompt.
+    assert.deepEqual(await h.store.getDeferredCompaction(), { checkpoint: "c1", after: "reasoning-only", tokens: 320_000, threshold: 200_000 })
+    assert.equal(h.state.compact, 0)
   }
-  await h.controller.onPrompt(prompt())
-  await setImmediate()
   const status = await h.controller.memoryStatus("s")
-  assert.equal(status.retained, 310_000)
-  assert.equal(status.growth.tokens, 0)
-  assert.match(status.decision.reason, /No new durable growth/)
-  assert.equal(h.state.compact, 0)
-  assert.equal(await h.store.getDeferredCompaction(), undefined)
-  assert.equal((await h.store.getGateStats()).gates, 0)
+  assert.equal(status.retained, 320_000)
+  assert.equal(status.growth.tokens, 10_000, "a replayed reasoning part is retained conversation, not free")
+  await h.controller.onPrompt(prompt())
+  assert.equal(h.state.compact, 1, "the overdue safeguard admits at the next prompt; the loop guard is the prompt gate, not undercounting")
 })
 
 test("automatic bounds honor model input limits and the last request's explicit output reserve", async () => {

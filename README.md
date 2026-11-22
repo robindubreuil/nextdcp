@@ -203,14 +203,20 @@ or a missing observation after reload selects safe compactor regeneration instea
 of committing stale state. Malformed edits are refused before admission. An
 uncommitted proposal is transient; a committed state and its authorship are durable.
 
-**Admission is not completion.** The tool reports **Requested**, **Already pending**,
-**Not admitted**, or **Failed**. Requested means the control was admitted for the next
-step boundary, not that an archive or replacement summary already exists. Pending,
-duplicate-boundary and three-minute cooldown safeguards remain; there is **no
-once-per-round limit** after a successful cut moves the boundary. A duplicate cannot
-replace an already staged proposal, and a refused edit cannot leak into a later cut.
-Completion is observed separately through host outcomes and `/memory`; the tool
-never waits for the cut that needs its own step to finish.
+**Admission is not completion.** The tool reports **Prepared**, **Already pending**,
+**Not admitted**, or **Failed**. Prepared means the cut is **staged at this step
+boundary**, not that an archive or replacement summary already exists: the model's
+next action decides where it lands. Tool work that continues the round applies the
+staged cut at its call-time boundary — the episode ends at the call itself, and
+newer work rides live beside the summary. A final reply that closes the round
+keeps the context intact and next-prompt scheduling re-makes the cut, steered by
+the user's message. A staged edit survives its hold; new user input forces its
+regeneration, and a refused apply is explicit and immediately re-stageable.
+Pending, duplicate-boundary and three-minute cooldown safeguards remain; there is
+**no once-per-round limit** after a successful cut moves the boundary. A duplicate
+cannot replace an already staged proposal, and a refused edit cannot leak into a
+later cut. Completion is observed separately through host outcomes and `/memory`;
+the tool never waits for the cut that needs its own step to finish.
 
 ## Checkpoint guidance and the overdue safeguard
 
@@ -290,7 +296,9 @@ admitted control: `checkpoint_now` admits and stages supplied edits normally.
 A crossing with no live round, a staged revert, or compaction already running
 or cooling down does not open a gate. A staged revert or running compaction is
 left alone; without a live round, an eligible crossing compacts silently. A
-round that ends before its next build repays the consumed crossing. A gate notice
+round that ends before its next build repays the consumed crossing as a
+next-prompt marker, so the cut lands steered by the user's next message. A gate
+notice
 that would itself exceed capacity yields to capacity recovery. Gate, checkpoint
 and capacity outcomes are counted per session in plugin storage; deleting the
 session removes them.
@@ -298,7 +306,9 @@ session removes them.
 ## Adaptive baseline
 
 The automatic threshold meters the **retained conversation**: current summary,
-native recent tail and new durable rows, excluding ephemeral reasoning. System
+native recent tail and new durable rows including reasoning — replaying hosts
+(GLM) carry it in every later request, and calibration absorbs hosts that strip
+it, so counting it never undercounts a replaying host. System
 instructions, tool schemas and wrappers belong to the separate capacity check.
 The baseline is persisted per main model under the session's actual project ID.
 
@@ -329,7 +339,7 @@ project-lifetime archive (`projects/<projectID>/episodes/P<n>`): notes only,
 deduplicated against retained notes by exact text, capped at the 200 most recent.
 The plugin's raw session archive is cleared — the note becomes the
 fetchable original. A fresh session finds them through `recall` two ways:
-`recall P12` returns the whole note with stable provenance (source session),
+`recall id=P12` returns the whole note with stable provenance (source session),
 and full-layer queries search the same text alongside live archive evidence.
 Relative age appears on search-result labels, never in the paginated original.
 A small 30-day recency preference and a positive 0.9 floor keep old notes
@@ -446,10 +456,11 @@ reasoning are omitted. OpenCode still controls the compaction cut. A working
 state replaces the whole cut, so it sets `metadata.keepID: null` and OpenCode
 keeps no verbatim recent tail beside it (the host tail walks back to the latest
 user message regardless of `compaction.keep.tokens` and would duplicate the
-state). Native fallbacks keep OpenCode's tail.
+state). A staged checkpoint applied at its call-time boundary instead keeps any
+newer work live beside the summary. Native fallbacks keep OpenCode's tail.
 
-Ending a successful turn counts the final retained assistant reply and tool data,
-not ephemeral reasoning,
+Ending a successful turn counts the final retained assistant reply, reasoning
+and tool data,
 then only records that soft-threshold compaction is due;
 it does not generate a summary. If you send another prompt, compaction runs
 before that message is admitted, leaving the new request verbatim after the

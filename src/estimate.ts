@@ -41,11 +41,10 @@ function attachmentTokens(file: unknown): number {
   catch { return Math.ceil(file.data.length * 3 / 16) }
 }
 
-/** Estimated tokens of one assistant row: its text and reasoning parts plus its
- *  tool calls; reasoning is optional because it is generated per response, not
- *  conversation the later calls carry. */
-function assistantTokens(row: Row, reasoning = true): number {
-  const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || (reasoning && part.type === "reasoning")) ? partTokens(part as Part) : 0), 0)
+/** Estimated tokens of one assistant row: its text and reasoning parts plus
+ *  its tool calls. */
+function assistantTokens(row: Row): number {
+  const text = (row.content ?? []).reduce<number>((n, part) => n + (object(part) && (part.type === "text" || part.type === "reasoning") ? partTokens(part as Part) : 0), 0)
   return text + rowCalls(row).reduce((n, call) => n + partTokens({ type: "tool-call", ...call } as Part) + partTokens({ type: "tool-result", ...call } as Part), 0)
 }
 
@@ -81,12 +80,13 @@ export function conversationTokens(rows: readonly Row[]): number {
 export const RECENT_TURNS = 10
 
 /** Durable tokens of the rows a compaction cut would archive: user rows plus
- *  assistant text and tool calls, reasoning excluded — reasoning is regenerated
- *  per response, so it is not growth the live transcript accumulates. */
+ *  assistant text, reasoning and tool calls. Reasoning counts because replaying
+ *  hosts (GLM) carry it in every later request; usageScale absorbs hosts that
+ *  strip it, so counting it never overshoots by much and never undercounts. */
 export function durableTokens(rows: readonly Row[]): number {
   return rows.reduce((sum, row) => {
     if (row.type === "user") return sum + userTokens(row)
-    return sum + (row.type === "assistant" ? assistantTokens(row, false) : otherTokens(row))
+    return sum + (row.type === "assistant" ? assistantTokens(row) : otherTokens(row))
   }, 0)
 }
 
@@ -106,8 +106,9 @@ export function evidenceTokens(rows: readonly Row[]): number {
 }
 
 /** Conversation retained after the latest checkpoint: summary + native recent
- *  tail + NEW durable rows, excluding ephemeral reasoning. System/tool-definition
- *  overhead and host wrappers belong to the separate complete-request meter. */
+ *  tail + NEW durable rows, reasoning included (replaying hosts carry it).
+ *  System/tool-definition overhead and host wrappers belong to the separate
+ *  complete-request meter. */
 export function retainedTokens(rows: readonly Row[]): number {
   const index = rows.findLastIndex((row) => row.type === "compaction" && row.status === "completed")
   const checkpoint = rows[index] as (Row & { readonly metadata?: unknown }) | undefined
@@ -125,7 +126,7 @@ export function recentDurable(rows: readonly Row[], turns: number): { tokens: nu
   let counted = 0, sum = 0
   for (let at = rows.length - 1; at >= 0 && counted < turns; at--) {
     const row = rows[at]
-    if (row.type === "assistant") { sum += assistantTokens(row, false); counted++ }
+    if (row.type === "assistant") { sum += assistantTokens(row); counted++ }
     else if (row.type === "user") sum += userTokens(row)
     else sum += otherTokens(row)
   }

@@ -262,7 +262,7 @@ wrapper and recent tail. A repeated hook with the same committed boundary render
 that saved handoff without another model request.
 
 The live handoff contains current work, not an episode directory. One archive
-anchor gives coverage, episode endpoints, and `recall catalog` / `recall(query)`.
+anchor gives coverage, episode endpoints, and `recall id=catalog` / `recall(query)`.
 Cold notes and old originals are fetched only when needed. Summaries remain lossy;
 recoverability depends on successful archive writes and use of recall.
 
@@ -272,11 +272,13 @@ recoverability depends on successful archive writes and use of recall.
 
 - **Retained conversation (automatic mode):** the latest completed summary and
   native `metadata.recent` tail plus persisted rows after that checkpoint,
-  excluding ephemeral reasoning and older archived rows. This meter schedules
-  the overdue-checkpoint safeguard.
+  reasoning included, excluding older archived rows. This meter schedules
+  the overdue-checkpoint safeguard. Replaying hosts (GLM) carry reasoning in
+  every later request, so it is genuine retained growth; `usageScale` absorbs
+  hosts that strip it.
 - **New durable growth:** persisted rows after the completed checkpoint. Count
-  user text/skills/attachments, retained assistant text/tool data, shell output,
-  and relevant injected text; exclude ephemeral reasoning and the retained
+  user text/skills/attachments, retained assistant text/reasoning/tool data,
+  shell output, and relevant injected text; exclude the retained
   checkpoint/tail. It schedules explicit `budget`/`idle` overrides, gives every
   admission its identity, and prevents zero-growth recompaction loops.
 - **Complete request projection:** assembled hook messages, system parts, and
@@ -356,7 +358,9 @@ capacity check.
   Authorized delegation is an option, not an automatic operation by nextdcp. No
   compactor summary is prepared during that evaluation step. A required notice
   that would exceed capacity yields to capacity recovery.
-- **No later build:** a round ending with an unheld open gate repays its crossing.
+- **No later build:** a round ending with an unheld open gate repays its crossing
+  as a next-prompt marker (threshold 0), so the cut lands steered by the user's
+  message; without the next-prompt machinery it requests compaction directly.
   Without a live round, an eligible crossing requests compaction silently. For
   explicit budgets only, a recent tool failure postpones the soft decision during
   diagnosis; never capacity recovery or the automatic safeguard. Guards/cooldowns
@@ -370,10 +374,16 @@ capacity check.
   trimmed characters become labeled relevance evidence, not a user row or a
   basis for retiring constraints. Reopening alone does nothing.
 - **`checkpoint_now`:** approval-free working-state-edit admission; refuse a staged
-  revert/inactive round and report an already running/pending cut. An open gate
-  is only a schedule: admit and stage the edit normally, then clear the gate on
-  admission. No once-per-round restriction; a completed cut moves the boundary,
-  permitting another edit. Pending/duplicate-boundary/cooldown safeguards remain.
+  revert/inactive round and report an already running/pending cut. The call
+  **stages the cut at its own step boundary** instead of requesting compaction:
+  tool work that continues the round applies it there (newer work rides live
+  beside the summary via `keepID`), a final reply dissolves the staging into a
+  next-prompt marker, and a failed/interrupted round applies it as continued
+  work. An open gate is only a schedule: the call answers it, staging the edit
+  normally and clearing the gate. No once-per-round restriction; a completed cut
+  moves the boundary, permitting another edit. Pending/duplicate-boundary/
+  cooldown safeguards apply at staging; a refused apply is explicit and
+  re-stageable.
 
 All admission paths share one session guard. Context hooks never await the
 runner's compaction; prompt hooks share its admission promise. The guard clears
@@ -463,17 +473,19 @@ per-turn observer/retriever, embedding service, topic graph, or system-prefix
 rewrite. Apart from the optional gate notice, live history is left unchanged.
 
 Provide exactly one of `query` or `id`. Addresses accept optional `layer` and
-`page` pairs; direct parameters fill only what the address omits:
+`page` pairs; direct parameters fill only what the address omits. Rendered
+suggestions spell the field — `recall id=…` — and a copied marker or command
+word is tolerated and stripped:
 
 ```text
-recall E57
-recall E57 layer tools page 2
-recall call_<full opaque ID>
-recall msg_<full opaque ID>
-recall P12
-recall catalog
-recall catalog all
-recall catalog E7
+E57
+E57 layer tools page 2
+call_<full opaque ID>
+msg_<full opaque ID>
+P12
+catalog
+catalog all
+catalog E7
 ```
 
 Rendered opaque IDs are full, never a fixed-length prefix that might collide.

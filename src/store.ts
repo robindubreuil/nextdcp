@@ -19,6 +19,8 @@ export type DeferredCompaction = {
   readonly checkpoint: string | null
   readonly after: string
   readonly tokens: number
+  /** A zero threshold is an unconditional marker: a repayment or staged cut
+   *  that already earned its compaction fires at the next prompt regardless. */
   readonly threshold: number
 }
 
@@ -231,7 +233,7 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     if (value === undefined) return undefined
     if (!object(value) || (value.checkpoint !== null && typeof value.checkpoint !== "string") ||
         typeof value.after !== "string" || typeof value.tokens !== "number" || !Number.isFinite(value.tokens) || value.tokens < 0 ||
-        typeof value.threshold !== "number" || !Number.isFinite(value.threshold) || value.threshold <= 0) {
+        typeof value.threshold !== "number" || !Number.isFinite(value.threshold) || value.threshold < 0) {
       throw new Error("Invalid deferred compaction")
     }
     return value as DeferredCompaction
@@ -326,8 +328,11 @@ export function createStore(storage: Storage, sessionID: string, report: Reporte
     return complete
   }
   const getPending = (id: string) => get<Pending>(key("pending", id))
-  const prepareArchive = async (rows: readonly Row[]): Promise<Pending> => {
-    const cut = planCut(rows)
+  const prepareArchive = async (rows: readonly Row[], rowIDs?: readonly string[]): Promise<Pending> => {
+    // An explicit span is the model's own call-time cut: its episode ends there even
+    // when newer rows already ride the conversation.
+    const planned = planCut(rows)
+    const cut = rowIDs ? { ...planned, rowIDs: [...rowIDs] } : planned
     const previous = await getPending(cut.checkpoint)
     if (previous && (previous.parent !== cut.parent || JSON.stringify(previous.rowIDs) !== JSON.stringify(cut.rowIDs))) throw new Error("Compaction boundary changed")
     const pending: Pending = { id: cut.checkpoint, parent: cut.parent, rowIDs: cut.rowIDs, archived: false,

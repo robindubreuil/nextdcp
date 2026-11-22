@@ -75,7 +75,7 @@ export function renderWorking(working: WorkingMemory, through: string, gap = fal
   return `## Current working state\nObjective: ${working.objective}` +
     section("User constraints", working.constraints) + section("State", working.state) +
     section("Next", working.next) + section("References", working.references.map((ref) => `${ref.id}: ${ref.why}`)) +
-    `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are archived${tail}. Browse: recall catalog; search: recall(query).` +
+    `\n\nArchive through ${through}${title ? ` (${title})` : ""}: older tasks and exact evidence are archived${tail}. Browse: recall id=catalog; search: recall(query).` +
     (gap ? " Some original history was not archived; recall reports these gaps." : "")
 }
 

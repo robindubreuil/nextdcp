@@ -20,7 +20,7 @@ export function formatMemoryStatus(state: MemoryStatus): string {
     `Current retained rows · estimates, scale ×${state.scale.toFixed(2)}`,
     `${state.checkpoint?.native ? "Native" : "Working"} summary: ~${number(state.summary.tokens)} tokens · ${number(state.summary.chars)} chars`,
     `Native recent tail: ~${number(state.recent.tokens)} tokens · ${number(state.recent.chars)} chars`,
-    `New durable growth: ~${number(state.growth.tokens)} tokens · ${number(state.growth.rows)} rows (no ephemeral reasoning)`,
+    `New durable growth: ~${number(state.growth.tokens)} tokens · ${number(state.growth.rows)} rows (reasoning included)`,
     `Retained conversation total: ~${number(retained)} tokens (summary + native tail + new growth)`,
     `${scope === "retained" ? "Overdue-checkpoint safeguard" : "Soft budget"}: ${state.budget === undefined ? state.budgetMode : `~${number(state.budget)} tokens (${state.budgetMode} · ${scope === "retained" ? "total retained conversation" : "new durable growth only"})`}`,
     ...(state.budgetBaseline === undefined ? [] : [`Adaptive baseline: ~${number(state.budgetBaseline)} · temporary evidence/work allowance: ~${number(state.liveAllowance ?? 0)}`]),

@@ -166,16 +166,16 @@ test("~1.5k-token pages preserve every character and have explicit continuation"
 test("id recall without page returns the whole original in one call", () => {
   const small = "a".repeat(RECALL_PAGE_CHARS * 3)
   const whole = recallPage("call-1", small)
-  assert.match(whole, /^recall call-1 \(whole output\)\n/)
+  assert.match(whole, /^recall id=call-1 \(whole output\)\n/)
   assert.ok(whole.endsWith(small))
   const big = "b".repeat(RECALL_PAGE_CHARS * 7) + "😀 tail"
   const head = recallPage("call-2", big)
   const body = head.slice(head.indexOf("\n") + 1)
-  assert.match(head, /^recall call-2 \(whole output too large: first 30000 of 42007 characters; use a query to locate the relevant page first, or continue at page 6\)\n/)
+  assert.match(head, /^recall id=call-2 \(whole output too large: first 30000 of 42007 characters; use a query to locate the relevant page first, or continue at page 6\)\n/)
   assert.equal(body, big.slice(0, RECALL_ALL_CHARS))
   const rest = Array.from({ length: 3 }, (_, index) => paginate(big, index + 6).content).join("")
   assert.equal(body + rest, big)
-  assert.equal(recallPage("empty", ""), "recall empty (whole output)\n")
+  assert.equal(recallPage("empty", ""), "recall id=empty (whole output)\n")
   const files = []
   const text = formatCall({ id: "call-3", name: "read", input: {}, result: { type: "content", value: [{ type: "text", text: "x ".repeat(3_500) }, { type: "file", uri: "file:///x", mime: "image/png" }] } }, files)
   const withFile = recallPage("call-3", text, undefined, files)
@@ -272,7 +272,7 @@ test("media recall returns original native files only on their own page, without
   const page = recallPage("media", text, 2, files)
   assert.deepEqual(page.slice(1), [image])
   assert.doesNotMatch(page[0].text, /base64|AAAA/)
-  assert.equal(recallPage("media", text, 3, files), "recall media page 3 is out of range: this original has 2 pages; the last page is 2.")
+  assert.equal(recallPage("media", text, 3, files), "recall id=media page 3 is out of range: this original has 2 pages; the last page is 2.")
   const errorFiles = []
   const error = formatCall({ id: "error", name: "read", input: {}, result: { type: "error", value: { error: "failed", content: [image] } } }, errorFiles)
   assert.match(error, /failed/)
@@ -319,9 +319,9 @@ test("layer matrix: conversation renders runnable tags, tools the originals, ful
   assert.match(conversation, /^Episode E9 — conversation/)
   assert.match(conversation, /\[User\]: exact user question/)
   assert.match(conversation, /\[Assistant\]: useful answer/)
-  assert.match(conversation, /\[Tool read \{"path":"a\.ts"\} → recall call-1\]/)
-  assert.match(conversation, /\[Tool recall \{"query":"old"\} → recall call-echo\]/)
-  assert.match(conversation, /\[Shell node test → recall sh1\]/)
+  assert.match(conversation, /\[Tool read \{"path":"a\.ts"\} → recall id=call-1\]/)
+  assert.match(conversation, /\[Tool recall \{"query":"old"\} → recall id=call-echo\]/)
+  assert.match(conversation, /\[Shell node test → recall id=sh1\]/)
   assert.doesNotMatch(conversation, /inline state output|original output from calls\/|shell output|quoted old evidence/, "commands are tags; every output is one hop away")
 
   const tools = formatTranscript("E9", rows, { layer: "tools", call })
@@ -353,12 +353,12 @@ test("conversation tags identify heavy calls without carrying them; originals st
   const conversation = formatTranscript("E9", rows, { layer: "conversation", call: resolve })
   const toolTag = conversation.split("\n").find((line) => line.startsWith("[Tool write"))
   assert.ok(toolTag !== undefined)
-  assert.match(toolTag, /… \(\+\d+ chars\) → recall call-write\]$/)
-  assert.ok(toolTag.length < "[Tool write ".length + TAG_INPUT_CHARS + 30 + " → recall call-write]".length, "a heavy input leaves only its head in the tag")
+  assert.match(toolTag, /… \(\+\d+ chars\) → recall id=call-write\]$/)
+  assert.ok(toolTag.length < "[Tool write ".length + TAG_INPUT_CHARS + 30 + " → recall id=call-write]".length, "a heavy input leaves only its head in the tag")
   assert.ok(!conversation.includes("step 119"), "the conversation layer carries the tag head, not the script body")
 
   const shellStart = conversation.indexOf("[Shell python3")
-  const shellTag = conversation.slice(shellStart, conversation.indexOf("→ recall sh1]", shellStart) + 13)
+  const shellTag = conversation.slice(shellStart, conversation.indexOf("→ recall id=sh1]", shellStart) + 16)
   assert.ok(shellTag.includes("… (+"), "a heredoc command is capped like a tool input")
   assert.ok(!shellTag.includes("step 119"))
 
@@ -386,17 +386,17 @@ test("tag caps land exactly: no marker at the boundary, no split surrogate pairs
   const render = (path) => formatTranscript("E1", at(path).map((row) => ({ id: row.id, text: JSON.stringify(row) })), { layer: "conversation" })
   // `{"path":"` + 189 + `"}` is exactly TAG_INPUT_CHARS: shown whole, no marker.
   const exact = render("x".repeat(TAG_INPUT_CHARS - 11))
-  assert.ok(exact.includes(`[Tool write {"path":"${"x".repeat(TAG_INPUT_CHARS - 11)}"} → recall call-1]`))
+  assert.ok(exact.includes(`[Tool write {"path":"${"x".repeat(TAG_INPUT_CHARS - 11)}"} → recall id=call-1]`))
   assert.ok(!exact.includes("… (+"))
   // One char over: the marker names exactly what was omitted.
-  assert.match(render("x".repeat(TAG_INPUT_CHARS - 10)), /… \(\+1 chars\) → recall call-1\]/)
+  assert.match(render("x".repeat(TAG_INPUT_CHARS - 10)), /… \(\+1 chars\) → recall id=call-1\]/)
   // A surrogate pair straddling the cut is kept whole: the last shown char is not a lone high surrogate.
   const emoji = render("x".repeat(TAG_INPUT_CHARS - 10) + "😀".repeat(30))
   const head = emoji.slice(emoji.indexOf('"path":"') + 8, emoji.indexOf("… (+"))
   const units = [...head]
   const last = units.at(-1)
   assert.ok(last !== undefined && last.length === 1 && last.charCodeAt(0) < 0xd800, "the cut never ends on a lone high surrogate")
-  assert.match(emoji, /… \(\+\d+ chars\) → recall call-1\]/)
+  assert.match(emoji, /… \(\+\d+ chars\) → recall id=call-1\]/)
 })
 
 test("injected content tags in conversation, homes in the row original: skills and inline text", () => {
@@ -414,9 +414,9 @@ test("injected content tags in conversation, homes in the row original: skills a
   const conversationFiles = []
   const conversation = formatTranscript("E2", rows, { layer: "conversation", files: conversationFiles })
   assert.match(conversation, /\[User\]: use the companion skill/)
-  assert.match(conversation, new RegExp(`\\[Skill activated: companion \\(${skillBody.length} chars\\) → recall msg_user1\\]`))
-  assert.match(conversation, /\[Attached text\/plain: benchlog\.txt \(\d+ chars\) → recall msg_user1\]/)
-  assert.match(conversation, /\[Skill activated: report \(\d+ chars\) → recall msg_skill1\]/)
+  assert.match(conversation, new RegExp(`\\[Skill activated: companion \\(${skillBody.length} chars\\) → recall id=msg_user1\\]`))
+  assert.match(conversation, /\[Attached text\/plain: benchlog\.txt \(\d+ chars\) → recall id=msg_user1\]/)
+  assert.match(conversation, /\[Skill activated: report \(\d+ chars\) → recall id=msg_skill1\]/)
   assert.match(conversation, /\[Attached image\/png: chart\.png\]/, "media stays a native label, not a counted tag")
   assert.deepEqual(conversationFiles.map((item) => item.file.uri), ["data:image/png;base64,AAAA"])
   assert.ok(!conversation.includes("skill directive line 30") && !conversation.includes("bench log line"), "injected bodies never ride the dialogue")
@@ -474,6 +474,8 @@ test("parseTarget reads every rendered address and rejects what it cannot mean",
   assert.deepEqual(parseTarget("catalog E7 page 2"), { kind: "catalog", entry: "E7", page: 2 })
   assert.deepEqual(parseTarget("catalog all page 3"), { kind: "catalog", all: true, page: 3 })
   assert.deepEqual(parseTarget("E57"), { kind: "episode", handle: "E57" })
+  assert.deepEqual(parseTarget("id=E57"), { kind: "episode", handle: "E57" }, "a copied field marker is tolerated")
+  assert.deepEqual(parseTarget("recall id=E57 layer tools page 2"), { kind: "episode", handle: "E57", layer: "tools", page: 2 }, "so is the whole rendered suggestion")
   assert.deepEqual(parseTarget("E57 layer tools page 2"), { kind: "episode", handle: "E57", layer: "tools", page: 2 })
   assert.deepEqual(parseTarget("call_01HZ2a3"), { kind: "opaque", handle: "call_01HZ2a3" })
   assert.deepEqual(parseTarget("msg_9f page 3"), { kind: "opaque", handle: "msg_9f", page: 3 })
