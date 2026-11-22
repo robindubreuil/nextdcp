@@ -170,15 +170,18 @@ checkpoint_now({
   Replace stale `state`/`next` lists explicitly: an omitted field remains unchanged.
 - New standing constraints must **themselves be the shortest self-contained exact
   quotes from new user text**, including human replies to the built-in `question`
-  tool. No duplicate proof payload is needed. Host rules,
-  assistant plans and task requirements do not belong here; task requirements live
-  in `state`/`next` only while that task is active.
+  tool. A quote is a locator: the plugin resolves it to the exact span of the
+  matching user message — tolerating whitespace/typography drift — and stores that
+  source span, so every admitted rule is verbatim by construction. No duplicate
+  proof payload is needed. Task requirements live in `state`/`next` only while
+  that task is active.
 - Existing constraints, including legacy entries, survive omission. Explicit user
   withdrawal or correction of a misattributed rule uses
   `retire: [{ constraint: "exact old constraint", quote: "verbatim new-user evidence" }]`.
   Quotes resolve only against actual new user text or completed `question` calls'
-  structured human answers, never arbitrary tool prose/metadata, attachments, skill
-  bodies, queued hints or old archives. Validation proves source text, not its intent;
+  structured human answers — the whitelist is mechanical: tool prose/metadata,
+  attachments, skill bodies, queued hints and old archives hold no user spans.
+  Validation proves source text, not its intent;
   the author must distinguish instructions from quotations and temporary requirements.
 - The short `archive` note is required for a direct edit. Its first line is
   `Title: <episode name>`, followed by 1–3 brief new outcome/search-cue sentences:
@@ -411,7 +414,7 @@ Inline generation already sees the checkpoint and user text, so its prompt does
 not repeat the prior state or a directory of user-message snippets. A stateless
 compaction model still receives the complete prior state and readable new cut.
 The validator resolves retirement quotes to user IDs without asking the model to
-copy those IDs. A native fallback's separately protected constraints are supplied
+copy those IDs, pinning each quote to its exact source span. A native fallback's separately protected constraints are supplied
 when its textual summary may have omitted them.
 No topic classifier, observer model, embedding service, or merge request runs.
 Recall returns readable transcripts, with complete originals returned in one call
@@ -527,7 +530,7 @@ and backups accordingly.
   rather than patching the pre-fallback state as if nothing happened.
 - Standing constraints survive accidental model omission. Removing one requires
   explicit new-user withdrawal or misattribution correction with a verbatim quote;
-  the validator records its source row. Task-local requirements
+  the validator pins it to the exact source span and records its source row. Task-local requirements
   belong with unfinished work, not the permanent constraint list. Mechanical
   validation cannot prove semantic completeness or that a retirement is justified.
 - An opaque provider-native checkpoint with no textual summary stays under

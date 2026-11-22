@@ -15,9 +15,9 @@ test("always-present tool instructions stay small without hiding recall addressi
   assert.match(CHECKPOINT_NOW_DESCRIPTION, /ideally under ~1k tokens: no history, finished work, re-injected instructions, or detail that files or recall restore/)
 })
 
-test("the compactor is asked for continuation state, never a quota-filling recap or host instruction copy", () => {
+test("the compactor is asked for continuation state, never a quota-filling recap", () => {
   assert.ok(tokens(WORKING_PROMPT) <= 600)
-  assert.match(WORKING_PROMPT, /host|AGENTS\.md/)
+  assert.match(WORKING_PROMPT, /pins each quote to its exact source span/)
   assert.match(WORKING_PROMPT, /verbatim|exact quotes/)
   assert.match(WORKING_PROMPT, /task.*state\/next|state\/next.*task/i)
   assert.match(WORKING_PROMPT, /next decision|next action/)

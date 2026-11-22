@@ -85,7 +85,7 @@ export const CHECKPOINT_INPUT = {
   type: "object", additionalProperties: false, properties: {
     archive: { ...text, description: "Required on a direct edit: 'Title: <name>' then 1–3 short outcome/search-cue sentences. Cold note, not live state." },
     working: { type: "object", additionalProperties: false, properties: {
-      objective: text, constraints: { ...list, description: "Standing user rules: short self-contained exact quotes from new user text. Not host/AGENTS.md rules, plans or task requirements. Remove old rules only via retire." }, state: list, next: list,
+      objective: text, constraints: { ...list, description: "Standing user rules: short self-contained exact quotes from new user text, pinned to the exact source span. Task requirements go in state/next. Remove old rules only via retire." }, state: list, next: list,
       references: { type: "array", maxItems: 3, items: { type: "object", additionalProperties: false, required: ["id", "why"], properties: { id: text, why: text } } },
     } },
     retire: { type: "array", description: "Explicit new-user withdrawal/misattribution correction: exact old constraint plus verbatim user quote.",

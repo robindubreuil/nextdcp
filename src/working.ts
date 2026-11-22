@@ -1,6 +1,6 @@
 import { tokens } from "./tokens.ts"
 import { object } from "./guards.ts"
-import { userSources, type SourceRow, type UserSource } from "./user-sources.ts"
+import { matchSource, userSources, type SourceRow, type UserSource } from "./user-sources.ts"
 
 export const DEFAULT_MEMORY_BUDGET = 2_000
 export class HandoffError extends Error {}
@@ -154,7 +154,8 @@ function shellArchive(note: string, users: readonly UserSource[], previous: Prio
 }
 
 /** An omission is NOT evidence that a standing instruction stopped applying.
- *  Retirement must be explicit, auditable, and grounded in a new user message. */
+ *  Retirement must be explicit, auditable, and grounded in a new user message,
+ *  with its quote pinned to the exact source span. */
 function shellRetirements(items: readonly unknown[], previous: PriorConstraints | undefined, users: readonly UserSource[]): Retirement[] {
   const retired = new Set<string>()
   return items.map((item) => {
@@ -164,22 +165,27 @@ function shellRetirements(items: readonly unknown[], previous: PriorConstraints 
     const { constraint, quote, messageID } = item
     if (!previous?.constraints.includes(constraint) || retired.has(constraint))
       throw new HandoffError("Invalid constraint retirement: constraint must be a current standing rule, retired at most once")
-    const user = users.findLast((row) => (messageID === undefined || row.id === messageID) && row.text.includes(quote))
+    const user = matchSource(users, quote, messageID)
     if (!user) throw new HandoffError("Constraint retirement needs a verbatim quote from a new user message")
     retired.add(constraint)
-    return { constraint, messageID: user.id, quote }
+    return { constraint, messageID: user.id, quote: user.text }
   })
 }
 
-/** A new protected rule is its own source quote: no second author-written proof
- *  envelope, host-instruction copies, or unchecked paraphrases that stick forever.
- *  Previously committed (including legacy/native) rules keep omission protection. */
+/** A new protected rule is its own source quote: the author's quote is a locator,
+ *  and the plugin pins the exact source span as the stored rule — no second proof
+ *  envelope or unchecked paraphrase can stick forever. Previously committed
+ *  (including legacy/native) rules keep omission protection. */
 const mergeConstraints = (previous: readonly string[], retired: ReadonlySet<string>, next: readonly string[], users: readonly UserSource[]): string[] => {
-  const constraints = [...new Set([...previous.filter((item) => !retired.has(item)), ...next])]
-  if (constraints.some((item) => retired.has(item))) throw new HandoffError("A retired constraint is still present in the handoff")
   const inherited = new Set(previous)
-  if (next.some((item) => !inherited.has(item) && !users.some((row) => row.text.includes(item))))
-    throw new HandoffError("New standing constraints must be verbatim quotes from new user messages; keep task requirements in state/next and omit host instructions")
+  const pinned = next.map((item) => {
+    if (inherited.has(item)) return item
+    const source = matchSource(users, item)
+    if (!source) throw new HandoffError("New standing constraints must be verbatim quotes from new user messages; keep task requirements in state/next and omit host instructions")
+    return source.text
+  })
+  const constraints = [...new Set([...previous.filter((item) => !retired.has(item)), ...pinned])]
+  if (constraints.some((item) => retired.has(item))) throw new HandoffError("A retired constraint is still present in the handoff")
   return constraints
 }
 

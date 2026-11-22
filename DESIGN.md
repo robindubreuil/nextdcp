@@ -144,7 +144,8 @@ including earlier main-authored edits, not a frozen compactor seed. Omitted fiel
 carry forward; present lists replace their predecessors. Standing constraints
 remain additive/protected until explicitly retired with new-user evidence. New
 entries are themselves self-contained exact quotes from actual new user text;
-host rules and unchecked assistant paraphrases cannot become protected entries.
+the submitted quote is only a locator — the validator pins and stores the exact
+source span, so unchecked paraphrases cannot become protected entries.
 No additional model-authored provenance envelope is needed. A short cold note
 accompanies each direct edit; there is no appended notes log.
 
@@ -200,7 +201,8 @@ Main-model generation uses `ctx.session.generate`, preserving native request
 projection and media handling. Its checkpoint and user text are already in that
 context: the prompt does not copy them again or add a user-snippet directory.
 Retirement quotes resolve to durable user-row or question-call IDs in the shared validator; authors
-need not copy IDs (older explicit-ID handoffs remain valid). After native fallback,
+need not copy IDs (older explicit-ID handoffs remain valid), and the recorded quote
+is the exact resolved source span. After native fallback,
 separately protected constraints are still supplied if its summary omitted them.
 An explicitly selected/configured compaction
 model uses `ctx.experimental.generate.text`: prior state plus the complete
@@ -219,11 +221,13 @@ request errors warn and fall back rather than picking an arbitrary provider.
 Validate the schema, reachable archive references, title, constraint retirements,
 and complete rendered working-state size. Prior standing constraints omitted by
 the model are carried forward, including legacy rules without source metadata.
-A new constraint must itself occur verbatim in a real user row's text or a completed
+A new constraint must resolve to a span of a real user row's text or a completed
 built-in `question` call's structured `state.metadata.answers` in the new cut.
-Only that human-answer envelope is normalized as user evidence; question input,
+The quote is a locator: exact match first, then whitespace/typography-normalized
+resolution, and the stored rule is the source's exact span. Only that human-answer
+envelope is normalized as user evidence; question input,
 rendered tool prose, other tools' metadata, attachments, injected skills and queued
-relevance hints cannot supply proof. Separate answers never form a joined quote.
+relevance hints hold no user spans. Separate answers never form a joined quote.
 Retirement requires an exact prior constraint and a quote from such a new human
 source: explicit withdrawal or correction of a misattributed rule. These are source
 checks, **not proof** of semantic intent; the author must distinguish quoted

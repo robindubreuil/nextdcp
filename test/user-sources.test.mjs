@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { questionSource, userSources } from "../src/user-sources.ts"
+import { matchSource, questionSource, userSources } from "../src/user-sources.ts"
 import { questionRow } from "./support/question.ts"
 
 test("human sources include user text and separate completed question answers with durable call IDs", () => {
@@ -47,4 +47,15 @@ test("malformed structured answers fail closed instead of coercing or trusting t
   for (const part of [null, "question", {}, { type: "tool", name: "question", id: "call_q", state: null }])
     assert.equal(questionSource(part), undefined)
   assert.deepEqual(userSources([{ id: "bad", type: "assistant", content: null }]), [])
+})
+
+test("quotes are locators: the resolved span is the source's own text, not the author's", () => {
+  const span = "Keep the \u201cplugin\u201d safe\u2014\nalways."
+  const users = userSources([{ id: "u1", type: "user", text: `For this session: ${span}` }, { id: "u2", type: "user", text: `Note: ${span}` }])
+  assert.deepEqual(matchSource(users, span), { id: "u2", text: span }, "an exact quote pins the identical span; the latest source wins")
+  assert.deepEqual(matchSource(users, 'Keep the "plugin" safe- always.'), { id: "u2", text: span }, "whitespace and typography drift resolves to the source span")
+  assert.deepEqual(matchSource(users, 'Keep the "plugin" safe- always.', "u1"), { id: "u1", text: span }, "messageID restricts resolution")
+  assert.equal(matchSource(users, "Keep the plugin safe", "u1"), undefined, "an out-of-scope source stays silent")
+  assert.equal(matchSource(users, "Keep the plugin safe at all times."), undefined, "a paraphrase has no span")
+  assert.equal(matchSource(users, "  \t "), undefined, "an empty locator resolves nothing")
 })

@@ -205,6 +205,22 @@ test("new standing constraints must themselves quote real new user text, not inj
   assert.deepEqual(parsePatchHandoff(patch, previous, users, ids).working.constraints, [constraint])
 })
 
+test("a drifted quote is pinned to the source's exact span while paraphrases fail closed", () => {
+  const span = "Keep the \u201cplugin\u201d absolutely safe\u2014\nalways."
+  const users = [{ id: "u1", type: "user", text: `For this session: ${span}` }]
+  const drifted = 'Keep the "plugin" absolutely safe- always.'
+  assert.deepEqual(parseHandoff(raw({ working: working({ constraints: [drifted] }) }), working(), users, ids).working.constraints, [span])
+  assert.deepEqual(parsePatchHandoff(raw({ working: { constraints: [drifted] } }), working(), users, ids).working.constraints, [span])
+  for (const constraints of [["Keep the plugin absolutely safe."], ["Keep the \u201cplugin\u201d always."]]) {
+    for (const [parse, response] of [[parseHandoff, raw({ working: working({ constraints }) })], [parsePatchHandoff, raw({ working: { constraints } })]])
+      assert.throws(() => parse(response, working(), users, ids), /New standing constraints.*verbatim.*new user/)
+  }
+  const quote = "You may now replace the active  plugin."
+  const retired = parseHandoff(raw({ working: working({ constraints: [] }), retiredConstraints: [{ constraint, quote: "You may now replace the active plugin." }] }),
+    constrained(), [{ id: "u2", type: "user", text: quote }], ids)
+  assert.deepEqual(retired.retiredConstraints, [{ constraint, messageID: "u2", quote }], "the recorded quote is the source's exact span")
+})
+
 test("retirement quotes resolve their own user source without requiring the author to repeat row IDs", () => {
   const previous = constrained()
   const constraint = previous.constraints[0]

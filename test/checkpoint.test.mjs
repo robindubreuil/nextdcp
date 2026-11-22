@@ -164,6 +164,12 @@ test("direct edits share question-answer proof for new constraints and retiremen
   assert.throws(() => parseCheckpoint(input, working, [], rows, ids), /verbatim quote.*new user/)
 })
 
+test("a main edit's quote is a locator pinned to the exact user span", () => {
+  const span = "Keep the \u201cplugin\u201d safe."
+  const parsed = parseCheckpoint(edit({ constraints: ['Keep the "plugin" safe.'] }), working, [], [user("u1", `Note: ${span}`)], ids)
+  assert.deepEqual(parsed.working.constraints, [...working.constraints, span])
+})
+
 test("semantic fences include structured human answers, even if the rendered question result is unchanged", () => {
   const rows = [user("u1", "Request"), questionRow([["One", "Two"], ["Three"]])]
   const before = captureEvidence(rows)
