@@ -22,17 +22,33 @@ const keys = (value: Record<string, unknown>, expected: readonly string[]) => Ob
 
 const FIELDS = ["objective", "constraints", "state", "next", "references"] as const
 
+const validField = {
+  objective: (value: unknown): value is string => text(value),
+  constraints: (value: unknown): value is string[] => list(value),
+  state: (value: unknown): value is string[] => list(value),
+  next: (value: unknown): value is string[] => list(value),
+  references: (value: unknown): value is WorkingMemory["references"] =>
+    Array.isArray(value) && value.length <= 3 && value.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why)),
+} as const
+
 export function validWorking(value: unknown): value is WorkingMemory {
-  return object(value) && keys(value, FIELDS) && text(value.objective) &&
-    list(value.constraints) && list(value.state) && list(value.next) && Array.isArray(value.references) && value.references.length <= 3 &&
-    value.references.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why))
+  return object(value) && keys(value, FIELDS) && FIELDS.every((key) => validField[key](value[key]))
+}
+
+/** Per-field shape failures, named: the offending key and its accepted shape. */
+const fieldProblems = (fields: Record<string, unknown>): string[] => {
+  const shape: Record<string, string> = { objective: "must be text", constraints: "must be a string list", state: "must be a string list",
+    next: "must be a string list", references: "must be {id, why} pairs (max 3)" }
+  return Object.keys(fields).map((key) => key in shape
+    ? validField[key as keyof typeof validField](fields[key]) ? undefined : `${key} ${shape[key]}`
+    : `unknown field ${key}`).filter((problem): problem is string => problem !== undefined)
 }
 
 /** The schema failure, named: a complete state carries every field, and the
  *  omission itself is the repair a model needs instead of a generic rejection. */
 const workingProblem = (value: unknown): string => {
   const missing = FIELDS.filter((key) => !(key in (object(value) ? value : {})))
-  return `Handoff has an invalid handoff schema: ${missing.length ? `working is missing ${missing.join(", ")}, a complete state needs all five fields (use [] for empty lists)` : "objective is text, constraints/state/next are string lists, references are {id, why} pairs"}`
+  return `Handoff has an invalid handoff schema: ${missing.length ? `working is missing ${missing.join(", ")}, a complete state needs all five fields (use [] for empty lists)` : fieldProblems(object(value) ? value : {}).join("; ")}`
 }
 
 /** Only the author's explicit Title line names an episode; the note body stays archived. */
@@ -100,21 +116,34 @@ function extractObject(raw: string): unknown {
   return undefined
 }
 
+/** The shell failure, named: which top-level piece is wrong, never a generic rejection. */
+const shellProblem = (value: unknown): string => {
+  if (!object(value)) return "Handoff has an invalid handoff schema: top level must be an object"
+  const problems: string[] = []
+  const unknown = Object.keys(value).filter((key) => !["archive", "working", "retiredConstraints"].includes(key))
+  if (unknown.length) problems.push(`unknown top-level ${unknown.join(", ")}`)
+  if (!text(value.archive)) problems.push("archive must be text")
+  if (!object(value.working)) problems.push("working must be an object")
+  if (!Array.isArray(value.retiredConstraints)) problems.push("retiredConstraints must be an array")
+  return `Handoff has an invalid handoff schema: ${problems.join("; ")}`
+}
+
 /** Parse a model response shell (fence-stripped): archive note, working object, retirements. */
-function parseShell(raw: string): Record<string, unknown> {
+function parseShell(raw: string): { archive: string; working: Record<string, unknown>; retiredConstraints: unknown[] } {
   const stripped = raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, "$1")
   let value: unknown
   try { value = JSON.parse(stripped) } catch { value = extractObject(stripped) }
   if (value === undefined) throw new HandoffError("Handoff did not contain valid JSON")
-  if (!object(value) || !keys(value, ["archive", "working", "retiredConstraints"]) || !text(value.archive) ||
-      !object(value.working) || !Array.isArray(value.retiredConstraints)) throw new HandoffError("Handoff has an invalid handoff schema")
-  return value
+  if (!object(value)) throw new HandoffError(shellProblem(value))
+  const archive = value.archive, working = value.working, retiredConstraints = value.retiredConstraints
+  if (!text(archive) || !object(working) || !Array.isArray(retiredConstraints) ||
+      !keys(value, ["archive", "working", "retiredConstraints"])) throw new HandoffError(shellProblem(value))
+  return { archive, working, retiredConstraints }
 }
 
 /** The new episode's note: a Title line first, in the language of the user's messages. */
-function shellArchive(value: Record<string, unknown>, users: readonly UserSource[], previous: PriorConstraints | undefined, priorSummary?: string): string {
-  if (!text(value.archive)) throw new HandoffError("Handoff has an invalid handoff schema")
-  const archive = value.archive.trim()
+function shellArchive(note: string, users: readonly UserSource[], previous: PriorConstraints | undefined, priorSummary?: string): string {
+  const archive = note.trim()
   if (!/^Title:[\t ]*\S/.test(archive)) throw new HandoffError("Archive note must begin with a 'Title: <episode name>' line")
   // A cut may contain only assistant/tool work. The validated prior state still
   // carries the task's language; the candidate being validated cannot authorize itself.
@@ -126,13 +155,15 @@ function shellArchive(value: Record<string, unknown>, users: readonly UserSource
 
 /** An omission is NOT evidence that a standing instruction stopped applying.
  *  Retirement must be explicit, auditable, and grounded in a new user message. */
-function shellRetirements(value: Record<string, unknown>, previous: PriorConstraints | undefined, users: readonly UserSource[]): Retirement[] {
+function shellRetirements(items: readonly unknown[], previous: PriorConstraints | undefined, users: readonly UserSource[]): Retirement[] {
   const retired = new Set<string>()
-  return (value.retiredConstraints as readonly unknown[]).map((item) => {
+  return items.map((item) => {
     if (!object(item) || !keys(item, ["constraint", "messageID", "quote"]) || !text(item.constraint) || !text(item.quote) ||
-        item.messageID !== undefined && !text(item.messageID) ||
-        !previous?.constraints.includes(item.constraint) || retired.has(item.constraint)) throw new HandoffError("Invalid constraint retirement")
+        item.messageID !== undefined && !text(item.messageID))
+      throw new HandoffError("Invalid constraint retirement: {constraint, quote} strings, quote non-empty, optional messageID")
     const { constraint, quote, messageID } = item
+    if (!previous?.constraints.includes(constraint) || retired.has(constraint))
+      throw new HandoffError("Invalid constraint retirement: constraint must be a current standing rule, retired at most once")
     const user = users.findLast((row) => (messageID === undefined || row.id === messageID) && row.text.includes(quote))
     if (!user) throw new HandoffError("Constraint retirement needs a verbatim quote from a new user message")
     retired.add(constraint)
@@ -158,22 +189,13 @@ export function parseHandoff(raw: string, previous: PriorConstraints | undefined
   if (!validWorking(value.working)) throw new HandoffError(workingProblem(value.working))
   const users = userSources(rows)
   // An inherited native summary supplies language only, never retirement proof.
-  const archive = shellArchive(value, users, previous, priorSummary)
-  const retiredConstraints = shellRetirements(value, previous, users)
+  const archive = shellArchive(value.archive, users, previous, priorSummary)
+  const retiredConstraints = shellRetirements(value.retiredConstraints, previous, users)
   const retired = new Set(retiredConstraints.map((item) => item.constraint))
   const working = value.working
   if (working.references.some((ref) => !ids.has(ref.id))) throw new HandoffError("Handoff references an unavailable archive")
   return { archive, working: { ...working, constraints: mergeConstraints(previous?.constraints ?? [], retired, working.constraints, users) }, retiredConstraints }
 }
-
-const validField = {
-  objective: (value: unknown): value is string => text(value),
-  constraints: (value: unknown): value is string[] => list(value),
-  state: (value: unknown): value is string[] => list(value),
-  next: (value: unknown): value is string[] => list(value),
-  references: (value: unknown): value is WorkingMemory["references"] =>
-    Array.isArray(value) && value.length <= 3 && value.every((ref) => object(ref) && keys(ref, ["id", "why"]) && text(ref.id) && text(ref.why)),
-} as const
 
 /** Patch mode: omitted working fields carry forward unchanged; each present field
  *  replaces the previous one entirely. The merged whole must then pass the same
@@ -181,14 +203,12 @@ const validField = {
  *  the request. Constraint retirement keeps its exact-quote proof unchanged. */
 export function parsePatchHandoff(raw: string, previous: WorkingMemory, rows: readonly SourceRow[], ids: ReadonlySet<string>): Handoff {
   const value = parseShell(raw)
-  if (!object(value.working)) throw new HandoffError("Handoff has an invalid patch schema")
-  const fields: Record<string, unknown> = value.working
-  if (!keys(fields, ["objective", "constraints", "state", "next", "references"]) ||
-      Object.keys(fields).some((key) => !validField[key as keyof typeof validField](fields[key as keyof typeof validField])))
-    throw new HandoffError("Handoff has an invalid patch schema")
+  const problems = fieldProblems(value.working)
+  if (problems.length) throw new HandoffError(`Handoff has an invalid patch schema: ${problems.join("; ")}`)
+  const fields = value.working
   const users = userSources(rows)
-  const archive = shellArchive(value, users, previous)
-  const retiredConstraints = shellRetirements(value, previous, users)
+  const archive = shellArchive(value.archive, users, previous)
+  const retiredConstraints = shellRetirements(value.retiredConstraints, previous, users)
   const retired = new Set(retiredConstraints.map((item) => item.constraint))
   const working: WorkingMemory = {
     objective: typeof fields.objective === "string" ? fields.objective : previous.objective,

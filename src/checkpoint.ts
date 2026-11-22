@@ -17,16 +17,23 @@ export type Evidence = readonly (readonly [string, string])[]
  *  handoffs. Resolve quotes against NEW user text and structured human question
  *  replies, never assistant statements or arbitrary tool output. */
 export function parseCheckpoint(input: CheckpointInput, previous: WorkingMemory | undefined, constraints: readonly string[], users: Users, ids: ReadonlySet<string>, priorSummary?: string): Handoff {
-  if (!object(input) || Object.keys(input).some((key) => !["archive", "working", "retire"].includes(key)) ||
-      input.retire !== undefined && !Array.isArray(input.retire)) throw new HandoffError("Invalid checkpoint edit schema")
+  if (!object(input)) throw new HandoffError("Invalid checkpoint edit schema: input must be an object")
+  const unknown = Object.keys(input).filter((key) => !["archive", "working", "retire"].includes(key))
+  if (unknown.length) throw new HandoffError(`Invalid checkpoint edit schema: unknown ${unknown.join(", ")}; expect archive, working, retire`)
+  if (input.retire !== undefined && !Array.isArray(input.retire))
+    throw new HandoffError("Invalid checkpoint edit schema: retire must be an array of {constraint, quote}")
   for (const item of input.retire ?? []) {
     if (!object(item) || Object.keys(item).some((key) => !["constraint", "quote"].includes(key)) ||
-        typeof item.constraint !== "string" || typeof item.quote !== "string" || !item.quote.trim()) throw new HandoffError("Invalid constraint retirement")
+        typeof item.constraint !== "string" || typeof item.quote !== "string" || !item.quote.trim())
+      throw new HandoffError("Invalid constraint retirement: {constraint, quote} strings, quote non-empty")
   }
   if (typeof input.archive !== "string" || !input.archive.trim())
     throw new HandoffError("Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation")
-  const raw = JSON.stringify({ archive: input.archive, working: input.working === undefined ? {} : input.working, retiredConstraints: input.retire ?? [] })
-  if (!previous && !input.working) throw new HandoffError("No structured working state yet; supply all working fields or call with {} to let the compactor seed it")
+  // A first seed reads an absent references list as none: nothing carried forward
+  // can be lost there, and models habitually omit an empty list.
+  const working = input.working === undefined ? {} : !previous && input.working.references === undefined ? { ...input.working, references: [] } : input.working
+  const raw = JSON.stringify({ archive: input.archive, working, retiredConstraints: input.retire ?? [] })
+  if (!previous && !input.working) throw new HandoffError("No structured working state yet; supply objective/constraints/state/next or call with {} to let the compactor seed it")
   return previous ? parsePatchHandoff(raw, previous, users, ids) : parseHandoff(raw, { constraints }, users, ids, priorSummary)
 }
 

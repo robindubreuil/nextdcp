@@ -16,8 +16,13 @@ tests, and copies both bundles to a content-addressed release under the user's
 application-data directory: `%LOCALAPPDATA%/opencode/nextdcp/releases/` on
 Windows, `~/Library/Application Support/opencode/nextdcp/releases/` on macOS,
 and `$XDG_DATA_HOME/opencode/nextdcp/releases/` (or `~/.local/share/…`) on
-Linux. Add the printed absolute file URI
-to the existing OpenCode configuration, preserving its other settings:
+Linux. `npm run install:local` then switches OpenCode to that release for you,
+after the same typecheck and tests: the configuration gets a dated
+`*.bak-nextdcp-install-*` copy beside it, only the nextdcp plugin URI changes,
+and the previous URI is printed as the rollback. With no nextdcp entry to
+replace it refuses and prints the one to add. To switch by hand, add the
+printed absolute file URI to the existing OpenCode configuration, preserving
+its other settings:
 
 ```jsonc
 {
@@ -178,9 +183,11 @@ checkpoint_now({
 - The short `archive` note is required for a direct edit. Its first line is
   `Title: <episode name>`, followed by 1–3 brief new outcome/search-cue sentences:
   cold search evidence, not a second copy of the working state.
-- With no structured prior state, supply all working fields (`objective`,
-  `constraints`, `state`, `next`, `references`) or call **`checkpoint_now({})`** to
-  let the compactor seed it. `{}` always requests compactor generation.
+- With no structured prior state, supply the working fields (`objective`,
+  `constraints`, `state`, `next`; `references` may be omitted and then starts
+  empty) or call **`checkpoint_now({})`** to let the compactor seed it. After the
+  first seed the field stays strict: the compactor's handoff references are the
+  authoritative list. `{}` always requests compactor generation.
 - There is **no arbitrary edit-payload cap**. The entire merged state is measured
   against `memory.budget` as a **soft target**; the tool asks for under ~1k tokens
   without history or detail that files or `recall` restore. A valid main-authored

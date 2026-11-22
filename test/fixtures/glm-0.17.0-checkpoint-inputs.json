@@ -1,0 +1,425 @@
+[
+  {
+    "row": 22,
+    "fresh": "Archive note must begin with a 'Title: <episode name>' line",
+    "patch": "Archive note must begin with a 'Title: <episode name>' line",
+    "input": {
+      "archive": "Sanitized outcome note without a title line.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 22.",
+          "Constraints point 2 of row 22."
+        ],
+        "next": [
+          "Next point 1 of row 22.",
+          "Next point 2 of row 22.",
+          "Next point 3 of row 22.",
+          "Next point 4 of row 22.",
+          "Next point 5 of row 22."
+        ],
+        "objective": "Objective text for row 22.",
+        "state": [
+          "State point 1 of row 22.",
+          "State point 2 of row 22.",
+          "State point 3 of row 22.",
+          "State point 4 of row 22.",
+          "State point 5 of row 22.",
+          "State point 6 of row 22.",
+          "State point 7 of row 22.",
+          "State point 8 of row 22.",
+          "State point 9 of row 22."
+        ]
+      }
+    }
+  },
+  {
+    "row": 23,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 23\nSanitized outcome note.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 23.",
+          "Constraints point 2 of row 23."
+        ],
+        "next": [
+          "Next point 1 of row 23.",
+          "Next point 2 of row 23.",
+          "Next point 3 of row 23.",
+          "Next point 4 of row 23.",
+          "Next point 5 of row 23."
+        ],
+        "objective": "Objective text for row 23.",
+        "state": [
+          "State point 1 of row 23.",
+          "State point 2 of row 23.",
+          "State point 3 of row 23.",
+          "State point 4 of row 23.",
+          "State point 5 of row 23.",
+          "State point 6 of row 23.",
+          "State point 7 of row 23.",
+          "State point 8 of row 23."
+        ]
+      }
+    }
+  },
+  {
+    "row": 83,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 83\nSanitized outcome note.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 83.",
+          "Constraints point 2 of row 83.",
+          "Constraints point 3 of row 83."
+        ],
+        "next": [
+          "Next point 1 of row 83.",
+          "Next point 2 of row 83.",
+          "Next point 3 of row 83.",
+          "Next point 4 of row 83.",
+          "Next point 5 of row 83."
+        ],
+        "objective": "Objective text for row 83.",
+        "state": [
+          "State point 1 of row 83.",
+          "State point 2 of row 83.",
+          "State point 3 of row 83.",
+          "State point 4 of row 83.",
+          "State point 5 of row 83.",
+          "State point 6 of row 83.",
+          "State point 7 of row 83.",
+          "State point 8 of row 83."
+        ]
+      }
+    }
+  },
+  {
+    "row": 187,
+    "fresh": "generation",
+    "patch": "generation",
+    "input": {}
+  },
+  {
+    "row": 322,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 322\nSanitized outcome note.",
+      "working": {
+        "objective": "Objective text for row 322.",
+        "constraints": [
+          "Constraints point 1 of row 322.",
+          "Constraints point 2 of row 322.",
+          "Constraints point 3 of row 322.",
+          "Constraints point 4 of row 322.",
+          "Constraints point 5 of row 322.",
+          "Constraints point 6 of row 322.",
+          "Constraints point 7 of row 322."
+        ],
+        "state": [
+          "State point 1 of row 322.",
+          "State point 2 of row 322.",
+          "State point 3 of row 322.",
+          "State point 4 of row 322.",
+          "State point 5 of row 322.",
+          "State point 6 of row 322.",
+          "State point 7 of row 322."
+        ],
+        "next": [
+          "Next point 1 of row 322.",
+          "Next point 2 of row 322.",
+          "Next point 3 of row 322.",
+          "Next point 4 of row 322.",
+          "Next point 5 of row 322."
+        ]
+      }
+    }
+  },
+  {
+    "row": 323,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 323\nSanitized outcome note.",
+      "working": {
+        "objective": "Objective text for row 323.",
+        "constraints": [
+          "Constraints point 1 of row 323.",
+          "Constraints point 2 of row 323.",
+          "Constraints point 3 of row 323.",
+          "Constraints point 4 of row 323.",
+          "Constraints point 5 of row 323.",
+          "Constraints point 6 of row 323.",
+          "Constraints point 7 of row 323."
+        ],
+        "state": [
+          "State point 1 of row 323.",
+          "State point 2 of row 323.",
+          "State point 3 of row 323.",
+          "State point 4 of row 323.",
+          "State point 5 of row 323."
+        ],
+        "next": [
+          "Next point 1 of row 323.",
+          "Next point 2 of row 323.",
+          "Next point 3 of row 323.",
+          "Next point 4 of row 323."
+        ]
+      }
+    }
+  },
+  {
+    "row": 324,
+    "fresh": "generation",
+    "patch": "generation",
+    "input": {}
+  },
+  {
+    "row": 355,
+    "fresh": "Handoff has an invalid handoff schema: working is missing objective, a complete state needs all five fields (use [] for empty lists)",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 355\nSanitized outcome note.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 355."
+        ],
+        "next": [
+          "Next point 1 of row 355.",
+          "Next point 2 of row 355.",
+          "Next point 3 of row 355.",
+          "Next point 4 of row 355."
+        ],
+        "state": [
+          "State point 1 of row 355.",
+          "State point 2 of row 355.",
+          "State point 3 of row 355.",
+          "State point 4 of row 355."
+        ]
+      }
+    }
+  },
+  {
+    "row": 356,
+    "fresh": "Handoff has an invalid handoff schema: working is missing objective, a complete state needs all five fields (use [] for empty lists)",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 356\nSanitized outcome note.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 356."
+        ],
+        "next": [
+          "Next point 1 of row 356.",
+          "Next point 2 of row 356.",
+          "Next point 3 of row 356.",
+          "Next point 4 of row 356."
+        ],
+        "state": [
+          "State point 1 of row 356.",
+          "State point 2 of row 356.",
+          "State point 3 of row 356.",
+          "State point 4 of row 356."
+        ]
+      }
+    }
+  },
+  {
+    "row": 357,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 357\nSanitized outcome note.",
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 357."
+        ],
+        "next": [
+          "Next point 1 of row 357.",
+          "Next point 2 of row 357.",
+          "Next point 3 of row 357.",
+          "Next point 4 of row 357."
+        ],
+        "objective": "Objective text for row 357.",
+        "references": [],
+        "state": [
+          "State point 1 of row 357.",
+          "State point 2 of row 357.",
+          "State point 3 of row 357.",
+          "State point 4 of row 357."
+        ]
+      }
+    }
+  },
+  {
+    "row": 412,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 412\nSanitized outcome note.",
+      "working": {
+        "objective": "Objective text for row 412.",
+        "constraints": [
+          "Constraints point 1 of row 412."
+        ],
+        "state": [
+          "State point 1 of row 412.",
+          "State point 2 of row 412.",
+          "State point 3 of row 412.",
+          "State point 4 of row 412.",
+          "State point 5 of row 412.",
+          "State point 6 of row 412.",
+          "State point 7 of row 412."
+        ],
+        "next": [
+          "Next point 1 of row 412.",
+          "Next point 2 of row 412.",
+          "Next point 3 of row 412.",
+          "Next point 4 of row 412.",
+          "Next point 5 of row 412."
+        ]
+      }
+    }
+  },
+  {
+    "row": 437,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 437\nSanitized outcome note.",
+      "working": {
+        "objective": "Objective text for row 437.",
+        "constraints": [
+          "Constraints point 1 of row 437."
+        ],
+        "state": [
+          "State point 1 of row 437.",
+          "State point 2 of row 437.",
+          "State point 3 of row 437.",
+          "State point 4 of row 437.",
+          "State point 5 of row 437.",
+          "State point 6 of row 437."
+        ],
+        "next": [
+          "Next point 1 of row 437.",
+          "Next point 2 of row 437.",
+          "Next point 3 of row 437.",
+          "Next point 4 of row 437."
+        ]
+      }
+    }
+  },
+  {
+    "row": 488,
+    "fresh": "ok",
+    "patch": "ok",
+    "input": {
+      "archive": "Title: Episode 488\nSanitized outcome note.",
+      "working": {
+        "objective": "Objective text for row 488.",
+        "constraints": [
+          "Constraints point 1 of row 488."
+        ],
+        "state": [
+          "State point 1 of row 488.",
+          "State point 2 of row 488.",
+          "State point 3 of row 488.",
+          "State point 4 of row 488.",
+          "State point 5 of row 488.",
+          "State point 6 of row 488."
+        ],
+        "next": [
+          "Next point 1 of row 488.",
+          "Next point 2 of row 488.",
+          "Next point 3 of row 488.",
+          "Next point 4 of row 488."
+        ]
+      }
+    }
+  },
+  {
+    "row": 511,
+    "fresh": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "patch": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "input": {
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 511."
+        ],
+        "next": [
+          "Next point 1 of row 511.",
+          "Next point 2 of row 511.",
+          "Next point 3 of row 511.",
+          "Next point 4 of row 511.",
+          "Next point 5 of row 511."
+        ],
+        "objective": "Objective text for row 511.",
+        "state": [
+          "State point 1 of row 511.",
+          "State point 2 of row 511.",
+          "State point 3 of row 511.",
+          "State point 4 of row 511.",
+          "State point 5 of row 511.",
+          "State point 6 of row 511."
+        ]
+      }
+    }
+  },
+  {
+    "row": 522,
+    "fresh": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "patch": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "input": {
+      "working": {
+        "objective": "Objective text for row 522.",
+        "constraints": [
+          "Constraints point 1 of row 522."
+        ],
+        "state": [
+          "State point 1 of row 522.",
+          "State point 2 of row 522.",
+          "State point 3 of row 522.",
+          "State point 4 of row 522.",
+          "State point 5 of row 522.",
+          "State point 6 of row 522.",
+          "State point 7 of row 522."
+        ],
+        "next": [
+          "Next point 1 of row 522.",
+          "Next point 2 of row 522.",
+          "Next point 3 of row 522.",
+          "Next point 4 of row 522."
+        ]
+      }
+    }
+  },
+  {
+    "row": 523,
+    "fresh": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "patch": "Archive note is required on a direct edit: 'Title: <episode name>' then 1–3 short outcome/search-cue sentences; use {} for compactor generation",
+    "input": {
+      "working": {
+        "constraints": [
+          "Constraints point 1 of row 523."
+        ],
+        "next": [
+          "Next point 1 of row 523.",
+          "Next point 2 of row 523."
+        ],
+        "objective": "Objective text for row 523.",
+        "state": [
+          "State point 1 of row 523.",
+          "State point 2 of row 523.",
+          "State point 3 of row 523.",
+          "State point 4 of row 523.",
+          "State point 5 of row 523.",
+          "State point 6 of row 523."
+        ]
+      }
+    }
+  }
+]

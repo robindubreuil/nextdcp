@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import test from "node:test"
 import { captureEvidence, changedEvidence, parseCheckpoint } from "../src/checkpoint.ts"
 import { questionRow } from "./support/question.ts"
@@ -30,9 +31,18 @@ test("a main author can seed a full state, but cannot apply a partial edit to an
   assert.deepEqual(protectedSeed.working.constraints, working.constraints, "native fallback's surviving constraints remain protected")
 })
 
+test("a first seed reads an omitted references list as none; a malformed one still fails closed", () => {
+  const seeded = parseCheckpoint(edit({ objective: "Ship", constraints: [], state: ["Sealed"], next: [] }), undefined, [], [], ids)
+  assert.deepEqual(seeded.working.references, [])
+  assert.throws(() => parseCheckpoint(edit({ objective: "Ship", constraints: [], state: [], next: [], references: null }), undefined, [], [], ids), /references must be \{id, why\} pairs/)
+})
+
 test("rejections name the defect and the repair so a model recovers in one call", () => {
-  assert.throws(() => parseCheckpoint(edit({ objective: "Ship", constraints: [], state: ["Sealed"], next: [] }), undefined, [], [], ids),
-    /working is missing references, a complete state needs all five fields \(use \[\] for empty lists\)/)
+  assert.throws(() => parseCheckpoint(edit({ extra: true }), working, working.constraints, [], ids), /unknown field extra/)
+  assert.throws(() => parseCheckpoint(edit({ state: "not a list" }), working, working.constraints, [], ids), /state must be a string list/)
+  assert.throws(() => parseCheckpoint(edit({ objective: "Ship", constraints: [], state: "not a list", next: [], references: [] }), undefined, [], [], ids), /state must be a string list/)
+  assert.throws(() => parseCheckpoint({ ...edit(), summary: "extra" }, working, working.constraints, [], ids), /unknown summary; expect archive, working, retire/)
+  assert.throws(() => parseCheckpoint({ ...edit(), retire: "no" }, working, working.constraints, [], ids), /retire must be an array/)
   assert.throws(() => parseCheckpoint({ working: { state: ["Sealed"] } }, working, working.constraints, [], ids),
     /Archive note is required on a direct edit.*use \{\} for compactor generation/)
 })
@@ -170,4 +180,30 @@ test("semantic fences include structured human answers, even if the rendered que
   const bookkeeping = structuredClone(rows)
   bookkeeping[1].content[0].state.metadata.title = "UI-only title"
   assert.equal(changedEvidence(before, [...bookkeeping, own()], pub), undefined)
+})
+
+// Structural replicas of 16 checkpoint_now payloads captured from a GLM session
+// on 0.17.0 (debug bundle ses_e0108e5bbffeCpNFu6FvJyRb8N): keys, list lengths and
+// Title-line presence preserved, all prose replaced. Each entry pins the exact
+// outcome under both a fresh seed and a patch so the defect class stays fixed.
+const fixtures = JSON.parse(readFileSync(new URL("./fixtures/glm-0.17.0-checkpoint-inputs.json", import.meta.url), "utf8"))
+
+test("captured GLM checkpoint payloads keep their exact outcomes under fresh and patch modes", () => {
+  const previous = { objective: "o", constraints: ["c"], state: ["s"], next: ["n"], references: [] }
+  const rows = [{ id: "u1", type: "user", text: fixtures.flatMap((fixture) => fixture.input.working?.constraints ?? []).join("\n") }]
+  for (const fixture of fixtures) {
+    for (const label of ["fresh", "patch"]) {
+      const prior = label === "patch" ? previous : undefined
+      if (fixture[label] === "generation") {
+        assert.deepEqual(fixture.input, {}, `row ${fixture.row}: empty input routes to compactor generation`)
+        continue
+      }
+      try {
+        parseCheckpoint(fixture.input, prior, prior?.constraints ?? [], rows, ids)
+        assert.equal(fixture[label], "ok", `row ${fixture.row} ${label} parsed but a rejection was expected`)
+      } catch (error) {
+        assert.equal(error.message, fixture[label], `row ${fixture.row} ${label}`)
+      }
+    }
+  }
 })

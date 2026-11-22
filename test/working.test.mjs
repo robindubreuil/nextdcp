@@ -258,3 +258,10 @@ test("structured question answers count as user-language evidence, unlike arbitr
   rows[0].content[0].name = "read"
   assert.throws(() => parseHandoff(raw({ archive }), undefined, rows, ids), /language/)
 })
+
+test("a generated full state still requires every field; only a first direct edit defaults references", () => {
+  const { references: _omitted, ...partial } = working()
+  assert.throws(() => parseHandoff(raw({ working: partial }), constrained(), [], ids),
+    /working is missing references, a complete state needs all five fields \(use \[\] for empty lists\)/)
+  assert.deepEqual(parsePatchHandoff(raw({ working: partial }), working(), [], ids).working, working(), "a patch omits fields to carry them forward")
+})

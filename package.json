@@ -1,6 +1,6 @@
 {
   "name": "nextdcp",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "Bounded task-focused working memory and archived recall for OpenCode V2",
   "type": "module",
   "exports": {
@@ -20,7 +20,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.mjs\"",
     "prerelease:local": "npm run typecheck && npm test",
-    "release:local": "node scripts/release.mjs"
+    "release:local": "node scripts/release.mjs",
+    "preinstall:local": "npm run typecheck && npm test",
+    "install:local": "node scripts/install.mjs"
   },
   "engines": {
     "node": ">=20"
