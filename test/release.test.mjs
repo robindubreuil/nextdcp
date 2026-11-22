@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
@@ -13,6 +13,7 @@ async function fixture(t) {
   await writeFile(join(source, "package.json"), JSON.stringify({ name: "nextdcp", version: "0.3.0" }))
   await writeFile(join(source, "dist/index.js"), "server first")
   await writeFile(join(source, "dist/tui.js"), "tui first")
+  await writeFile(join(source, "dist/cli.js"), "cli first")
   return { source, releases }
 }
 
@@ -25,7 +26,10 @@ test("release publication is reproducible and development builds cannot change a
   assert.notEqual(first, second)
   assert.equal(await readFile(join(first, "index.js"), "utf8"), "server first")
   assert.equal(await readFile(join(second, "index.js"), "utf8"), "server second")
-  assert.deepEqual(JSON.parse(await readFile(join(first, "package.json"), "utf8")).exports, { ".": "./index.js", "./tui": "./tui.js" })
+  const manifest = JSON.parse(await readFile(join(first, "package.json"), "utf8"))
+  assert.deepEqual(manifest.exports, { ".": "./index.js", "./tui": "./tui.js", "./cli": "./cli.js" })
+  assert.deepEqual(manifest.bin, { ocq: "./cli.js" })
+  assert.ok((await stat(join(first, "cli.js"))).mode & 0o111, "the CLI ships executable")
 })
 
 test("concurrent publishers converge on identical releases; altered releases are never overwritten", async (t) => {

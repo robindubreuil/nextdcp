@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto"
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -21,8 +21,10 @@ export async function createRelease(source, releases) {
   const files = new Map([
     ["index.js", await readFile(join(source, "dist/index.js"))],
     ["tui.js", await readFile(join(source, "dist/tui.js"))],
+    ["cli.js", await readFile(join(source, "dist/cli.js"))],
     ["package.json", Buffer.from(JSON.stringify({ name: manifest.name, version: manifest.version, type: "module",
-      exports: { ".": "./index.js", "./tui": "./tui.js" } }, null, 2) + "\n")],
+      bin: { ocq: "./cli.js" },
+      exports: { ".": "./index.js", "./tui": "./tui.js", "./cli": "./cli.js" } }, null, 2) + "\n")],
   ])
   const hash = createHash("sha256")
   for (const [name, bytes] of files) hash.update(name).update("\0").update(bytes).update("\0")
@@ -38,7 +40,10 @@ export async function createRelease(source, releases) {
   const staging = join(releases, `.staging-${randomBytes(12).toString("hex")}`)
   await mkdir(staging)
   try {
-    for (const [name, bytes] of files) await writeFile(join(staging, name), bytes, { flag: "wx" })
+    for (const [name, bytes] of files) {
+      await writeFile(join(staging, name), bytes, { flag: "wx" })
+      if (name === "cli.js") await chmod(join(staging, name), 0o755)
+    }
     try { await rename(staging, directory) } catch (error) {
       if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(error.code)) throw error
       // Another publisher may have won the race. Verify; never replace it.

@@ -40,7 +40,11 @@ plugin needs. The obsolete `experimental.background_compaction` key is not a sub
 
 Use the actual URI printed by the release script, not the example digest. Do not
 run nextdcp alongside another context-management plugin (such as
-`opencode-dcp`) in the same session. The package can also be packed with
+`opencode-dcp`) in the same session. Since 0.20.0 the release also carries the
+`ocq` command-line inspector; `install:local` symlinks it into
+`$XDG_BIN_HOME` (or `~/.local/bin`) and removes the link again when rolling
+back to a release without it. It never touches an `ocq` that is not its own
+symlink. The package can also be packed with
 `npm pack`; no registry
 release is assumed. `npm pack` builds automatically; installed packages use the
 same bundle through their package entrypoint. **Do not point a live installation
@@ -54,6 +58,34 @@ an active `nextdcp`. The TUI part is discovered from the same directory; no
 separate terminal configuration is needed unless terminal plugins were disabled.
 Inspect the project's explicit Location: the server's default directory may differ
 from the terminal's. A local API client can pass `{ location: { directory: projectPath } }`.
+
+## ocq — reading the session database
+
+`ocq` is a strictly read-only inspector for the OpenCode session database that
+ships with nextdcp releases. It complements the curated recall archive with raw
+facts straight from the live database: which sessions exist, what each message
+cost in estimated tokens, and exactly what a message stored. The database is
+opened with `node:sqlite` in read-only mode (Node >= 22.13; the plugin itself
+runs on older Node) and no code path writes, creates, or moves anything.
+
+```
+ocq sessions  [--sort date|tokens|cost] [--grep TEXT] [--limit N | --all] [--json]
+ocq messages  <session> [--type user,assistant,...] [--seq A[:B]] [--limit N | --all] [--json]
+ocq show      <session> [seq] [--part N] [--max-chars N] [--json]
+```
+
+`<session>` is a full or shortened `ses_` id, a slug, or a unique prefix of
+either; an ambiguous prefix lists the candidates instead of guessing.
+`sessions` ranks by recency, total stored token columns, or cost, and greps
+titles and slugs. `messages` walks one conversation with per-message part
+counts, first-token and streaming timings, and `EST` — nextdcp's chars/4
+estimator run over the stored rows, including compaction summaries, so the
+numbers match what live metering would have counted. Providers do not store
+per-message usage in the database, so estimates are the honest ceiling
+available. `show` prints a message as labeled blocks (text, reasoning, tool
+input/output, compaction summary and recent transcript) with `--max-chars`
+clipping, or a single part with `--part N`; `--json` returns the stored JSON
+exactly as it lies in the database. `--db PATH` inspects another database.
 
 ## Compaction model
 

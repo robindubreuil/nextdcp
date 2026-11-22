@@ -7,9 +7,9 @@
 // dated backup before any change. Exported helpers are unit-tested.
 
 import { existsSync } from "node:fs";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, delimiter, join, resolve, sep } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
 import { createRelease, releasesDir } from "./release.mjs";
@@ -65,6 +65,38 @@ export async function installConfig(config, uri, now = new Date()) {
   return previous;
 }
 
+/**
+ * Keep the ocq launcher in the user's bin directory in step with the release
+ * being installed: symlink it when the release ships a CLI, remove the link
+ * when a rollback target predates it. Only symlinks that resolve inside the
+ * releases directory are ever touched — anything else at the path (a regular
+ * file, a foreign or dangling link) is left strictly alone. Returns the action
+ * taken, or null when there is nothing to do (Windows, non-file URIs, foreign
+ * targets).
+ */
+export async function linkBin(uri, env = process.env, platform = process.platform, home = homedir()) {
+  if (platform === "win32") return null;
+  let parsed;
+  try { parsed = new URL(uri); } catch { return null; }
+  if (parsed.protocol !== "file:") return null;
+  const releases = releasesDir(platform, env, home);
+  const link = join(env.XDG_BIN_HOME || join(home, ".local", "bin"), "ocq");
+  // lstat, not existsSync: a dangling symlink is still something to respect.
+  let status = null;
+  try { status = await lstat(link); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const managed = status !== null && status.isSymbolicLink() &&
+    resolve(dirname(link), await readlink(link)).startsWith(releases + sep);
+  if (!existsSync(join(fileURLToPath(parsed), "cli.js"))) {
+    if (managed) { await rm(link); return { action: "removed", path: link }; }
+    return null;
+  }
+  if (status === null) await mkdir(dirname(link), { recursive: true });
+  else if (!managed) return null;
+  else await rm(link);
+  await symlink(join(fileURLToPath(parsed), "cli.js"), link);
+  return { action: "linked", path: link };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const source = fileURLToPath(new URL("../", import.meta.url));
   const uri = process.argv[2] ?? pathToFileURL(await createRelease(source, releasesDir())).href;
@@ -77,6 +109,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const previous = await installConfig(config, uri);
     console.log(`Installed: ${uri}\nConfig: ${config} (backup kept next to it)`);
     for (const old of previous) console.log(`Previous (rollback): ${old}`);
+    const linked = await linkBin(uri, process.env);
+    if (linked) {
+      console.log(linked.action === "linked" ? `ocq CLI: ${linked.path}` : "ocq CLI: link removed (this release has no CLI)");
+      if (linked.action === "linked" && !(process.env.PATH ?? "").split(delimiter).includes(dirname(linked.path))) {
+        console.log(`note: ${dirname(linked.path)} is not on PATH yet`);
+      }
+    }
   } catch (error) {
     console.error(`install:local: ${error.message}`);
     process.exit(1);
