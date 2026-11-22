@@ -335,6 +335,26 @@ that would itself exceed capacity yields to capacity recovery. Gate, checkpoint
 and capacity outcomes are counted per session in plugin storage; deleting the
 session removes them.
 
+## Recurring one-shot nudge
+
+Re-typing the same code one-shot (`python3 -c '…'`, `bash -c '…'`) across
+sessions is pure token waste. The plugin pools model shell commands from the
+host database over the last 90 days and clusters code payloads by word
+similarity, so uses that are *similar enough* group together even when no two
+are identical; a payload repeated verbatim pools too, as the strongest signal
+of all. A family qualifies only when it spans at least three sessions and its
+observed retyping clearly outruns the nudge's own costs — the notice, the
+one-time script write, and the short wrapper that remains per call.
+
+When the live session's own commands match such a family, one automated tail
+notice — once per session, subagents excluded — names the recurring shape,
+its observed cost, and asks the model to persist it as a small script under
+`scripts/` and call it with arguments instead of re-typing the one-shot. Like
+reminders, it is request-scoped, rides the conversation tail, is omitted when
+it would not fit safe capacity (and retries later), and never queues a cut:
+it corrects behavior, it does not compact. The pool is rebuilt in the
+background every six hours; `nudge: false` disables the feature.
+
 ## Adaptive baseline
 
 The automatic threshold meters the **retained conversation**: current summary,
@@ -425,6 +445,7 @@ from recent completed requests; without such usage the raw estimate applies.
 | `idle` | adaptive baseline (or explicit `budget`) | After a successful turn at or above this threshold with new durable growth, compact on the **next prompt**, not while idle. Automatic mode compares the retained conversation; a positive number compares new durable growth; `false` disables this path. Subagent sessions are ignored. |
 | `budget` | adaptive retained-conversation safeguard | Default: the overdue-checkpoint safeguard plus pause reminders and fresh-evidence room. An explicit positive number instead sets a mid-round **new durable growth** threshold (no reminders or evidence room); `false` disables soft gates and reminders, not capacity safety. See [Checkpoint guidance](#checkpoint-guidance-and-the-overdue-safeguard). |
 | `notice` | `tail` | Placement of gate notices: `tail` appends a request-scoped final message (no cached-prefix churn); `system` uses a system part for providers that drop trailing messages and disables optional reminders. |
+| `nudge` | enabled | One tail notice per session when this session's shell commands match a family of similar code one-shots retyped across ≥ 3 sessions in the last 90 days (host database, rescanned every 6 h), asking to persist the payload as a script. `false` disables. See [Recurring one-shot nudge](#recurring-one-shot-nudge). |
 | `memory.budget` | `2000` | Soft target for the complete rendered working state, including headings and references. Valid main-authored edits warn and commit above it without regeneration. Compactor generation aims about 1000 or less and can use one repair attempt; constraints are never truncated. |
 | `debug` | `false` | Include debug diagnostics in the server log. Archive, inheritance and native-fallback warnings are logged regardless. |
 

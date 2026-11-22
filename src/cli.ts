@@ -10,11 +10,10 @@
 // readOnly and no code path here writes, creates or moves anything.
 
 import { existsSync } from "node:fs"
-import { homedir } from "node:os"
-import { join } from "node:path"
 import { object } from "./guards.ts"
 import { conversationTokens } from "./estimate.ts"
 import { tokens } from "./tokens.ts"
+import { defaultDatabase } from "./recurring.ts"
 import type { Row } from "./memory.ts"
 
 const PROGRAM = "ocq"
@@ -144,12 +143,6 @@ function printTable(head: readonly string[], rows: readonly (readonly string[])[
 
 type Database = import("node:sqlite").DatabaseSync
 type SQLInputValue = import("node:sqlite").SQLInputValue
-
-function defaultDatabase(): string {
-  if (process.env.XDG_DATA_HOME) return join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
-  const base = process.platform === "darwin" ? join(homedir(), "Library", "Application Support") : join(homedir(), ".local", "share")
-  return join(base, "opencode", "opencode.db")
-}
 
 function openDatabase(path: string): Database {
   if (!existsSync(path)) fail(`no database at ${path} — start OpenCode first, or pass --db PATH`)

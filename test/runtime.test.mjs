@@ -1,9 +1,13 @@
 import assert from "node:assert/strict"
 import { registerHooks } from "node:module"
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { setImmediate } from "node:timers/promises"
 import test from "node:test"
 import { projectHistory } from "./support/history.ts"
 import { questionRow } from "./support/question.ts"
+import { fixtureDatabase, liveJsonSummary, pooledSessions } from "./support/pool.ts"
 import { WORKING_PROMPT, RECALL_DESCRIPTION, CHECKPOINT_NOW_DESCRIPTION, budgetGateNotice } from "../src/prompts.ts"
 import { tokens } from "../src/tokens.ts"
 import { durableTokens, latestProviderUsage, requestTokens, retainedTokens, usageScale } from "../src/estimate.ts"
@@ -26,6 +30,14 @@ const hook = registerHooks({
 })
 const { setup } = await import("../src/index.ts")
 hook.deregister()
+
+// The recurring one-shot nudge reads the host database; point every controller
+// at a scratch data root before the first one exists. Only the explicit
+// fixture-writing tests below ever point it at a real database file.
+const scratchData = mkdtempSync(join(tmpdir(), "nextdcp-data-"))
+process.env.XDG_DATA_HOME = scratchData
+const hasSqlite = await import("node:sqlite").then(() => true, () => false)
+const requireSqlite = { skip: hasSqlite ? false : "node:sqlite is unavailable on this node" }
 
 class MemoryStorage {
   values = new Map()
@@ -3329,4 +3341,65 @@ test("search labels retained branch originals outside the active episode chain",
   for (const page of [Number.MAX_SAFE_INTEGER + 1, Infinity, NaN]) {
     assert.match(await h.controller.recall("s", { query: "active", page }), /positive safe integer/)
   }
+})
+
+// The recurring one-shot nudge: the pool loads from the scratch database in
+// the background, so builds are polled until the scan has families to see.
+const bashStep = (id, command) => ({ id, type: "assistant", content: [
+  { type: "text", text: "summarizing the sessions" },
+  { type: "tool", id: `${id}-call`, name: "bash", state: { status: "completed", input: { command } } },
+] })
+const nudgeNotices = (request) => request.messages
+  .filter((message) => message.role === "user" && message.content?.some((part) => typeof part.text === "string" && part.text.startsWith("[Recurring one-shot"))).length
+const pooledHarness = async (t, options = {}) => {
+  const data = mkdtempSync(join(tmpdir(), "nextdcp-nudge-"))
+  process.env.XDG_DATA_HOME = data
+  t.after(() => { rmSync(data, { recursive: true, force: true }); process.env.XDG_DATA_HOME = scratchData })
+  await mkdirSync(join(data, "opencode"), { recursive: true })
+  await fixtureDatabase(join(data, "opencode", "opencode.db"), pooledSessions)
+  const h = harness(options)
+  h.state.rows = [user("u1", "summarize the sessions"), bashStep("a1", `rtk bypass python3 -c '${liveJsonSummary}'`)]
+  return h
+}
+const buildUntil = async (h, ready, base = event(), attempts = 300) => {
+  const request = { ...base, messages: projectHistory(h.state.rows).messages }
+  for (let attempt = 0; !ready(request) && attempt < attempts; attempt++) {
+    await h.controller.onContext(request)
+    await setImmediate()
+  }
+  await h.controller.onContext(request)
+  return request
+}
+
+test("a live recurring one-shot earns exactly one nudge per session", requireSqlite, async (t) => {
+  const h = await pooledHarness(t)
+  const request = await buildUntil(h, (candidate) => nudgeNotices(candidate) > 0)
+  assert.equal(nudgeNotices(request), 1, "the notice rides the conversation tail once the pool loads")
+  const second = { ...event(), messages: projectHistory(h.state.rows).messages }
+  await h.controller.onContext(second)
+  assert.equal(nudgeNotices(second), 0, "a nudged session is never nudged again")
+})
+
+test("subagent sessions are never nudged", requireSqlite, async (t) => {
+  const h = await pooledHarness(t)
+  h.state.info = { ...h.state.info, parentID: "ses_parent" }
+  const request = await buildUntil(h, () => true, 20)
+  assert.equal(nudgeNotices(request), 0)
+})
+
+test("options.nudge === false disables the nudge", requireSqlite, async (t) => {
+  const h = await pooledHarness(t, { nudge: false })
+  const request = await buildUntil(h, () => true, 20)
+  assert.equal(nudgeNotices(request), 0)
+})
+
+test("a capacity-refused nudge retries on a later build", requireSqlite, async (t) => {
+  const h = await pooledHarness(t)
+  // Window sizes are cached per model, so the roomy retry rides a second model.
+  h.state.models.push({ ...model, id: "roomy", enabled: true, capabilities: { input: ["text"], output: ["text"] }, variants: [], limit: { context: 1_050_000, input: 922_000, output: 128_000 } })
+  h.state.models[0].limit = { context: 9_000, output: 8_192 }
+  const tight = await buildUntil(h, () => true, event(), 20)
+  assert.equal(nudgeNotices(tight), 0, "the notice waits when it would not fit")
+  const request = await buildUntil(h, (candidate) => nudgeNotices(candidate) > 0, { ...event(), model: { ...model, id: "roomy" } })
+  assert.equal(nudgeNotices(request), 1, "the same session still earns its nudge once room returns")
 })

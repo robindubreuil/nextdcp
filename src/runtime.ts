@@ -17,6 +17,7 @@ import { object, positive, modelRef } from "./guards.ts"
 import { durableTokens, evidenceTokens, latestProviderUsage, recentDurable, requestParts, retainedTokens, usageScale, REQUEST_MARGIN, RECENT_TURNS, type ViewMessage } from "./estimate.ts"
 import { captureEvidence, changedEvidence, CHECKPOINT_INPUT, parseCheckpoint, type CheckpointInput, type Evidence, type Publication } from "./checkpoint.ts"
 import { freshEvidence, liveBudget, NEAR_SHARE, pause, reminderFor, type Reminder } from "./safeguard.ts"
+import { commandsIn, createNudge, renderNudge } from "./recurring.ts"
 
 type SessionID = Parameters<Plugin.Context["session"]["get"]>[0]["sessionID"]
 type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
@@ -67,6 +68,9 @@ type SessionState = {
   /** Stamped at the first session read: subagent sessions never feed the thermostat
    *  or graduate notes; their findings return via the delegation summary. */
   owner?: SessionOwner
+  /** The recurring one-shot nudge has landed in this session; set only when the
+   *  notice actually fits — a capacity-refused nudge retries on a later build. */
+  nudged?: boolean
   /** Numeric, observational diagnostics only; never injected or persisted. */
   request?: MemoryRequest
   decision?: MemoryDecision
@@ -114,6 +118,9 @@ export function createController(context: Plugin.Context) {
   const log = (where: string, error: unknown) => {
     if (debug) warn(where, error)
   }
+  // The recurring one-shot pool scans the host database in the background at
+  // startup and every TTL; `false` disables the nudge entirely.
+  const nudge = ctx.options.nudge === false ? undefined : createNudge(warn)
   // Fire-and-forget gate telemetry: counted, logged when debugging, never load-bearing.
   const gateStat = (sessionID: string, field: keyof GateStats) => {
     void storeFor(sessionID).countGate(field).then((stats) => {
@@ -381,6 +388,14 @@ export function createController(context: Plugin.Context) {
         else messages.push({ role: "user", content: [{ type: "text", text } as Part] })
         entry.request = { ...request, total: request.total + notice, ...(noticeInSystem ? { system: request.system + notice } : { messages: request.messages + notice }) }
         return true
+      }
+      // The recurring one-shot nudge rides the tail once per session, before any
+      // held-round or capacity return: it corrects behavior, it does not compact.
+      // A capacity-refused notice leaves the flag unset and retries next build.
+      if (nudge && !entry.nudged && !entry.owner?.subagent) {
+        nudge.refresh()
+        const family = nudge.scan(commandsIn(cycleRows), info.location.directory)
+        if (family && appendNotice(renderNudge(family))) entry.nudged = true
       }
       if (info.revert) { decide(entry, "held", "A staged revert is active."); return }
       if (running(rows)) { decide(entry, "held", "A compaction is already running."); return }

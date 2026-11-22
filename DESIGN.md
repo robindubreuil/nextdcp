@@ -466,6 +466,34 @@ known window; **complete capacity is rechecked on every eligible build before
 the hold**. A hold expires on success, failure, interruption, or plugin reload
 and writes no idle catch-up marker. The automatic safeguard never uses it.
 
+### Recurring one-shot nudge
+
+Re-typed code one-shots are the one token waste no per-session mechanism can
+see: the evidence that a `python3 -c '…'` payload has been rebuilt from
+scratch many times lives *across* sessions, in the host database. The pool is
+therefore read from there — assistant commands of the last 90 days, rebuilt in
+the background every six hours — while the per-request cost stays minimal: the
+build-time scan only matches the live session's commands against in-memory
+families; no database work happens on the request path.
+
+Detection is similarity, not identity: payloads are word-set matched (Jaccard
+≥ 0.4, star-clustered so the dominant variant seeds its family), because the
+goal is not to catch verbatim repeats — those pool trivially — but uses
+similar enough that one script under `scripts/` would serve them all. A
+wrapper gate keeps families about *code* (interpreters and shell `-c`/`-e`),
+excluding URLs and JSON bodies that merely ride along. Admission needs three
+sessions — one stubborn session retyping itself is real waste but says nothing
+about recurrence — and a gain gate: observed retyped payload must exceed the
+notice plus the one-time script write plus the residual per-call wrapper by a
+clear margin, so the nudge is only sent where following it is a net win.
+
+The notice is event-driven, not session-start: it rides the tail of a build
+whose session itself just produced a matching command, landing when the advice
+is demonstrably relevant instead of speculatively. It fires at most once per
+session (repeating it would itself be waste), skips subagents — the main
+session owns script authorship — never queues a cut, and a capacity refusal
+leaves it unspent to retry on a later build.
+
 ## Recall: one protocol, truthful evidence
 
 The standing protocol lives in the `recall` tool description; there is no
@@ -624,6 +652,7 @@ src/
   estimate.ts    retained/growth/evidence/request meters and calibration
   thermostat.ts  versioned adaptive baseline bounds and +50%/−20% updates
   safeguard.ts   fresh-evidence allowance, pause detection and reminder spacing
+  recurring.ts   cross-session one-shot pool, families and the nudge notice
   recall.ts      readable originals, media, pagination, addresses and BM25
   tokens.ts      text/media estimates
   time.ts        spans and positive-floor recency preference
